@@ -13,6 +13,7 @@ import (
 	smithyio "github.com/aws/smithy-go/io"
 	"github.com/aws/smithy-go/middleware"
 	"github.com/aws/smithy-go/ptr"
+	"github.com/aws/smithy-go/tracing"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"io"
 	"strings"
@@ -37,6 +38,13 @@ func (m *awsRestjson1_deserializeOpCreateToken) HandleDeserialize(ctx context.Co
 	if !ok {
 		return out, metadata, &smithy.DeserializationError{Err: fmt.Errorf("unknown transport type %T", out.RawResponse)}
 	}
+
+	defer func() { smithyhttp.CloseResponseBody(ctx, response, false, err) }()
+
+	_, span := tracing.StartSpan(ctx, "OperationDeserializer")
+	endTimer := startMetricTimer(ctx, "client.call.deserialization_duration")
+	defer endTimer()
+	defer span.End()
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return out, metadata, awsRestjson1_deserializeOpErrorCreateToken(response, &metadata)
@@ -72,6 +80,7 @@ func (m *awsRestjson1_deserializeOpCreateToken) HandleDeserialize(ctx context.Co
 		}
 	}
 
+	span.End()
 	return out, metadata, err
 }
 
@@ -259,6 +268,13 @@ func (m *awsRestjson1_deserializeOpCreateTokenWithIAM) HandleDeserialize(ctx con
 		return out, metadata, &smithy.DeserializationError{Err: fmt.Errorf("unknown transport type %T", out.RawResponse)}
 	}
 
+	defer func() { smithyhttp.CloseResponseBody(ctx, response, false, err) }()
+
+	_, span := tracing.StartSpan(ctx, "OperationDeserializer")
+	endTimer := startMetricTimer(ctx, "client.call.deserialization_duration")
+	defer endTimer()
+	defer span.End()
+
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return out, metadata, awsRestjson1_deserializeOpErrorCreateTokenWithIAM(response, &metadata)
 	}
@@ -293,6 +309,7 @@ func (m *awsRestjson1_deserializeOpCreateTokenWithIAM) HandleDeserialize(ctx con
 		}
 	}
 
+	span.End()
 	return out, metadata, err
 }
 
@@ -414,6 +431,11 @@ func awsRestjson1_deserializeOpDocumentCreateTokenWithIAMOutput(v **CreateTokenW
 				sv.AccessToken = ptr.String(jtv)
 			}
 
+		case "awsAdditionalDetails":
+			if err := awsRestjson1_deserializeDocumentAwsAdditionalDetails(&sv.AwsAdditionalDetails, value); err != nil {
+				return err
+			}
+
 		case "expiresIn":
 			if value != nil {
 				jtv, ok := value.(json.Number)
@@ -497,6 +519,13 @@ func (m *awsRestjson1_deserializeOpRegisterClient) HandleDeserialize(ctx context
 		return out, metadata, &smithy.DeserializationError{Err: fmt.Errorf("unknown transport type %T", out.RawResponse)}
 	}
 
+	defer func() { smithyhttp.CloseResponseBody(ctx, response, false, err) }()
+
+	_, span := tracing.StartSpan(ctx, "OperationDeserializer")
+	endTimer := startMetricTimer(ctx, "client.call.deserialization_duration")
+	defer endTimer()
+	defer span.End()
+
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return out, metadata, awsRestjson1_deserializeOpErrorRegisterClient(response, &metadata)
 	}
@@ -531,6 +560,7 @@ func (m *awsRestjson1_deserializeOpRegisterClient) HandleDeserialize(ctx context
 		}
 	}
 
+	span.End()
 	return out, metadata, err
 }
 
@@ -581,11 +611,20 @@ func awsRestjson1_deserializeOpErrorRegisterClient(response *smithyhttp.Response
 	case strings.EqualFold("InvalidClientMetadataException", errorCode):
 		return awsRestjson1_deserializeErrorInvalidClientMetadataException(response, errorBody)
 
+	case strings.EqualFold("InvalidRedirectUriException", errorCode):
+		return awsRestjson1_deserializeErrorInvalidRedirectUriException(response, errorBody)
+
 	case strings.EqualFold("InvalidRequestException", errorCode):
 		return awsRestjson1_deserializeErrorInvalidRequestException(response, errorBody)
 
 	case strings.EqualFold("InvalidScopeException", errorCode):
 		return awsRestjson1_deserializeErrorInvalidScopeException(response, errorBody)
+
+	case strings.EqualFold("SlowDownException", errorCode):
+		return awsRestjson1_deserializeErrorSlowDownException(response, errorBody)
+
+	case strings.EqualFold("UnsupportedGrantTypeException", errorCode):
+		return awsRestjson1_deserializeErrorUnsupportedGrantTypeException(response, errorBody)
 
 	default:
 		genericError := &smithy.GenericAPIError{
@@ -710,6 +749,13 @@ func (m *awsRestjson1_deserializeOpStartDeviceAuthorization) HandleDeserialize(c
 		return out, metadata, &smithy.DeserializationError{Err: fmt.Errorf("unknown transport type %T", out.RawResponse)}
 	}
 
+	defer func() { smithyhttp.CloseResponseBody(ctx, response, false, err) }()
+
+	_, span := tracing.StartSpan(ctx, "OperationDeserializer")
+	endTimer := startMetricTimer(ctx, "client.call.deserialization_duration")
+	defer endTimer()
+	defer span.End()
+
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return out, metadata, awsRestjson1_deserializeOpErrorStartDeviceAuthorization(response, &metadata)
 	}
@@ -744,6 +790,7 @@ func (m *awsRestjson1_deserializeOpStartDeviceAuthorization) HandleDeserialize(c
 		}
 	}
 
+	span.End()
 	return out, metadata, err
 }
 
@@ -1158,6 +1205,42 @@ func awsRestjson1_deserializeErrorInvalidGrantException(response *smithyhttp.Res
 	return output
 }
 
+func awsRestjson1_deserializeErrorInvalidRedirectUriException(response *smithyhttp.Response, errorBody *bytes.Reader) error {
+	output := &types.InvalidRedirectUriException{}
+	var buff [1024]byte
+	ringBuffer := smithyio.NewRingBuffer(buff[:])
+
+	body := io.TeeReader(errorBody, ringBuffer)
+	decoder := json.NewDecoder(body)
+	decoder.UseNumber()
+	var shape interface{}
+	if err := decoder.Decode(&shape); err != nil && err != io.EOF {
+		var snapshot bytes.Buffer
+		io.Copy(&snapshot, ringBuffer)
+		err = &smithy.DeserializationError{
+			Err:      fmt.Errorf("failed to decode response body, %w", err),
+			Snapshot: snapshot.Bytes(),
+		}
+		return err
+	}
+
+	err := awsRestjson1_deserializeDocumentInvalidRedirectUriException(&output, shape)
+
+	if err != nil {
+		var snapshot bytes.Buffer
+		io.Copy(&snapshot, ringBuffer)
+		err = &smithy.DeserializationError{
+			Err:      fmt.Errorf("failed to decode response body, %w", err),
+			Snapshot: snapshot.Bytes(),
+		}
+		return err
+	}
+
+	errorBody.Seek(0, io.SeekStart)
+
+	return output
+}
+
 func awsRestjson1_deserializeErrorInvalidRequestException(response *smithyhttp.Response, errorBody *bytes.Reader) error {
 	output := &types.InvalidRequestException{}
 	var buff [1024]byte
@@ -1414,6 +1497,15 @@ func awsRestjson1_deserializeDocumentAccessDeniedException(v **types.AccessDenie
 				sv.Error_description = ptr.String(jtv)
 			}
 
+		case "reason":
+			if value != nil {
+				jtv, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("expected AccessDeniedExceptionReason to be of type string, got %T instead", value)
+				}
+				sv.Reason = types.AccessDeniedExceptionReason(jtv)
+			}
+
 		default:
 			_, _ = key, value
 
@@ -1461,6 +1553,46 @@ func awsRestjson1_deserializeDocumentAuthorizationPendingException(v **types.Aut
 					return fmt.Errorf("expected ErrorDescription to be of type string, got %T instead", value)
 				}
 				sv.Error_description = ptr.String(jtv)
+			}
+
+		default:
+			_, _ = key, value
+
+		}
+	}
+	*v = sv
+	return nil
+}
+
+func awsRestjson1_deserializeDocumentAwsAdditionalDetails(v **types.AwsAdditionalDetails, value interface{}) error {
+	if v == nil {
+		return fmt.Errorf("unexpected nil of type %T", v)
+	}
+	if value == nil {
+		return nil
+	}
+
+	shape, ok := value.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("unexpected JSON type %v", value)
+	}
+
+	var sv *types.AwsAdditionalDetails
+	if *v == nil {
+		sv = &types.AwsAdditionalDetails{}
+	} else {
+		sv = *v
+	}
+
+	for key, value := range shape {
+		switch key {
+		case "identityContext":
+			if value != nil {
+				jtv, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("expected IdentityContext to be of type string, got %T instead", value)
+				}
+				sv.IdentityContext = ptr.String(jtv)
 			}
 
 		default:
@@ -1717,6 +1849,55 @@ func awsRestjson1_deserializeDocumentInvalidGrantException(v **types.InvalidGran
 	return nil
 }
 
+func awsRestjson1_deserializeDocumentInvalidRedirectUriException(v **types.InvalidRedirectUriException, value interface{}) error {
+	if v == nil {
+		return fmt.Errorf("unexpected nil of type %T", v)
+	}
+	if value == nil {
+		return nil
+	}
+
+	shape, ok := value.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("unexpected JSON type %v", value)
+	}
+
+	var sv *types.InvalidRedirectUriException
+	if *v == nil {
+		sv = &types.InvalidRedirectUriException{}
+	} else {
+		sv = *v
+	}
+
+	for key, value := range shape {
+		switch key {
+		case "error":
+			if value != nil {
+				jtv, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("expected Error to be of type string, got %T instead", value)
+				}
+				sv.Error_ = ptr.String(jtv)
+			}
+
+		case "error_description":
+			if value != nil {
+				jtv, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("expected ErrorDescription to be of type string, got %T instead", value)
+				}
+				sv.Error_description = ptr.String(jtv)
+			}
+
+		default:
+			_, _ = key, value
+
+		}
+	}
+	*v = sv
+	return nil
+}
+
 func awsRestjson1_deserializeDocumentInvalidRequestException(v **types.InvalidRequestException, value interface{}) error {
 	if v == nil {
 		return fmt.Errorf("unexpected nil of type %T", v)
@@ -1755,6 +1936,15 @@ func awsRestjson1_deserializeDocumentInvalidRequestException(v **types.InvalidRe
 					return fmt.Errorf("expected ErrorDescription to be of type string, got %T instead", value)
 				}
 				sv.Error_description = ptr.String(jtv)
+			}
+
+		case "reason":
+			if value != nil {
+				jtv, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("expected InvalidRequestExceptionReason to be of type string, got %T instead", value)
+				}
+				sv.Reason = types.InvalidRequestExceptionReason(jtv)
 			}
 
 		default:

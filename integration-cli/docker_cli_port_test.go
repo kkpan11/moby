@@ -2,15 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/testutil"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/internal/testutil"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -19,12 +21,12 @@ type DockerCLIPortSuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerCLIPortSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIPortSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIPortSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIPortSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 func (s *DockerCLIPortSuite) TestPortList(c *testing.T) {
@@ -102,7 +104,7 @@ func (s *DockerCLIPortSuite) TestPortList(c *testing.T) {
 	testRange := func() {
 		// host port ranges used
 		IDs := make([]string, 3)
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			out = cli.DockerCmd(c, "run", "-d", "-p", "9090-9092:80", "busybox", "top").Stdout()
 			IDs[i] = strings.TrimSpace(out)
 
@@ -119,7 +121,7 @@ func (s *DockerCLIPortSuite) TestPortList(c *testing.T) {
 		// Exhausted port range did not return an error
 		assert.Assert(c, err != nil, "out: %s", out)
 
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			cli.DockerCmd(c, "rm", "-f", IDs[i])
 		}
 	}
@@ -163,44 +165,26 @@ func (s *DockerCLIPortSuite) TestPortList(c *testing.T) {
 	cli.DockerCmd(c, "rm", "-f", id)
 }
 
-func assertPortList(c *testing.T, out string, expected []string) {
-	c.Helper()
-	lines := strings.Split(strings.Trim(out, "\n "), "\n")
-	assert.Assert(c, is.Len(lines, len(expected)), "expected: %s", strings.Join(expected, ", "))
+func assertPortList(t *testing.T, out string, expected []string) {
+	t.Helper()
 
-	sort.Strings(lines)
-	sort.Strings(expected)
-
-	// "docker port" does not yet have a "--format" flag, and older versions
-	// of the CLI used an incorrect output format for mappings on IPv6 addresses
-	// for example, "80/tcp -> :::80" instead of "80/tcp -> [::]:80".
-	oldFormat := func(mapping string) string {
-		old := strings.Replace(mapping, "[", "", 1)
-		old = strings.Replace(old, "]:", ":", 1)
-		return old
-	}
-
-	for i := 0; i < len(expected); i++ {
-		if lines[i] == expected[i] {
-			continue
-		}
-		assert.Equal(c, lines[i], oldFormat(expected[i]))
-	}
+	actual := strings.Split(strings.TrimSpace(out), "\n")
+	assert.DeepEqual(t, actual, expected, cmpopts.SortSlices(func(a, b string) bool { return a < b }))
 }
 
 func assertPortRange(ctx context.Context, id string, expectedTCP, expectedUDP []int) error {
-	client := testEnv.APIClient()
-	inspect, err := client.ContainerInspect(ctx, id)
+	apiClient := testEnv.APIClient()
+	res, err := apiClient.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 	if err != nil {
 		return err
 	}
 
 	var validTCP, validUDP bool
-	for portAndProto, binding := range inspect.NetworkSettings.Ports {
-		if portAndProto.Proto() == "tcp" && len(expectedTCP) == 0 {
+	for port, binding := range res.Container.NetworkSettings.Ports {
+		if port.Proto() == "tcp" && len(expectedTCP) == 0 {
 			continue
 		}
-		if portAndProto.Proto() == "udp" && len(expectedTCP) == 0 {
+		if port.Proto() == "udp" && len(expectedTCP) == 0 {
 			continue
 		}
 
@@ -225,16 +209,16 @@ func assertPortRange(ctx context.Context, id string, expectedTCP, expectedUDP []
 		}
 	}
 	if !validTCP {
-		return fmt.Errorf("tcp port not found")
+		return errors.New("tcp port not found")
 	}
 	if !validUDP {
-		return fmt.Errorf("udp port not found")
+		return errors.New("udp port not found")
 	}
 	return nil
 }
 
-func stopRemoveContainer(id string, c *testing.T) {
-	cli.DockerCmd(c, "rm", "-f", id)
+func stopRemoveContainer(id string, t *testing.T) {
+	cli.DockerCmd(t, "rm", "-f", id)
 }
 
 func (s *DockerCLIPortSuite) TestUnpublishedPortsInPsOutput(c *testing.T) {
@@ -251,9 +235,9 @@ func (s *DockerCLIPortSuite) TestUnpublishedPortsInPsOutput(c *testing.T) {
 	unpPort2 := fmt.Sprintf("%d/tcp", port2)
 	out := cli.DockerCmd(c, "ps", "-n=1").Stdout()
 	// Missing unpublished ports in docker ps output
-	assert.Assert(c, strings.Contains(out, unpPort1))
+	assert.Assert(c, is.Contains(out, unpPort1))
 	// Missing unpublished ports in docker ps output
-	assert.Assert(c, strings.Contains(out, unpPort2))
+	assert.Assert(c, is.Contains(out, unpPort2))
 	// Run the container forcing to publish the exposed ports
 	cli.DockerCmd(c, "run", "-d", "-P", expose1, expose2, "busybox", "sleep", "5")
 
@@ -279,9 +263,9 @@ func (s *DockerCLIPortSuite) TestUnpublishedPortsInPsOutput(c *testing.T) {
 	expBnd2 := fmt.Sprintf("0.0.0.0:%d->%s", offset+port2, unpPort2)
 	out = cli.DockerCmd(c, "ps", "-n=1").Stdout()
 	// Cannot find expected port binding (expBnd1) in docker ps output
-	assert.Assert(c, strings.Contains(out, expBnd1))
+	assert.Assert(c, is.Contains(out, expBnd1))
 	// Cannot find expected port binding (expBnd2) in docker ps output
-	assert.Assert(c, strings.Contains(out, expBnd2))
+	assert.Assert(c, is.Contains(out, expBnd2))
 	// Remove container now otherwise it will interfere with next test
 	stopRemoveContainer(id, c)
 
@@ -292,9 +276,9 @@ func (s *DockerCLIPortSuite) TestUnpublishedPortsInPsOutput(c *testing.T) {
 	// Check docker ps o/p for last created container reports the specified port mappings
 	out = cli.DockerCmd(c, "ps", "-n=1").Stdout()
 	// Cannot find expected port binding (expBnd1) in docker ps output
-	assert.Assert(c, strings.Contains(out, expBnd1))
+	assert.Assert(c, is.Contains(out, expBnd1))
 	// Cannot find expected port binding (expBnd2) in docker ps output
-	assert.Assert(c, strings.Contains(out, expBnd2))
+	assert.Assert(c, is.Contains(out, expBnd2))
 	// Remove container now otherwise it will interfere with next test
 	stopRemoveContainer(id, c)
 
@@ -304,9 +288,9 @@ func (s *DockerCLIPortSuite) TestUnpublishedPortsInPsOutput(c *testing.T) {
 	// Check docker ps o/p for last created container reports the specified unpublished port and port mapping
 	out = cli.DockerCmd(c, "ps", "-n=1").Stdout()
 	// Missing unpublished exposed ports (unpPort1) in docker ps output
-	assert.Assert(c, strings.Contains(out, unpPort1))
+	assert.Assert(c, is.Contains(out, unpPort1))
 	// Missing port binding (expBnd2) in docker ps output
-	assert.Assert(c, strings.Contains(out, expBnd2))
+	assert.Assert(c, is.Contains(out, expBnd2))
 }
 
 func (s *DockerCLIPortSuite) TestPortHostBinding(c *testing.T) {

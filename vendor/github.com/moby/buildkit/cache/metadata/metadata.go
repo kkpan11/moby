@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -20,14 +22,28 @@ const (
 	externalBucket = "_external"
 )
 
-var errNotFound = errors.Errorf("not found")
+var errNotFound = errors.New("not found")
 
 type Store struct {
 	db db.DB
 }
 
 func NewStore(dbPath string) (*Store, error) {
-	db, err := boltutil.Open(dbPath, 0600, nil)
+	// Check for legacy (v1) cache state.
+	//
+	// Automatic migration was removed in https://github.com/moby/buildkit/pull/6509
+	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+		legacyMetadata := filepath.Join(filepath.Dir(dbPath), "metadata.db")
+		if _, err := os.Stat(legacyMetadata); err == nil {
+			return nil, errors.Errorf(
+				"legacy (v1) cache metadata found at %q and needs to be removed or migrated; downgrade BuildKit to v0.27.1 to perform automatic migration or remove the existing cache",
+				legacyMetadata,
+			)
+		}
+	}
+	db, err := boltutil.Open(dbPath, 0600, &bolt.Options{
+		FreelistType: bolt.FreelistMapType,
+	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to open database file %s", dbPath)
 	}
@@ -193,7 +209,7 @@ func (s *Store) Get(id string) (*StorageItem, bool) {
 	}
 
 	var si *StorageItem
-	if err := s.db.Update(func(tx *bolt.Tx) error {
+	if err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(mainBucket))
 		if b == nil {
 			return nil
@@ -432,7 +448,7 @@ type Value struct {
 	Index string          `json:"index,omitempty"`
 }
 
-func NewValue(v interface{}) (*Value, error) {
+func NewValue(v any) (*Value, error) {
 	dt, err := json.Marshal(v)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -440,7 +456,7 @@ func NewValue(v interface{}) (*Value, error) {
 	return &Value{Value: json.RawMessage(dt)}, nil
 }
 
-func (v *Value) Unmarshal(target interface{}) error {
+func (v *Value) Unmarshal(target any) error {
 	return errors.WithStack(json.Unmarshal(v.Value, target))
 }
 

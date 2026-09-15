@@ -12,25 +12,28 @@ import (
 	"time"
 
 	"github.com/creack/pty"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/request"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/skip"
 )
 
-func (s *DockerCLIUpdateSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIUpdateSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIUpdateSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIUpdateSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 func (s *DockerCLIUpdateSuite) TestUpdateRunningContainer(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
 	testRequires(c, memoryLimitSupport)
+	skip.If(c, onlyCgroupsv2(), "FIXME: cgroupsV2 not supported yet")
 
 	const name = "test-update-container"
 	cli.DockerCmd(c, "run", "-d", "--name", name, "-m", "300M", "busybox", "top")
@@ -46,6 +49,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateRunningContainer(c *testing.T) {
 func (s *DockerCLIUpdateSuite) TestUpdateRunningContainerWithRestart(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
 	testRequires(c, memoryLimitSupport)
+	skip.If(c, onlyCgroupsv2(), "FIXME: cgroupsV2 not supported yet")
 
 	const name = "test-update-container"
 	cli.DockerCmd(c, "run", "-d", "--name", name, "-m", "300M", "busybox", "top")
@@ -62,6 +66,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateRunningContainerWithRestart(c *testing.
 func (s *DockerCLIUpdateSuite) TestUpdateStoppedContainer(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
 	testRequires(c, memoryLimitSupport)
+	skip.If(c, onlyCgroupsv2(), "FIXME: cgroupsV2 not supported yet")
 
 	const name = "test-update-container"
 	const file = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
@@ -77,6 +82,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateStoppedContainer(c *testing.T) {
 func (s *DockerCLIUpdateSuite) TestUpdatePausedContainer(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
 	testRequires(c, cpuShare)
+	skip.If(c, onlyCgroupsv2(), "FIXME: cgroupsV2 not supported yet")
 
 	const name = "test-update-container"
 	cli.DockerCmd(c, "run", "-d", "--name", name, "--cpu-shares", "1000", "busybox", "top")
@@ -95,6 +101,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateWithUntouchedFields(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
 	testRequires(c, memoryLimitSupport)
 	testRequires(c, cpuShare)
+	skip.If(c, onlyCgroupsv2(), "FIXME: cgroupsV2 not supported yet")
 
 	const name = "test-update-container"
 	cli.DockerCmd(c, "run", "-d", "--name", name, "-m", "300M", "--cpu-shares", "800", "busybox", "top")
@@ -118,7 +125,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateContainerInvalidValue(c *testing.T) {
 	out, _, err := dockerCmdWithError("update", "-m", "2M", name)
 	assert.ErrorContains(c, err, "")
 	expected := "Minimum memory limit allowed is 6MB"
-	assert.Assert(c, strings.Contains(out, expected))
+	assert.Assert(c, is.Contains(out, expected))
 }
 
 func (s *DockerCLIUpdateSuite) TestUpdateContainerWithoutFlags(c *testing.T) {
@@ -135,6 +142,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateSwapMemoryOnly(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
 	testRequires(c, memoryLimitSupport)
 	testRequires(c, swapMemorySupport)
+	skip.If(c, onlyCgroupsv2(), "FIXME: cgroupsV2 not supported yet")
 
 	const name = "test-update-container"
 	cli.DockerCmd(c, "run", "-d", "--name", name, "--memory", "300M", "--memory-swap", "500M", "busybox", "top")
@@ -151,6 +159,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateInvalidSwapMemory(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
 	testRequires(c, memoryLimitSupport)
 	testRequires(c, swapMemorySupport)
+	skip.If(c, onlyCgroupsv2(), "FIXME: cgroupsV2 not supported yet")
 
 	const name = "test-update-container"
 	cli.DockerCmd(c, "run", "-d", "--name", name, "--memory", "300M", "--memory-swap", "500M", "busybox", "top")
@@ -185,10 +194,10 @@ func (s *DockerCLIUpdateSuite) TestUpdateStats(c *testing.T) {
 		assert.NilError(c, err)
 		assert.Equal(c, resp.Header.Get("Content-Type"), "application/json")
 
-		var v *container.Stats
+		var v container.StatsResponse
 		err = json.NewDecoder(body).Decode(&v)
 		assert.NilError(c, err)
-		body.Close()
+		_ = body.Close()
 
 		return v.MemoryStats.Limit
 	}
@@ -209,7 +218,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateMemoryWithSwapMemory(c *testing.T) {
 	cli.DockerCmd(c, "run", "-d", "--name", name, "--memory", "300M", "busybox", "top")
 	out, _, err := dockerCmdWithError("update", "--memory", "800M", name)
 	assert.ErrorContains(c, err, "")
-	assert.Assert(c, strings.Contains(out, "Memory limit should be smaller than already set memoryswap limit"))
+	assert.Assert(c, is.Contains(out, "Memory limit should be smaller than already set memoryswap limit"))
 
 	cli.DockerCmd(c, "update", "--memory", "800M", "--memory-swap", "1000M", name)
 }
@@ -231,7 +240,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateNotAffectMonitorRestartPolicy(c *testin
 	assert.NilError(c, cmd.Start())
 	defer cmd.Process.Kill()
 
-	_, err = cpty.Write([]byte("exit\n"))
+	_, err = cpty.WriteString("exit\n")
 	assert.NilError(c, err)
 
 	assert.NilError(c, cmd.Wait())
@@ -244,6 +253,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateNotAffectMonitorRestartPolicy(c *testin
 
 func (s *DockerCLIUpdateSuite) TestUpdateWithNanoCPUs(c *testing.T) {
 	testRequires(c, cpuCfsQuota, cpuCfsPeriod)
+	skip.If(c, onlyCgroupsv2(), "FIXME: cgroupsV2 not supported yet")
 
 	const file1 = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
 	const file2 = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
@@ -254,11 +264,11 @@ func (s *DockerCLIUpdateSuite) TestUpdateWithNanoCPUs(c *testing.T) {
 	out = cli.DockerCmd(c, "exec", "top", "sh", "-c", fmt.Sprintf("cat %s && cat %s", file1, file2)).Combined()
 	assert.Equal(c, strings.TrimSpace(out), "50000\n100000")
 
-	clt, err := client.NewClientWithOpts(client.FromEnv)
+	clt, err := client.New(client.FromEnv)
 	assert.NilError(c, err)
-	inspect, err := clt.ContainerInspect(testutil.GetContext(c), "top")
+	res, err := clt.ContainerInspect(testutil.GetContext(c), "top", client.ContainerInspectOptions{})
 	assert.NilError(c, err)
-	assert.Equal(c, inspect.HostConfig.NanoCPUs, int64(500000000))
+	assert.Equal(c, res.Container.HostConfig.NanoCPUs, int64(500000000))
 
 	out = inspectField(c, "top", "HostConfig.CpuQuota")
 	assert.Equal(c, out, "0", "CPU CFS quota should be 0")
@@ -267,12 +277,12 @@ func (s *DockerCLIUpdateSuite) TestUpdateWithNanoCPUs(c *testing.T) {
 
 	out, _, err = dockerCmdWithError("update", "--cpu-quota", "80000", "top")
 	assert.ErrorContains(c, err, "")
-	assert.Assert(c, strings.Contains(out, "Conflicting options: CPU Quota cannot be updated as NanoCPUs has already been set"))
+	assert.Assert(c, is.Contains(out, "Conflicting options: CPU Quota cannot be updated as NanoCPUs has already been set"))
 
 	cli.DockerCmd(c, "update", "--cpus", "0.8", "top")
-	inspect, err = clt.ContainerInspect(testutil.GetContext(c), "top")
+	res, err = clt.ContainerInspect(testutil.GetContext(c), "top", client.ContainerInspectOptions{})
 	assert.NilError(c, err)
-	assert.Equal(c, inspect.HostConfig.NanoCPUs, int64(800000000))
+	assert.Equal(c, res.Container.HostConfig.NanoCPUs, int64(800000000))
 
 	out = inspectField(c, "top", "HostConfig.CpuQuota")
 	assert.Equal(c, out, "0", "CPU CFS quota should be 0")

@@ -3,6 +3,7 @@ package solver
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -10,7 +11,9 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver/errdefs"
+	"github.com/moby/buildkit/solver/llbsolver/compat"
 	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/bkmaps"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/progress/controller"
@@ -27,8 +30,8 @@ type ResolveOpFunc func(Vertex, Builder) (Op, error)
 
 type Builder interface {
 	Build(ctx context.Context, e Edge) (CachedResultWithProvenance, error)
-	InContext(ctx context.Context, f func(ctx context.Context, g session.Group) error) error
-	EachValue(ctx context.Context, key string, fn func(interface{}) error) error
+	InContext(ctx context.Context, f func(ctx context.Context, jobCtx JobContext) error) error
+	EachValue(ctx context.Context, key string, fn func(any) error) error
 }
 
 // Solver provides a shared graph of all the vertexes currently being
@@ -47,19 +50,22 @@ type Solver struct {
 }
 
 type state struct {
-	jobs     map[*Job]struct{}
-	parents  map[digest.Digest]struct{}
-	childVtx map[digest.Digest]struct{}
+	jobs      map[*Job]struct{}
+	parents   map[digest.Digest]struct{}
+	childVtx  map[digest.Digest]struct{}
+	releasers []func() error
 
-	mpw   *progress.MultiWriter
-	allPw map[progress.Writer]struct{}
-	mspan *tracing.MultiSpan
+	mpw      *progress.MultiWriter
+	allPw    map[progress.Writer]struct{}
+	allPwMu  sync.Mutex // protects allPw
+	mspan    *tracing.MultiSpan
+	execSpan trace.Span
 
 	vtx          Vertex
 	clientVertex client.Vertex
 	origDigest   digest.Digest // original LLB digest. TODO: probably better to use string ID so this isn't needed
 
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	op    *sharedOp
 	edges map[Index]*edge
 	opts  SolverOpt
@@ -67,7 +73,62 @@ type state struct {
 
 	cache     map[string]CacheManager
 	mainCache CacheManager
+	metadata  VertexMetadata
 	solver    *Solver
+}
+
+func (s *state) Session() session.Group {
+	return s
+}
+
+func (s *state) Cleanup(fn func() error) error {
+	s.mu.Lock()
+	s.releasers = append(s.releasers, fn)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *state) ResolverCache() ResolverCache {
+	return s
+}
+
+func (s *state) CompatibilityVersion() (int, error) {
+	s.mu.RLock()
+	jobs := make([]*Job, 0, len(s.jobs))
+	for j := range s.jobs {
+		jobs = append(jobs, j)
+	}
+	s.mu.RUnlock()
+
+	version := 0
+	for _, j := range jobs {
+		v, err := j.CompatibilityVersion()
+		if err != nil {
+			return 0, err
+		}
+		if version == 0 {
+			version = v
+			continue
+		}
+		if version != v {
+			return 0, errors.Errorf("conflicting compatibility versions in shared solve state: %d != %d", version, v)
+		}
+	}
+	if version == 0 {
+		return compat.CompatibilityVersionCurrent, nil
+	}
+	return version, nil
+}
+
+func (s *state) Lock(key any) (values []any, release func(any) error, err error) {
+	var rcs []ResolverCache
+	s.mu.RLock()
+	for j := range s.jobs {
+		rcs = append(rcs, j.resolverCache)
+	}
+	s.mu.RUnlock()
+
+	return combinedResolverCache(rcs).Lock(key)
 }
 
 func (s *state) SessionIterator() session.Iterator {
@@ -177,11 +238,15 @@ func (s *state) setEdge(index Index, targetEdge *edge, targetState *state) {
 
 	if targetState != nil {
 		targetState.addJobs(s, map[*state]struct{}{})
+		targetState.releasers = append(targetState.releasers, s.releasers...)
+		s.releasers = nil
 
+		targetState.allPwMu.Lock()
 		if _, ok := targetState.allPw[s.mpw]; !ok {
 			targetState.mpw.Add(s.mpw)
 			targetState.allPw[s.mpw] = struct{}{}
 		}
+		targetState.allPwMu.Unlock()
 	}
 }
 
@@ -231,19 +296,20 @@ func (s *state) addJobs(srcState *state, memo map[*state]struct{}) {
 }
 
 func (s *state) combinedCacheManager() CacheManager {
-	s.mu.Lock()
+	s.mu.RLock()
 	cms := make([]CacheManager, 0, len(s.cache)+1)
-	cms = append(cms, s.mainCache)
+	mainCache := s.mainCache
+	cms = append(cms, mainCache)
 	for _, cm := range s.cache {
 		cms = append(cms, cm)
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	if len(cms) == 1 {
-		return s.mainCache
+		return mainCache
 	}
 
-	return NewCombinedCacheManager(cms, s.mainCache)
+	return NewCombinedCacheManager(cms, mainCache)
 }
 
 func (s *state) Release() {
@@ -255,6 +321,11 @@ func (s *state) Release() {
 	}
 	if s.op != nil {
 		s.op.release()
+	}
+	for _, r := range s.releasers {
+		if err := r(); err != nil {
+			bklog.G(context.TODO()).WithError(err).Error("failed to cleanup job resources")
+		}
 	}
 }
 
@@ -275,7 +346,7 @@ func (sb *subBuilder) Build(ctx context.Context, e Edge) (CachedResultWithProven
 	return &withProvenance{CachedResult: res}, nil
 }
 
-func (sb *subBuilder) InContext(ctx context.Context, f func(context.Context, session.Group) error) error {
+func (sb *subBuilder) InContext(ctx context.Context, f func(context.Context, JobContext) error) error {
 	ctx = progress.WithProgress(ctx, sb.mpw)
 	if sb.mspan.Span != nil {
 		ctx = trace.ContextWithSpan(ctx, sb.mspan)
@@ -283,10 +354,15 @@ func (sb *subBuilder) InContext(ctx context.Context, f func(context.Context, ses
 	return f(ctx, sb.state)
 }
 
-func (sb *subBuilder) EachValue(ctx context.Context, key string, fn func(interface{}) error) error {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
+func (sb *subBuilder) EachValue(ctx context.Context, key string, fn func(any) error) error {
+	sb.state.mu.RLock()
+	jobs := make([]*Job, 0, len(sb.jobs))
 	for j := range sb.jobs {
+		jobs = append(jobs, j)
+	}
+	sb.state.mu.RUnlock()
+
+	for _, j := range jobs {
 		if err := j.EachValue(ctx, key, fn); err != nil {
 			return err
 		}
@@ -295,14 +371,17 @@ func (sb *subBuilder) EachValue(ctx context.Context, key string, fn func(interfa
 }
 
 type Job struct {
+	mu            sync.Mutex // protects completedTime, pw, span
 	list          *Solver
 	pr            *progress.MultiReader
 	pw            progress.Writer
 	span          trace.Span
-	values        sync.Map
+	values        bkmaps.SyncMap[string, any]
 	id            string
 	startedTime   time.Time
 	completedTime time.Time
+	releasers     []func() error
+	resolverCache *resolverCache
 
 	progressCloser func(error)
 	SessionID      string
@@ -465,7 +544,7 @@ func (jl *Solver) loadUnlocked(ctx context.Context, v, parent Vertex, j *Job, ca
 
 	dgst := v.Digest()
 
-	dgstWithoutCache := digest.FromBytes([]byte(fmt.Sprintf("%s-ignorecache", dgst)))
+	dgstWithoutCache := digest.FromBytes(fmt.Appendf(nil, "%s-ignorecache", dgst))
 
 	// if same vertex is already loaded without cache just use that
 	st, ok := jl.actives[dgstWithoutCache]
@@ -550,6 +629,13 @@ func (jl *Solver) loadUnlocked(ctx context.Context, v, parent Vertex, j *Job, ca
 			}
 		}
 	}
+	if md := v.Options().Metadata; md != nil {
+		if st.metadata == nil {
+			st.metadata = md
+		} else {
+			st.metadata = st.metadata.Merge(md)
+		}
+	}
 
 	if j != nil {
 		if _, ok := st.jobs[j]; !ok {
@@ -567,9 +653,7 @@ func (jl *Solver) loadUnlocked(ctx context.Context, v, parent Vertex, j *Job, ca
 			}
 			parentState.childVtx[dgst] = struct{}{}
 
-			for id, c := range parentState.cache {
-				st.cache[id] = c
-			}
+			maps.Copy(st.cache, parentState.cache)
 		}
 	}
 
@@ -580,14 +664,20 @@ func (jl *Solver) loadUnlocked(ctx context.Context, v, parent Vertex, j *Job, ca
 
 func (jl *Solver) connectProgressFromState(target, src *state) {
 	for j := range src.jobs {
-		if _, ok := target.allPw[j.pw]; !ok {
-			target.mpw.Add(j.pw)
-			target.allPw[j.pw] = struct{}{}
-			j.pw.Write(identity.NewID(), target.clientVertex)
-			if j.span != nil && j.span.SpanContext().IsValid() {
-				target.mspan.Add(j.span)
+		j.mu.Lock()
+		pw := j.pw
+		span := j.span
+		j.mu.Unlock()
+		target.allPwMu.Lock()
+		if _, ok := target.allPw[pw]; !ok {
+			target.mpw.Add(pw)
+			target.allPw[pw] = struct{}{}
+			pw.Write(identity.NewID(), target.clientVertex)
+			if span != nil && span.SpanContext().IsValid() {
+				target.mspan.Add(span)
 			}
 		}
+		target.allPwMu.Unlock()
 	}
 	for p := range src.parents {
 		jl.connectProgressFromState(target, jl.actives[p])
@@ -615,6 +705,7 @@ func (jl *Solver) NewJob(id string) (*Job, error) {
 		id:             id,
 		startedTime:    time.Now(),
 		uniqueID:       identity.NewID(),
+		resolverCache:  newResolverCache(),
 	}
 	jl.jobs[id] = j
 
@@ -625,8 +716,8 @@ func (jl *Solver) NewJob(id string) (*Job, error) {
 
 func (jl *Solver) Get(id string) (*Job, error) {
 	ctx, cancel := context.WithCancelCause(context.Background())
-	ctx, _ = context.WithTimeoutCause(ctx, 6*time.Second, errors.WithStack(context.DeadlineExceeded))
-	defer cancel(errors.WithStack(context.Canceled))
+	ctx, _ = context.WithTimeoutCause(ctx, 6*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 	go func() {
 		<-ctx.Done()
@@ -693,7 +784,9 @@ func (jl *Solver) deleteIfUnreferenced(k digest.Digest, st *state) {
 
 func (j *Job) Build(ctx context.Context, e Edge) (CachedResultWithProvenance, error) {
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
+		j.mu.Lock()
 		j.span = span
+		j.mu.Unlock()
 	}
 
 	v, err := j.list.load(ctx, e.Vertex, nil, j)
@@ -732,17 +825,25 @@ func (j *Job) walkProvenance(ctx context.Context, e Edge, f func(ProvenanceProvi
 		return nil
 	}
 	visited[e.Vertex.Digest()] = struct{}{}
+	// Walk via the resolved state's inputs when available, so the recursion
+	// follows the chain that was actually scheduled rather than the caller's
+	// wrapper graph (which can reference orphan states via the
+	// dgstWithoutCache shift in loadUnlocked).
+	inputs := e.Vertex.Inputs()
 	if st, ok := j.list.actives[e.Vertex.Digest()]; ok {
 		st.mu.Lock()
-		if wp, ok := st.op.op.(ProvenanceProvider); ok {
-			if err := f(wp); err != nil {
-				st.mu.Unlock()
-				return err
+		if st.op != nil && st.op.op != nil {
+			if wp, ok := st.op.op.(ProvenanceProvider); ok {
+				if err := f(wp); err != nil {
+					st.mu.Unlock()
+					return err
+				}
 			}
 		}
+		inputs = st.vtx.Inputs()
 		st.mu.Unlock()
 	}
-	for _, inp := range e.Vertex.Inputs() {
+	for _, inp := range inputs {
 		if err := j.walkProvenance(ctx, inp, f, visited); err != nil {
 			return err
 		}
@@ -779,6 +880,13 @@ func (j *Job) Discard() error {
 		st.mu.Unlock()
 	}
 
+	for _, r := range j.releasers {
+		if err := r(); err != nil {
+			bklog.G(context.TODO()).WithError(err).Error("failed to cleanup job resources")
+		}
+	}
+	j.releasers = nil
+
 	go func() {
 		// don't clear job right away. there might still be a status request coming to read progress
 		time.Sleep(10 * time.Second)
@@ -794,6 +902,8 @@ func (j *Job) StartedTime() time.Time {
 }
 
 func (j *Job) RegisterCompleteTime() time.Time {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	if j.completedTime.IsZero() {
 		j.completedTime = time.Now()
 	}
@@ -804,15 +914,45 @@ func (j *Job) UniqueID() string {
 	return j.uniqueID
 }
 
-func (j *Job) InContext(ctx context.Context, f func(context.Context, session.Group) error) error {
-	return f(progress.WithProgress(ctx, j.pw), session.NewGroup(j.SessionID))
+func (j *Job) CompatibilityVersion() (int, error) {
+	version := compat.CompatibilityVersionCurrent
+	if err := j.EachValue(context.TODO(), compat.JobValueKey, func(v any) error {
+		parsed, ok := v.(int)
+		if !ok {
+			return errors.Errorf("invalid compatibility version %T", v)
+		}
+		version = parsed
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return version, nil
 }
 
-func (j *Job) SetValue(key string, v interface{}) {
+func (j *Job) InContext(ctx context.Context, f func(context.Context, JobContext) error) error {
+	return f(progress.WithProgress(ctx, j.pw), j)
+}
+
+func (j *Job) Session() session.Group {
+	return session.NewGroup(j.SessionID)
+}
+
+func (j *Job) Cleanup(fn func() error) error {
+	j.mu.Lock()
+	j.releasers = append(j.releasers, fn)
+	j.mu.Unlock()
+	return nil
+}
+
+func (j *Job) ResolverCache() ResolverCache {
+	return j.resolverCache
+}
+
+func (j *Job) SetValue(key string, v any) {
 	j.values.Store(key, v)
 }
 
-func (j *Job) EachValue(ctx context.Context, key string, fn func(interface{}) error) error {
+func (j *Job) EachValue(ctx context.Context, key string, fn func(any) error) error {
 	v, ok := j.values.Load(key)
 	if ok {
 		return fn(v)
@@ -827,8 +967,8 @@ type cacheMapResp struct {
 
 type activeOp interface {
 	CacheMap(context.Context, int) (*cacheMapResp, error)
-	LoadCache(ctx context.Context, rec *CacheRecord) (Result, error)
-	Exec(ctx context.Context, inputs []Result) (outputs []Result, exporters []ExportableCacheKey, err error)
+	LoadCache(ctx context.Context, rec *CacheRecord) (Result, func(context.Context) context.Context, error)
+	Exec(ctx context.Context, inputs []Result) (outputs []Result, exporters []ExportableCacheKey, ctxOpts func(context.Context) context.Context, err error)
 	IgnoreCache() bool
 	Cache() CacheManager
 	CalcSlowCache(context.Context, Index, PreprocessFunc, ResultBasedCacheFunc, Result) (digest.Digest, error)
@@ -893,25 +1033,30 @@ func (c cacheWithCacheOpts) Records(ctx context.Context, ck *CacheKey) ([]*Cache
 	return c.CacheManager.Records(withAncestorCacheOpts(ctx, c.st), ck)
 }
 
-func (s *sharedOp) LoadCache(ctx context.Context, rec *CacheRecord) (Result, error) {
+func (s *sharedOp) LoadCache(ctx context.Context, rec *CacheRecord) (Result, func(context.Context) context.Context, error) {
 	ctx = progress.WithProgress(ctx, s.st.mpw)
 	if s.st.mspan.Span != nil {
 		ctx = trace.ContextWithSpan(ctx, s.st.mspan)
 	}
 	// no cache hit. start evaluating the node
 	span, ctx := tracing.StartSpan(ctx, "load cache: "+s.st.vtx.Name(), trace.WithAttributes(attribute.String("vertex", s.st.vtx.Digest().String())))
+	s.st.execSpan = span
 	notifyCompleted := notifyStarted(ctx, &s.st.clientVertex, true)
 	res, err := s.Cache().Load(withAncestorCacheOpts(ctx, s.st), rec)
 	tracing.FinishWithError(span, err)
 	notifyCompleted(err, true)
-	return res, err
+	return res, func(ctx context.Context) context.Context {
+		return withAncestorCacheOpts(ctx, s.st)
+	}, err
 }
 
 // CalcSlowCache computes the digest of an input that is ready and has been
 // evaluated, hence "slow" cache.
 func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, p PreprocessFunc, f ResultBasedCacheFunc, res Result) (dgst digest.Digest, err error) {
 	defer func() {
-		err = WrapSlowCache(err, index, NewSharedResult(res).Clone())
+		if err != nil {
+			err = WrapSlowCache(err, index, res.Clone())
+		}
 		err = errdefs.WithOp(err, s.st.vtx.Sys(), s.st.vtx.Options().Description)
 		err = errdefs.WrapVertex(err, s.st.origDigest)
 	}()
@@ -936,7 +1081,9 @@ func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, p PreprocessF
 				return "", errors.Errorf("failed to get state for index %d on %v", index, s.st.vtx.Name())
 			}
 			ctx2 := progress.WithProgress(ctx, st.mpw)
-			if st.mspan.Span != nil {
+			if st.execSpan != nil {
+				ctx2 = trace.ContextWithSpan(ctx2, st.execSpan)
+			} else if st.mspan.Span != nil {
 				ctx2 = trace.ContextWithSpan(ctx2, st.mspan)
 			}
 			err = p(ctx2, res, st)
@@ -1034,7 +1181,7 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 		if complete {
 			if err == nil {
 				if res.Opts == nil {
-					res.Opts = CacheOpts(make(map[interface{}]interface{}))
+					res.Opts = CacheOpts(make(map[any]any))
 				}
 				res.Opts[progressKey{}] = &controller.Controller{
 					WriterFactory: progress.FromContext(ctx),
@@ -1060,14 +1207,14 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 	return &cacheMapResp{CacheMap: res[index], complete: s.cacheDone}, nil
 }
 
-func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result, exporters []ExportableCacheKey, err error) {
+func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result, exporters []ExportableCacheKey, ctxOpts func(context.Context) context.Context, err error) {
 	defer func() {
 		err = errdefs.WithOp(err, s.st.vtx.Sys(), s.st.vtx.Options().Description)
 		err = errdefs.WrapVertex(err, s.st.origDigest)
 	}()
 	op, err := s.getOp()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	flightControlKey := "exec"
 	res, err := s.gExecRes.Do(ctx, flightControlKey, func(ctx context.Context) (ret *execRes, retErr error) {
@@ -1091,6 +1238,7 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 
 		// no cache hit. start evaluating the node
 		span, ctx := tracing.StartSpan(ctx, s.st.vtx.Name(), trace.WithAttributes(attribute.String("vertex", s.st.vtx.Digest().String())))
+		s.st.execSpan = span
 		notifyCompleted := notifyStarted(ctx, &s.st.clientVertex, false)
 		defer func() {
 			tracing.FinishWithError(span, retErr)
@@ -1130,20 +1278,40 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 		return s.execRes, nil
 	})
 	if res == nil || err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return unwrapShared(res.execRes), res.execExporters, nil
+	return unwrapShared(res.execRes), res.execExporters, func(ctx context.Context) context.Context {
+		return withAncestorCacheOpts(ctx, s.st)
+	}, nil
 }
 
 func (s *sharedOp) getOp() (Op, error) {
 	s.opOnce.Do(func() {
 		s.subBuilder = s.st.builder()
-		s.op, s.err = s.resolver(s.st.vtx, s.subBuilder)
+		s.st.mu.RLock()
+		metadata := s.st.metadata
+		s.st.mu.RUnlock()
+		v := s.st.vtx
+		if metadata != nil {
+			v = &vertexWithMetadata{Vertex: v, metadata: metadata}
+		}
+		s.op, s.err = s.resolver(v, s.subBuilder)
 	})
 	if s.err != nil {
 		return nil, s.err
 	}
 	return s.op, nil
+}
+
+type vertexWithMetadata struct {
+	Vertex
+	metadata VertexMetadata
+}
+
+func (v *vertexWithMetadata) Options() VertexOptions {
+	opts := v.Vertex.Options()
+	opts.Metadata = v.metadata
+	return opts
 }
 
 func (s *sharedOp) release() {

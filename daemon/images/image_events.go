@@ -1,18 +1,19 @@
-package images // import "github.com/docker/docker/daemon/images"
+package images
 
 import (
 	"context"
+	"maps"
 
-	"github.com/docker/docker/api/types/backend"
-	"github.com/docker/docker/api/types/events"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon/server/imagebackend"
 )
 
 // LogImageEvent generates an event related to an image with only the default attributes.
-func (i *ImageService) LogImageEvent(imageID, refName string, action events.Action) {
-	ctx := context.TODO()
+func (i *ImageService) LogImageEvent(ctx context.Context, imageID, refName string, action events.Action) {
+	ctx = context.WithoutCancel(ctx)
 	attributes := map[string]string{}
 
-	img, err := i.GetImage(ctx, imageID, backend.GetImageOpts{})
+	img, err := i.GetImage(ctx, imageID, imagebackend.GetImageOpts{})
 	if err == nil && img.Config != nil {
 		// image has not been removed yet.
 		// it could be missing if the event is `delete`.
@@ -32,7 +33,5 @@ func copyAttributes(attributes, labels map[string]string) {
 	if labels == nil {
 		return
 	}
-	for k, v := range labels {
-		attributes[k] = v
-	}
+	maps.Copy(attributes, labels)
 }

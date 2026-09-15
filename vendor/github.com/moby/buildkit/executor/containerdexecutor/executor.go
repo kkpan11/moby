@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -13,23 +14,26 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/mount"
+	ctd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/executor/oci"
 	resourcestypes "github.com/moby/buildkit/executor/resources/types"
 	gatewayapi "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/identity"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/network"
 	"github.com/pkg/errors"
 )
 
 type containerdExecutor struct {
-	client           *containerd.Client
+	client           *ctd.Client
 	root             string
 	networkProviders map[pb.NetMode]network.Provider
+	proxyProvider    network.ProxyProvider
 	cgroupParent     string
 	dnsConfig        *oci.DNSConfig
 	running          map[string]*containerState
@@ -38,7 +42,9 @@ type containerdExecutor struct {
 	selinux          bool
 	traceSocket      string
 	rootless         bool
+	hypervIsolation  bool
 	runtime          *RuntimeInfo
+	cdiManager       *cdidevices.Manager
 }
 
 // OnCreateRuntimer provides an alternative to OCI hooks for applying network
@@ -61,16 +67,19 @@ type RuntimeInfo struct {
 }
 
 type ExecutorOptions struct {
-	Client           *containerd.Client
+	Client           *ctd.Client
 	Root             string
 	CgroupParent     string
 	NetworkProviders map[pb.NetMode]network.Provider
+	ProxyProvider    network.ProxyProvider
 	DNSConfig        *oci.DNSConfig
 	ApparmorProfile  string
 	Selinux          bool
 	TraceSocket      string
 	Rootless         bool
+	HyperVIsolation  bool
 	Runtime          *RuntimeInfo
+	CDIManager       *cdidevices.Manager
 }
 
 // New creates a new executor backed by connection to containerd API
@@ -83,6 +92,7 @@ func New(executorOpts ExecutorOptions) executor.Executor {
 		client:           executorOpts.Client,
 		root:             executorOpts.Root,
 		networkProviders: executorOpts.NetworkProviders,
+		proxyProvider:    executorOpts.ProxyProvider,
 		cgroupParent:     executorOpts.CgroupParent,
 		dnsConfig:        executorOpts.DNSConfig,
 		running:          make(map[string]*containerState),
@@ -90,7 +100,9 @@ func New(executorOpts ExecutorOptions) executor.Executor {
 		selinux:          executorOpts.Selinux,
 		traceSocket:      executorOpts.TraceSocket,
 		rootless:         executorOpts.Rootless,
+		hypervIsolation:  executorOpts.HyperVIsolation,
 		runtime:          executorOpts.Runtime,
+		cdiManager:       executorOpts.CDIManager,
 	}
 }
 
@@ -102,11 +114,17 @@ type containerState struct {
 	// On Windows we need to use the root mounts to achieve the same thing that Linux does
 	// with rootfsPath. So we save both in details.
 	rootMounts []mount.Mount
+	// Destinations of the mounts that the rootless spec conversion removed, whose mount
+	// points have to be recreated after the container is gone.
+	removedMounts []string
 }
 
 func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.Mount, mounts []executor.Mount, process executor.ProcessInfo, started chan<- struct{}) (rec resourcestypes.Recorder, err error) {
 	if id == "" {
 		id = identity.NewID()
+	}
+	if err := executor.ValidContainerID(id); err != nil {
+		return nil, err
 	}
 
 	startedOnce := sync.Once{}
@@ -135,9 +153,22 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 		bklog.G(ctx).Info("enabling HostNetworking")
 	}
 
-	provider, ok := w.networkProviders[meta.NetMode]
-	if !ok {
-		return nil, errors.Errorf("unknown network mode %s", meta.NetMode)
+	proxyConfig := meta.Proxy
+	var provider network.Provider
+	if proxyConfig == nil {
+		var ok bool
+		provider, ok = w.networkProviders[meta.NetMode]
+		if !ok {
+			return nil, errors.Errorf("unknown network mode %s", meta.NetMode)
+		}
+	} else if w.proxyProvider == nil {
+		return nil, errors.New("proxy network provider is not available")
+	} else {
+		proxyConfig = &network.ProxyConfig{
+			Policy:     proxyConfig.Policy,
+			Capture:    proxyConfig.Capture,
+			EgressMode: meta.NetMode,
+		}
 	}
 
 	resolvConf, hostsFile, releasers, err := w.prepareExecutionEnv(ctx, root, mounts, meta, details, meta.NetMode)
@@ -149,15 +180,28 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 		defer releasers()
 	}
 
-	if err := w.ensureCWD(ctx, details, meta); err != nil {
+	if err := w.ensureCWD(details, meta); err != nil {
 		return nil, err
 	}
 
-	namespace, err := provider.New(ctx, meta.Hostname)
+	var namespace network.Namespace
+	if proxyConfig != nil {
+		namespace, err = w.proxyProvider.NewProxy(ctx, proxyConfig)
+	} else {
+		namespace, err = provider.New(ctx, meta.Hostname, network.NamespaceOptions{})
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer namespace.Close()
+	if proxyNS, ok := namespace.(network.ProxyNamespace); ok {
+		meta.Env = executor.ReplaceEnv(meta.Env, proxyNS.ProxyEnv())
+		cleanProxyCA, err := executor.InjectProxyCA(details.rootfsPath, proxyNS.ProxyCACert())
+		if err != nil {
+			return nil, err
+		}
+		defer cleanProxyCA()
+	}
 
 	spec, releaseSpec, err := w.createOCISpec(ctx, id, resolvConf, hostsFile, namespace, mounts, meta, details)
 	if err != nil {
@@ -167,11 +211,20 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 		defer releaseSpec()
 	}
 
-	opts := []containerd.NewContainerOpts{
-		containerd.WithSpec(spec),
+	// Recreate the mount points that the rootless spec conversion removed, so that they
+	// are left in the rootfs the way a rootful build leaves them. This executor has no
+	// identity mapping, so they are owned by root. moby/buildkit#6686
+	defer func() {
+		if err == nil {
+			err = executor.CreateMountStubs(details.rootfsPath, details.removedMounts, 0, 0)
+		}
+	}()
+
+	opts := []ctd.NewContainerOpts{
+		ctd.WithSpec(spec),
 	}
 	if w.runtime != nil {
-		opts = append(opts, containerd.WithRuntime(w.runtime.Name, w.runtime.Options))
+		opts = append(opts, ctd.WithRuntime(w.runtime.Name, w.runtime.Options))
 	}
 	container, err := w.client.NewContainer(ctx, id, opts...)
 	if err != nil {
@@ -195,7 +248,7 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 		return nil, err
 	}
 	if w.runtime != nil && w.runtime.Path != "" {
-		taskOpts = append(taskOpts, containerd.WithRuntimePath(w.runtime.Path))
+		taskOpts = append(taskOpts, ctd.WithRuntimePath(w.runtime.Path))
 	}
 	task, err := container.NewTask(ctx, cio.NewCreator(cioOpts...), taskOpts...)
 	if err != nil {
@@ -203,7 +256,7 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 	}
 
 	defer func() {
-		if _, err1 := task.Delete(context.WithoutCancel(ctx), containerd.WithProcessKill); err == nil && err1 != nil {
+		if _, err1 := task.Delete(context.WithoutCancel(ctx), ctd.WithProcessKill); err == nil && err1 != nil {
 			err = errors.Wrapf(err1, "failed to delete task %s", id)
 		}
 	}()
@@ -215,7 +268,7 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 	}
 
 	trace.SpanFromContext(ctx).AddEvent("Container created")
-	err = w.runProcess(ctx, task, process.Resize, process.Signal, func() {
+	err = w.runProcess(ctx, task, process.Resize, process.Signal, process.Meta.ValidExitCodes, func() {
 		startedOnce.Do(func() {
 			trace.SpanFromContext(ctx).AddEvent("Container started")
 			if started != nil {
@@ -240,8 +293,8 @@ func (w *containerdExecutor) Exec(ctx context.Context, id string, process execut
 	if !ok {
 		return errors.Errorf("container %s not found", id)
 	}
-	var container containerd.Container
-	var task containerd.Task
+	var container ctd.Container
+	var task ctd.Task
 	for {
 		if container == nil {
 			container, _ = w.client.LoadContainer(ctx, id)
@@ -251,7 +304,7 @@ func (w *containerdExecutor) Exec(ctx context.Context, id string, process execut
 		}
 		if task != nil {
 			status, _ := task.Status(ctx)
-			if status.Status == containerd.Running {
+			if status.Status == ctd.Running {
 				break
 			}
 		}
@@ -274,6 +327,10 @@ func (w *containerdExecutor) Exec(ctx context.Context, id string, process execut
 	}
 
 	proc := spec.Process
+	if meta.Proxy != nil && len(meta.Env) > 0 {
+		meta.Env = executor.ReplaceEnv(meta.Env, network.FilterProxyEnv(proc.Env))
+		process.Meta = meta
+	}
 	if meta.User != "" {
 		userSpec, err := getUserSpec(meta.User, details.rootfsPath)
 		if err != nil {
@@ -291,8 +348,8 @@ func (w *containerdExecutor) Exec(ctx context.Context, id string, process execut
 	if meta.Cwd != "" {
 		spec.Process.Cwd = meta.Cwd
 	}
-	if len(process.Meta.Env) > 0 {
-		spec.Process.Env = process.Meta.Env
+	if len(meta.Env) > 0 {
+		proc.Env = meta.Env
 	}
 
 	fixProcessOutput(&process)
@@ -306,7 +363,7 @@ func (w *containerdExecutor) Exec(ctx context.Context, id string, process execut
 		return errors.WithStack(err)
 	}
 
-	err = w.runProcess(ctx, taskProcess, process.Resize, process.Signal, nil)
+	err = w.runProcess(ctx, taskProcess, process.Resize, process.Signal, process.Meta.ValidExitCodes, nil)
 	return err
 }
 
@@ -316,14 +373,14 @@ func fixProcessOutput(process *executor.ProcessInfo) {
 	// failed to start io pipe copy: unable to copy pipes: containerd-shim: opening file "" failed: open : no such file or directory: unknown
 	// So just stub out any missing output
 	if process.Stdout == nil {
-		process.Stdout = &nopCloser{io.Discard}
+		process.Stdout = &iohelper.NopWriteCloser{Writer: io.Discard}
 	}
 	if process.Stderr == nil {
-		process.Stderr = &nopCloser{io.Discard}
+		process.Stderr = &iohelper.NopWriteCloser{Writer: io.Discard}
 	}
 }
 
-func (w *containerdExecutor) runProcess(ctx context.Context, p containerd.Process, resize <-chan executor.WinSize, signal <-chan syscall.Signal, started func()) error {
+func (w *containerdExecutor) runProcess(ctx context.Context, p ctd.Process, resize <-chan executor.WinSize, signal <-chan syscall.Signal, validExitCodes []int, started func()) error {
 	// Not using `ctx` here because the context passed only affects the statusCh which we
 	// don't want cancelled when ctx.Done is sent.  We want to process statusCh on cancel.
 	statusCh, err := p.Wait(context.Background())
@@ -346,7 +403,7 @@ func (w *containerdExecutor) runProcess(ctx context.Context, p containerd.Proces
 		started()
 	}
 
-	p.CloseIO(ctx, containerd.WithStdinCloser)
+	p.CloseIO(ctx, ctd.WithStdinCloser)
 
 	// handle signals (and resize) in separate go loop so it does not
 	// potentially block the container cancel/exit status loop below.
@@ -394,7 +451,7 @@ func (w *containerdExecutor) runProcess(ctx context.Context, p containerd.Proces
 			ctxDone = nil
 			var killCtx context.Context
 			killCtx, cancel = context.WithCancelCause(context.Background())
-			killCtx, _ = context.WithTimeoutCause(killCtx, 10*time.Second, errors.WithStack(context.DeadlineExceeded))
+			killCtx, _ = context.WithTimeoutCause(killCtx, 10*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
 			killCtxDone = killCtx.Done()
 			p.Kill(killCtx, syscall.SIGKILL)
 			io.Cancel()
@@ -408,36 +465,36 @@ func (w *containerdExecutor) runProcess(ctx context.Context, p containerd.Proces
 					attribute.Int("exit.code", int(status.ExitCode())),
 				),
 			)
-			if status.ExitCode() != 0 {
-				exitErr := &gatewayapi.ExitError{
-					ExitCode: status.ExitCode(),
-					Err:      status.Error(),
+
+			if validExitCodes == nil {
+				// no exit codes specified, so only 0 is allowed
+				if status.ExitCode() == 0 {
+					return nil
 				}
-				if status.ExitCode() == gatewayapi.UnknownExitStatus && status.Error() != nil {
-					exitErr.Err = errors.Wrap(status.Error(), "failure waiting for process")
-				}
-				select {
-				case <-ctx.Done():
-					exitErr.Err = errors.Wrap(context.Cause(ctx), exitErr.Error())
-				default:
-				}
-				return exitErr
+			} else if slices.Contains(validExitCodes, int(status.ExitCode())) {
+				// exit code in allowed list, so exit cleanly
+				return nil
 			}
-			return nil
+
+			exitErr := &gatewayapi.ExitError{
+				ExitCode: status.ExitCode(),
+				Err:      status.Error(),
+			}
+			if status.ExitCode() == gatewayapi.UnknownExitStatus && status.Error() != nil {
+				exitErr.Err = errors.Wrap(status.Error(), "failure waiting for process")
+			}
+			select {
+			case <-ctx.Done():
+				exitErr.Err = errors.Wrap(context.Cause(ctx), exitErr.Error())
+			default:
+			}
+			return exitErr
 		case <-killCtxDone:
 			if cancel != nil {
 				cancel(errors.WithStack(context.Canceled))
 			}
 			io.Cancel()
-			return errors.Errorf("failed to kill process on cancel")
+			return errors.New("failed to kill process on cancel")
 		}
 	}
-}
-
-type nopCloser struct {
-	io.Writer
-}
-
-func (c *nopCloser) Close() error {
-	return nil
 }

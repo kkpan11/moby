@@ -1,11 +1,12 @@
 package oci
 
 import (
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/continuity/fs"
-	"github.com/docker/docker/pkg/idtools"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/sys/user"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 )
@@ -20,6 +21,9 @@ func generateMountOpts(_, _ string) []oci.SpecOpts {
 
 // generateSecurityOpts may affect mounts, so must be called after generateMountOpts
 func generateSecurityOpts(mode pb.SecurityMode, _ string, _ bool) ([]oci.SpecOpts, error) {
+	if err := pb.ValidateSecurityMode(mode); err != nil {
+		return nil, err
+	}
 	if mode == pb.SecurityMode_INSECURE {
 		return nil, errors.New("no support for running in insecure mode on FreeBSD")
 	}
@@ -34,7 +38,7 @@ func generateProcessModeOpts(mode ProcessMode) ([]oci.SpecOpts, error) {
 	return nil, nil
 }
 
-func generateIDmapOpts(idmap *idtools.IdentityMapping) ([]oci.SpecOpts, error) {
+func generateIDmapOpts(idmap *user.IdentityMapping) ([]oci.SpecOpts, error) {
 	if idmap == nil {
 		return nil, nil
 	}
@@ -69,4 +73,18 @@ func sub(m mount.Mount, subPath string) (mount.Mount, func() error, error) {
 	}
 	m.Source = src
 	return m, func() error { return nil }, nil
+}
+
+func generateLinuxResourceOpts(res *pb.LinuxResources) ([]oci.SpecOpts, error) {
+	if res == nil {
+		return nil, nil
+	}
+	return nil, errors.New("no support for Linux resource limits on FreeBSD")
+}
+
+func generateCDIOpts(_ *cdidevices.Manager, devices []*pb.CDIDevice) ([]oci.SpecOpts, error) {
+	if len(devices) == 0 {
+		return nil, nil
+	}
+	return nil, errors.New("no support for CDI on FreeBSD")
 }

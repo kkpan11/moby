@@ -20,12 +20,13 @@
 //	if err != nil {
 //		return fmt.Errorf("Error looking up volume plugin example: %v", err)
 //	}
-package plugins // import "github.com/docker/docker/pkg/plugins"
+package plugins
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -193,25 +194,20 @@ func (p *Plugin) implements(kind string) bool {
 	if p.Manifest == nil {
 		return false
 	}
-	for _, driver := range p.Manifest.Implements {
-		if driver == kind {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(p.Manifest.Implements, kind)
 }
 
 func loadWithRetry(name string, retry bool) (*Plugin, error) {
 	registry := NewLocalRegistry()
 	start := time.Now()
-	var testTimeOut int
+	var testTimeOut time.Duration
 	if name == testNonExistingPlugin {
 		// override the timeout in tests
-		testTimeOut = 2
+		testTimeOut = 2 * time.Second
 	}
 	var retries int
 	for {
-		pl, err := registry.Plugin(name)
+		plugin, err := registry.Plugin(name)
 		if err != nil {
 			if !retry {
 				return nil, err
@@ -232,17 +228,17 @@ func loadWithRetry(name string, retry bool) (*Plugin, error) {
 			storage.Unlock()
 			return pl, pl.activate()
 		}
-		storage.plugins[name] = pl
+		storage.plugins[name] = plugin
 		storage.Unlock()
 
-		err = pl.activate()
+		err = plugin.activate()
 		if err != nil {
 			storage.Lock()
 			delete(storage.plugins, name)
 			storage.Unlock()
 		}
 
-		return pl, err
+		return plugin, err
 	}
 }
 
@@ -322,8 +318,8 @@ func (l *LocalRegistry) GetAll(imp string) ([]*Plugin, error) {
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			pl, err := loadWithRetry(name, false)
-			chPl <- &plLoad{pl, err}
+			plg, err := loadWithRetry(name, false)
+			chPl <- &plLoad{plg, err}
 		}(name)
 	}
 

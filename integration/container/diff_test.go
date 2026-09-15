@@ -1,11 +1,12 @@
-package container // import "github.com/docker/docker/integration/container"
+package container
 
 import (
 	"testing"
 	"time"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/integration/internal/container"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/container"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
@@ -23,9 +24,10 @@ func TestDiff(t *testing.T) {
 		{Kind: containertypes.ChangeAdd, Path: "/foo/bar"},
 	}
 
-	items, err := apiClient.ContainerDiff(ctx, cID)
+	poll.WaitOn(t, container.IsInState(ctx, apiClient, cID, containertypes.StateExited), poll.WithTimeout(60*time.Second))
+	result, err := apiClient.ContainerDiff(ctx, cID, client.ContainerDiffOptions{})
 	assert.NilError(t, err)
-	assert.DeepEqual(t, expected, items)
+	assert.DeepEqual(t, expected, result.Changes)
 }
 
 func TestDiffStoppedContainer(t *testing.T) {
@@ -37,7 +39,7 @@ func TestDiffStoppedContainer(t *testing.T) {
 
 	cID := container.Run(ctx, t, apiClient, container.WithCmd("sh", "-c", `mkdir /foo; echo xyzzy > /foo/bar`))
 
-	poll.WaitOn(t, container.IsInState(ctx, apiClient, cID, "exited"), poll.WithDelay(100*time.Millisecond), poll.WithTimeout(60*time.Second))
+	poll.WaitOn(t, container.IsInState(ctx, apiClient, cID, containertypes.StateExited), poll.WithTimeout(60*time.Second))
 
 	expected := []containertypes.FilesystemChange{
 		{Kind: containertypes.ChangeAdd, Path: "/foo"},
@@ -50,7 +52,7 @@ func TestDiffStoppedContainer(t *testing.T) {
 		}
 	}
 
-	items, err := apiClient.ContainerDiff(ctx, cID)
+	result, err := apiClient.ContainerDiff(ctx, cID, client.ContainerDiffOptions{})
 	assert.NilError(t, err)
-	assert.DeepEqual(t, expected, items)
+	assert.DeepEqual(t, expected, result.Changes)
 }

@@ -189,13 +189,11 @@ func (u *Updater) Run(ctx context.Context, slots []orchestrator.Slot) {
 
 	// Start the workers.
 	slotQueue := make(chan orchestrator.Slot)
-	wg := sync.WaitGroup{}
-	wg.Add(parallelism)
-	for i := 0; i < parallelism; i++ {
-		go func() {
+	var wg sync.WaitGroup
+	for range parallelism {
+		wg.Go(func() {
 			u.worker(ctx, slotQueue, updateConfig)
-			wg.Done()
-		}()
+		})
 	}
 
 	var failedTaskWatch chan events.Event
@@ -491,7 +489,7 @@ func (u *Updater) useExistingTask(ctx context.Context, slot orchestrator.Slot, e
 
 // removeOldTasks shuts down the given tasks and returns one of the tasks that
 // was shut down, or an error.
-func (u *Updater) removeOldTasks(ctx context.Context, batch *store.Batch, removeTasks []*api.Task) (*api.Task, error) {
+func (u *Updater) removeOldTasks(_ context.Context, batch *store.Batch, removeTasks []*api.Task) (*api.Task, error) {
 	var (
 		lastErr     error
 		removedTask *api.Task

@@ -5,6 +5,7 @@ import (
 	_ "crypto/sha256" // for opencontainers/go-digest
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -48,7 +49,7 @@ func NewFileOp(s State, action *FileAction, c Constraints) *FileOp {
 }
 
 // CopyInput is either llb.State or *FileActionWithState
-// It is used by [Copy] to to specify the source of the copy operation.
+// It is used by [Copy] to specify the source of the copy operation.
 type CopyInput interface {
 	isFileOpCopyInput()
 }
@@ -80,6 +81,13 @@ func (fa *FileAction) Mkdir(p string, m os.FileMode, opt ...MkdirOption) *FileAc
 
 func (fa *FileAction) Mkfile(p string, m os.FileMode, dt []byte, opt ...MkfileOption) *FileAction {
 	a := Mkfile(p, m, dt, opt...)
+	a.prev = fa
+	return a
+}
+
+// Symlink creates a symlink at `newpath` that points to `oldpath`
+func (fa *FileAction) Symlink(oldpath, newpath string, opt ...SymlinkOption) *FileAction {
+	a := Symlink(oldpath, newpath, opt...)
 	a.prev = fa
 	return a
 }
@@ -192,6 +200,7 @@ type ChownOption interface {
 	MkdirOption
 	MkfileOption
 	CopyOption
+	SymlinkOption
 }
 
 type mkdirOptionFunc func(*MkdirInfo)
@@ -263,6 +272,15 @@ func WithUIDGID(uid, gid int) ChownOption {
 	}
 }
 
+type ChmodOpt struct {
+	Mode    os.FileMode
+	ModeStr string
+}
+
+func (co ChmodOpt) SetCopyOption(mi *CopyInfo) {
+	mi.Mode = &co
+}
+
 type ChownOpt struct {
 	User  *UserOpt
 	Group *UserOpt
@@ -271,11 +289,17 @@ type ChownOpt struct {
 func (co ChownOpt) SetMkdirOption(mi *MkdirInfo) {
 	mi.ChownOpt = &co
 }
+
 func (co ChownOpt) SetMkfileOption(mi *MkfileInfo) {
 	mi.ChownOpt = &co
 }
+
 func (co ChownOpt) SetCopyOption(mi *CopyInfo) {
 	mi.ChownOpt = &co
+}
+
+func (co ChownOpt) SetSymlinkOption(si *SymlinkInfo) {
+	si.ChownOpt = &co
 }
 
 func (co *ChownOpt) marshal(base pb.InputIndex) *pb.ChownOpt {
@@ -299,7 +323,8 @@ func (up *UserOpt) marshal(base pb.InputIndex) *pb.UserOpt {
 	}
 	if up.Name != "" {
 		return &pb.UserOpt{User: &pb.UserOpt_ByName{ByName: &pb.NamedUserOpt{
-			Name: up.Name, Input: base}}}
+			Name: up.Name, Input: int64(base),
+		}}}
 	}
 	return &pb.UserOpt{User: &pb.UserOpt_ByID{ByID: uint32(up.UID)}}
 }
@@ -322,6 +347,57 @@ func Mkfile(p string, m os.FileMode, dt []byte, opts ...MkfileOption) *FileActio
 			info: mi,
 		},
 	}
+}
+
+// SymlinkInfo is the modifiable options used to create symlinks
+type SymlinkInfo struct {
+	ChownOpt    *ChownOpt
+	CreatedTime *time.Time
+}
+
+func (si *SymlinkInfo) SetSymlinkOption(si2 *SymlinkInfo) {
+	*si2 = *si
+}
+
+type SymlinkOption interface {
+	SetSymlinkOption(*SymlinkInfo)
+}
+
+// Symlink creates a symlink at `newpath` that points to `oldpath`
+func Symlink(oldpath, newpath string, opts ...SymlinkOption) *FileAction {
+	var si SymlinkInfo
+	for _, o := range opts {
+		o.SetSymlinkOption(&si)
+	}
+
+	return &FileAction{
+		action: &fileActionSymlink{
+			oldpath: oldpath,
+			newpath: newpath,
+			info:    si,
+		},
+	}
+}
+
+type fileActionSymlink struct {
+	oldpath string
+	newpath string
+	info    SymlinkInfo
+}
+
+func (s *fileActionSymlink) addCaps(f *FileOp) {
+	addCap(&f.constraints, pb.CapFileSymlinkCreate)
+}
+
+func (s *fileActionSymlink) toProtoAction(_ context.Context, _ string, base pb.InputIndex) (pb.IsFileAction, error) {
+	return &pb.FileAction_Symlink{
+		Symlink: &pb.FileActionSymlink{
+			Oldpath:   s.oldpath,
+			Newpath:   s.newpath,
+			Owner:     s.info.ChownOpt.marshal(base),
+			Timestamp: marshalTime(s.info.CreatedTime),
+		},
+	}, nil
 }
 
 type MkfileOption interface {
@@ -488,11 +564,12 @@ type CopyOption interface {
 }
 
 type CopyInfo struct {
-	Mode                           *os.FileMode
+	Mode                           *ChmodOpt
 	FollowSymlinks                 bool
 	CopyDirContentsOnly            bool
 	IncludePatterns                []string
 	ExcludePatterns                []string
+	RequiredPaths                  []string
 	AttemptUnpack                  bool
 	CreateDestPath                 bool
 	AllowWildcard                  bool
@@ -527,6 +604,7 @@ func (a *fileActionCopy) toProtoAction(ctx context.Context, parent string, base 
 		Owner:                            a.info.ChownOpt.marshal(base),
 		IncludePatterns:                  a.info.IncludePatterns,
 		ExcludePatterns:                  a.info.ExcludePatterns,
+		RequiredPaths:                    a.info.RequiredPaths,
 		AllowWildcard:                    a.info.AllowWildcard,
 		AllowEmptyWildcard:               a.info.AllowEmptyWildcard,
 		FollowSymlink:                    a.info.FollowSymlinks,
@@ -537,7 +615,11 @@ func (a *fileActionCopy) toProtoAction(ctx context.Context, parent string, base 
 		AlwaysReplaceExistingDestPaths:   a.info.AlwaysReplaceExistingDestPaths,
 	}
 	if a.info.Mode != nil {
-		c.Mode = int32(*a.info.Mode)
+		if a.info.Mode.ModeStr != "" {
+			c.ModeStr = a.info.Mode.ModeStr
+		} else {
+			c.Mode = int32(a.info.Mode.Mode)
+		}
 	} else {
 		c.Mode = -1
 	}
@@ -547,7 +629,7 @@ func (a *fileActionCopy) toProtoAction(ctx context.Context, parent string, base 
 }
 
 func (a *fileActionCopy) sourcePath(ctx context.Context) (string, error) {
-	p := path.Clean(a.src)
+	p := filepath.ToSlash(path.Clean(a.src))
 	dir := "/"
 	var err error
 	if !path.IsAbs(p) {
@@ -567,8 +649,14 @@ func (a *fileActionCopy) addCaps(f *FileOp) {
 	if len(a.info.IncludePatterns) != 0 || len(a.info.ExcludePatterns) != 0 {
 		addCap(&f.constraints, pb.CapFileCopyIncludeExcludePatterns)
 	}
+	if len(a.info.RequiredPaths) != 0 {
+		addCap(&f.constraints, pb.CapFileCopyRequiredPaths)
+	}
 	if a.info.AlwaysReplaceExistingDestPaths {
 		addCap(&f.constraints, pb.CapFileCopyAlwaysReplaceExistingDestPaths)
+	}
+	if a.info.Mode.ModeStr != "" {
+		addCap(&f.constraints, pb.CapFileCopyModeStringFormat)
 	}
 }
 
@@ -584,6 +672,10 @@ func (c CreatedTime) SetMkdirOption(mi *MkdirInfo) {
 
 func (c CreatedTime) SetMkfileOption(mi *MkfileInfo) {
 	mi.CreatedTime = (*time.Time)(&c)
+}
+
+func (c CreatedTime) SetSymlinkOption(si *SymlinkInfo) {
+	si.CreatedTime = (*time.Time)(&c)
 }
 
 func (c CreatedTime) SetCopyOption(mi *CopyInfo) {
@@ -611,7 +703,7 @@ func (f *FileOp) Validate(context.Context, *Constraints) error {
 		return nil
 	}
 	if f.action == nil {
-		return errors.Errorf("action is required")
+		return errors.New("action is required")
 	}
 	f.isValidated = true
 	return nil
@@ -648,7 +740,7 @@ func (ms *marshalState) addInput(c *Constraints, o Output) (pb.InputIndex, error
 		return 0, err
 	}
 	for i, inp2 := range ms.inputs {
-		if *inp == *inp2 {
+		if inp.EqualVT(inp2) {
 			return pb.InputIndex(i), nil
 		}
 	}
@@ -713,7 +805,7 @@ func (ms *marshalState) add(fa *FileAction, c *Constraints) (*fileActionState, e
 			}
 			st.input2Relative = &src.target
 		} else {
-			return nil, errors.Errorf("invalid empty source for copy")
+			return nil, errors.New("invalid empty source for copy")
 		}
 	}
 
@@ -726,9 +818,13 @@ func (ms *marshalState) add(fa *FileAction, c *Constraints) (*fileActionState, e
 }
 
 func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, []*SourceLocation, error) {
-	if f.Cached(c) {
-		return f.Load()
+	cache := f.Acquire()
+	defer cache.Release()
+
+	if dgst, dt, md, srcs, err := cache.Load(c); err == nil {
+		return dgst, dt, md, srcs, nil
 	}
+
 	if err := f.Validate(ctx, c); err != nil {
 		return "", nil, nil, nil, err
 	}
@@ -786,17 +882,16 @@ func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		pfo.Actions = append(pfo.Actions, &pb.FileAction{
 			Input:          getIndex(st.input, len(state.inputs), st.inputRelative),
 			SecondaryInput: getIndex(st.input2, len(state.inputs), st.input2Relative),
-			Output:         output,
+			Output:         int64(output),
 			Action:         action,
 		})
 	}
 
-	dt, err := pop.Marshal()
+	dt, err := deterministicMarshal(pop)
 	if err != nil {
 		return "", nil, nil, nil, err
 	}
-	f.Store(dt, md, f.constraints.SourceLocations, c)
-	return f.Load()
+	return cache.Store(dt, md, f.constraints.SourceLocations, c)
 }
 
 func normalizePath(parent, p string, keepSlash bool) string {
@@ -826,9 +921,9 @@ func (f *FileOp) Inputs() []Output {
 	return f.action.allOutputs(map[Output]struct{}{}, []Output{})
 }
 
-func getIndex(input pb.InputIndex, len int, relative *int) pb.InputIndex {
+func getIndex(input pb.InputIndex, len int, relative *int) int64 {
 	if relative != nil {
-		return pb.InputIndex(len + *relative)
+		return int64(len + *relative)
 	}
-	return input
+	return int64(input)
 }

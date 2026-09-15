@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/buildkit/version"
 	"github.com/moby/locker"
@@ -16,33 +16,62 @@ import (
 	"github.com/pkg/errors"
 )
 
-func ProviderFromRef(ref string) (ocispecs.Descriptor, content.Provider, error) {
+type ResolveOpt struct {
+	Credentials func(string) (string, string, error)
+}
+
+type ResolveOptFunc func(*ResolveOpt)
+
+func WithCredentials(c func(string) (string, string, error)) ResolveOptFunc {
+	return func(o *ResolveOpt) {
+		o.Credentials = func(host string) (string, string, error) {
+			if host == "registry-1.docker.io" {
+				host = "https://index.docker.io/v1/"
+			}
+			return c(host)
+		}
+	}
+}
+
+func ProviderFromRef(ctx context.Context, ref string, opts ...ResolveOptFunc) (ocispecs.Descriptor, content.Provider, error) {
 	headers := http.Header{}
 	headers.Set("User-Agent", version.UserAgent())
-	remote := docker.NewResolver(docker.ResolverOptions{
-		Headers: headers,
-	})
 
-	name, desc, err := remote.Resolve(context.TODO(), ref)
+	var ro ResolveOpt
+	for _, f := range opts {
+		f(&ro)
+	}
+
+	dro := docker.ResolverOptions{
+		Headers: headers,
+	}
+	if ro.Credentials != nil {
+		dro.Hosts = docker.ConfigureDefaultRegistries(
+			docker.WithAuthorizer(docker.NewDockerAuthorizer(docker.WithAuthCreds(ro.Credentials))),
+		)
+	}
+	remote := docker.NewResolver(dro)
+
+	name, desc, err := remote.Resolve(ctx, ref)
 	if err != nil {
 		return ocispecs.Descriptor{}, nil, err
 	}
 
-	fetcher, err := remote.Fetcher(context.TODO(), name)
+	fetcher, err := remote.Fetcher(ctx, name)
 	if err != nil {
 		return ocispecs.Descriptor{}, nil, err
 	}
 	return desc, FromFetcher(fetcher), nil
 }
 
-func IngesterFromRef(ref string) (content.Ingester, error) {
+func IngesterFromRef(ctx context.Context, ref string) (content.Ingester, error) {
 	headers := http.Header{}
 	headers.Set("User-Agent", version.UserAgent())
 	remote := docker.NewResolver(docker.ResolverOptions{
 		Headers: headers,
 	})
 
-	p, err := remote.Pusher(context.TODO(), ref)
+	p, err := remote.Pusher(ctx, ref)
 	if err != nil {
 		return nil, err
 	}

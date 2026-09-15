@@ -1,18 +1,20 @@
 //go:build !windows
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/blkiodev"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/pkg/sysinfo"
+	"github.com/moby/moby/api/types/blkiodev"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/errdefs"
+	"github.com/moby/moby/v2/pkg/sysinfo"
 	"github.com/opencontainers/selinux/go-selinux"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
@@ -26,7 +28,7 @@ type fakeContainerGetter struct {
 func (f *fakeContainerGetter) GetContainer(cid string) (*container.Container, error) {
 	ctr, ok := f.containers[cid]
 	if !ok {
-		return nil, errors.New("container not found")
+		return nil, errdefs.NotFound(errors.New("container not found"))
 	}
 	return ctr, nil
 }
@@ -161,6 +163,13 @@ func TestParseSecurityOpt(t *testing.T) {
 		})
 		assert.Error(t, err, `invalid --security-opt 2: "unknown=something"`)
 	})
+	t.Run("invalid cgroup option", func(t *testing.T) {
+		secOpts := &container.SecurityOptions{}
+		err := parseSecurityOpt(secOpts, &containertypes.HostConfig{
+			SecurityOpt: []string{"writable-cgroups=dang"},
+		})
+		assert.Error(t, err, `invalid --security-opt 2: "writable-cgroups=dang"`)
+	})
 }
 
 func TestParseNNPSecurityOptions(t *testing.T) {
@@ -274,7 +283,6 @@ func TestVerifyPlatformContainerResources(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			warnings, err := verifyPlatformContainerResources(&tc.resources, &tc.sysInfo, tc.update)
@@ -356,4 +364,20 @@ func TestGetBlkioThrottleDevices(t *testing.T) {
 		assert.Check(t, retDevs[0].Minor == MINOR, "get minor device type")
 		assert.Check(t, retDevs[0].Rate == WEIGHT, "get device rate")
 	})
+}
+
+func TestVerifyPlatformContainerSettingsHostnameLength(t *testing.T) {
+	d := &Daemon{}
+
+	// A 64-byte hostname is the longest one Linux allows (HOST_NAME_MAX);
+	// it must still be accepted.
+	okHostname := strings.Repeat("a", maxHostnameLen)
+	_, err := verifyPlatformContainerSettings(d, nil, nil, &containertypes.Config{Hostname: okHostname}, false)
+	assert.NilError(t, err)
+
+	// One byte over the limit must be rejected with a clear error, instead
+	// of being passed through to fail later with an opaque OCI runtime error.
+	tooLong := strings.Repeat("a", maxHostnameLen+1)
+	_, err = verifyPlatformContainerSettings(d, nil, nil, &containertypes.Config{Hostname: tooLong}, false)
+	assert.ErrorContains(t, err, "too long")
 }

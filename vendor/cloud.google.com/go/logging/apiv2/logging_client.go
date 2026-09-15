@@ -1,4 +1,4 @@
-// Copyright 2023 Google LLC
+// Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,22 +17,29 @@
 package logging
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"net/http"
 	"net/url"
 	"time"
 
 	loggingpb "cloud.google.com/go/logging/apiv2/loggingpb"
 	longrunningpb "cloud.google.com/go/longrunning/autogen/longrunningpb"
 	gax "github.com/googleapis/gax-go/v2"
+	"github.com/googleapis/gax-go/v2/callctx"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/api/option/internaloption"
 	gtransport "google.golang.org/api/transport/grpc"
+	httptransport "google.golang.org/api/transport/http"
 	monitoredrespb "google.golang.org/genproto/googleapis/api/monitoredres"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -54,10 +61,14 @@ type CallOptions struct {
 func defaultGRPCClientOptions() []option.ClientOption {
 	return []option.ClientOption{
 		internaloption.WithDefaultEndpoint("logging.googleapis.com:443"),
+		internaloption.WithDefaultEndpointTemplate("logging.UNIVERSE_DOMAIN:443"),
 		internaloption.WithDefaultMTLSEndpoint("logging.mtls.googleapis.com:443"),
+		internaloption.WithDefaultUniverseDomain("googleapis.com"),
 		internaloption.WithDefaultAudience("https://logging.googleapis.com/"),
 		internaloption.WithDefaultScopes(DefaultAuthScopes()...),
 		internaloption.EnableJwtWithScope(),
+		internaloption.AllowHardBoundTokens("MTLS_S2A"),
+		internaloption.EnableNewAuthLibrary(),
 		option.WithGRPCDialOption(grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(math.MaxInt32))),
 	}
@@ -154,6 +165,92 @@ func defaultCallOptions() *CallOptions {
 	}
 }
 
+func defaultRESTCallOptions() *CallOptions {
+	return &CallOptions{
+		DeleteLog: []gax.CallOption{
+			gax.WithTimeout(60000 * time.Millisecond),
+			gax.WithRetry(func() gax.Retryer {
+				return gax.OnHTTPCodes(gax.Backoff{
+					Initial:    100 * time.Millisecond,
+					Max:        60000 * time.Millisecond,
+					Multiplier: 1.30,
+				},
+					http.StatusGatewayTimeout,
+					http.StatusInternalServerError,
+					http.StatusServiceUnavailable)
+			}),
+		},
+		WriteLogEntries: []gax.CallOption{
+			gax.WithTimeout(60000 * time.Millisecond),
+			gax.WithRetry(func() gax.Retryer {
+				return gax.OnHTTPCodes(gax.Backoff{
+					Initial:    100 * time.Millisecond,
+					Max:        60000 * time.Millisecond,
+					Multiplier: 1.30,
+				},
+					http.StatusGatewayTimeout,
+					http.StatusInternalServerError,
+					http.StatusServiceUnavailable)
+			}),
+		},
+		ListLogEntries: []gax.CallOption{
+			gax.WithTimeout(60000 * time.Millisecond),
+			gax.WithRetry(func() gax.Retryer {
+				return gax.OnHTTPCodes(gax.Backoff{
+					Initial:    100 * time.Millisecond,
+					Max:        60000 * time.Millisecond,
+					Multiplier: 1.30,
+				},
+					http.StatusGatewayTimeout,
+					http.StatusInternalServerError,
+					http.StatusServiceUnavailable)
+			}),
+		},
+		ListMonitoredResourceDescriptors: []gax.CallOption{
+			gax.WithTimeout(60000 * time.Millisecond),
+			gax.WithRetry(func() gax.Retryer {
+				return gax.OnHTTPCodes(gax.Backoff{
+					Initial:    100 * time.Millisecond,
+					Max:        60000 * time.Millisecond,
+					Multiplier: 1.30,
+				},
+					http.StatusGatewayTimeout,
+					http.StatusInternalServerError,
+					http.StatusServiceUnavailable)
+			}),
+		},
+		ListLogs: []gax.CallOption{
+			gax.WithTimeout(60000 * time.Millisecond),
+			gax.WithRetry(func() gax.Retryer {
+				return gax.OnHTTPCodes(gax.Backoff{
+					Initial:    100 * time.Millisecond,
+					Max:        60000 * time.Millisecond,
+					Multiplier: 1.30,
+				},
+					http.StatusGatewayTimeout,
+					http.StatusInternalServerError,
+					http.StatusServiceUnavailable)
+			}),
+		},
+		TailLogEntries: []gax.CallOption{
+			gax.WithTimeout(3600000 * time.Millisecond),
+			gax.WithRetry(func() gax.Retryer {
+				return gax.OnHTTPCodes(gax.Backoff{
+					Initial:    100 * time.Millisecond,
+					Max:        60000 * time.Millisecond,
+					Multiplier: 1.30,
+				},
+					http.StatusGatewayTimeout,
+					http.StatusInternalServerError,
+					http.StatusServiceUnavailable)
+			}),
+		},
+		CancelOperation: []gax.CallOption{},
+		GetOperation:    []gax.CallOption{},
+		ListOperations:  []gax.CallOption{},
+	}
+}
+
 // internalClient is an interface that defines the methods available from Cloud Logging API.
 type internalClient interface {
 	Close() error
@@ -184,7 +281,7 @@ type Client struct {
 
 // Wrapper methods routed to the internal client.
 
-// Close closes the connection to the API service. The user should invoke this when
+// Close closes the connection to the API service. **Always** call Close() when
 // the client is no longer required.
 func (c *Client) Close() error {
 	return c.internalClient.Close()
@@ -195,6 +292,16 @@ func (c *Client) Close() error {
 // use by Google-written clients.
 func (c *Client) setGoogleClientInfo(keyval ...string) {
 	c.internalClient.setGoogleClientInfo(keyval...)
+}
+
+// SetGoogleClientInfo sets the name and version of the application in
+// the `x-goog-api-client` header passed on each request. Intended for
+// use by Google-written clients.
+//
+// SetGoogleClientInfo is not concurrency-safe and should only be invoked
+// sequentially before concurrent operations begin.
+func (c *Client) SetGoogleClientInfo(keyval ...string) {
+	c.setGoogleClientInfo(keyval...)
 }
 
 // Connection returns a connection to the API service.
@@ -245,6 +352,8 @@ func (c *Client) ListLogs(ctx context.Context, req *loggingpb.ListLogsRequest, o
 
 // TailLogEntries streaming read of log entries as they are ingested. Until the stream is
 // terminated, it will continue reading logs.
+//
+// This method is not supported for the REST transport.
 func (c *Client) TailLogEntries(ctx context.Context, opts ...gax.CallOption) (loggingpb.LoggingServiceV2_TailLogEntriesClient, error) {
 	return c.internalClient.TailLogEntries(ctx, opts...)
 }
@@ -281,6 +390,8 @@ type gRPCClient struct {
 
 	// The x-goog-* metadata to be sent with each request.
 	xGoogHeaders []string
+
+	logger *slog.Logger
 }
 
 // NewClient creates a new logging service v2 client based on gRPC.
@@ -289,6 +400,16 @@ type gRPCClient struct {
 // Service for ingesting and querying logs.
 func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error) {
 	clientOpts := defaultGRPCClientOptions()
+	if gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		clientOpts = append(clientOpts, internaloption.WithTelemetryAttributes(map[string]string{
+			"gcp.client.service":  "logging",
+			"gcp.client.version":  getVersionClient(),
+			"gcp.client.repo":     "googleapis/google-cloud-go",
+			"gcp.client.artifact": "cloud.google.com/go/logging/apiv2",
+			"gcp.client.language": "go",
+			"url.domain":          "logging.googleapis.com",
+		}))
+	}
 	if newClientHook != nil {
 		hookOpts, err := newClientHook(ctx, clientHookParams{})
 		if err != nil {
@@ -307,9 +428,32 @@ func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error
 		connPool:         connPool,
 		client:           loggingpb.NewLoggingServiceV2Client(connPool),
 		CallOptions:      &client.CallOptions,
+		logger:           internaloption.GetLogger(opts),
 		operationsClient: longrunningpb.NewOperationsClient(connPool),
 	}
 	c.setGoogleClientInfo()
+	if gax.IsFeatureEnabled("METRICS") {
+		metrics := gax.NewClientMetrics(
+			gax.WithTelemetryLogger(c.logger),
+			gax.WithTelemetryAttributes(map[string]string{
+				gax.ClientService:  "logging",
+				gax.ClientVersion:  getVersionClient(),
+				gax.ClientArtifact: "cloud.google.com/go/logging/apiv2",
+				gax.RPCSystem:      "grpc",
+				gax.URLDomain:      "logging.googleapis.com",
+			}),
+		)
+
+		client.CallOptions.DeleteLog = append(client.CallOptions.DeleteLog, gax.WithClientMetrics(metrics))
+		client.CallOptions.WriteLogEntries = append(client.CallOptions.WriteLogEntries, gax.WithClientMetrics(metrics))
+		client.CallOptions.ListLogEntries = append(client.CallOptions.ListLogEntries, gax.WithClientMetrics(metrics))
+		client.CallOptions.ListMonitoredResourceDescriptors = append(client.CallOptions.ListMonitoredResourceDescriptors, gax.WithClientMetrics(metrics))
+		client.CallOptions.ListLogs = append(client.CallOptions.ListLogs, gax.WithClientMetrics(metrics))
+		client.CallOptions.TailLogEntries = append(client.CallOptions.TailLogEntries, gax.WithClientMetrics(metrics))
+		client.CallOptions.CancelOperation = append(client.CallOptions.CancelOperation, gax.WithClientMetrics(metrics))
+		client.CallOptions.GetOperation = append(client.CallOptions.GetOperation, gax.WithClientMetrics(metrics))
+		client.CallOptions.ListOperations = append(client.CallOptions.ListOperations, gax.WithClientMetrics(metrics))
+	}
 
 	client.internalClient = c
 
@@ -329,25 +473,142 @@ func (c *gRPCClient) Connection() *grpc.ClientConn {
 // use by Google-written clients.
 func (c *gRPCClient) setGoogleClientInfo(keyval ...string) {
 	kv := append([]string{"gl-go", gax.GoVersion}, keyval...)
-	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "grpc", grpc.Version)
-	c.xGoogHeaders = []string{"x-goog-api-client", gax.XGoogHeader(kv...)}
+	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "grpc", grpc.Version, "pb", protoVersion)
+	c.xGoogHeaders = []string{
+		"x-goog-api-client", gax.XGoogHeader(kv...),
+	}
 }
 
-// Close closes the connection to the API service. The user should invoke this when
+// Close closes the connection to the API service. **Always** call Close() when
 // the client is no longer required.
 func (c *gRPCClient) Close() error {
 	return c.connPool.Close()
 }
 
+// Methods, except Close, may be called concurrently. However, fields must not be modified concurrently with method calls.
+type restClient struct {
+	// The http endpoint to connect to.
+	endpoint string
+
+	// The http client.
+	httpClient *http.Client
+
+	// The x-goog-* headers to be sent with each request.
+	xGoogHeaders []string
+
+	// Points back to the CallOptions field of the containing Client
+	CallOptions **CallOptions
+
+	logger *slog.Logger
+}
+
+// NewRESTClient creates a new logging service v2 rest client.
+//
+// Service for ingesting and querying logs.
+func NewRESTClient(ctx context.Context, opts ...option.ClientOption) (*Client, error) {
+	clientOpts := append(defaultRESTClientOptions(), opts...)
+	if gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		clientOpts = append(clientOpts, internaloption.WithTelemetryAttributes(map[string]string{
+			"gcp.client.service":  "logging",
+			"gcp.client.version":  getVersionClient(),
+			"gcp.client.repo":     "googleapis/google-cloud-go",
+			"gcp.client.artifact": "cloud.google.com/go/logging/apiv2",
+			"gcp.client.language": "go",
+			"url.domain":          "logging.googleapis.com",
+		}))
+	}
+	httpClient, endpoint, err := httptransport.NewClient(ctx, clientOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	callOpts := defaultRESTCallOptions()
+	c := &restClient{
+		endpoint:    endpoint,
+		httpClient:  httpClient,
+		CallOptions: &callOpts,
+		logger:      internaloption.GetLogger(opts),
+	}
+	c.setGoogleClientInfo()
+
+	if gax.IsFeatureEnabled("METRICS") {
+		metrics := gax.NewClientMetrics(
+			gax.WithTelemetryLogger(c.logger),
+			gax.WithTelemetryAttributes(map[string]string{
+				gax.ClientService:  "logging",
+				gax.ClientVersion:  getVersionClient(),
+				gax.ClientArtifact: "cloud.google.com/go/logging/apiv2",
+				gax.RPCSystem:      "http",
+				gax.URLDomain:      "logging.googleapis.com",
+			}),
+		)
+
+		callOpts.DeleteLog = append(callOpts.DeleteLog, gax.WithClientMetrics(metrics))
+		callOpts.WriteLogEntries = append(callOpts.WriteLogEntries, gax.WithClientMetrics(metrics))
+		callOpts.ListLogEntries = append(callOpts.ListLogEntries, gax.WithClientMetrics(metrics))
+		callOpts.ListMonitoredResourceDescriptors = append(callOpts.ListMonitoredResourceDescriptors, gax.WithClientMetrics(metrics))
+		callOpts.ListLogs = append(callOpts.ListLogs, gax.WithClientMetrics(metrics))
+		callOpts.TailLogEntries = append(callOpts.TailLogEntries, gax.WithClientMetrics(metrics))
+		callOpts.CancelOperation = append(callOpts.CancelOperation, gax.WithClientMetrics(metrics))
+		callOpts.GetOperation = append(callOpts.GetOperation, gax.WithClientMetrics(metrics))
+		callOpts.ListOperations = append(callOpts.ListOperations, gax.WithClientMetrics(metrics))
+	}
+
+	return &Client{internalClient: c, CallOptions: callOpts}, nil
+}
+
+func defaultRESTClientOptions() []option.ClientOption {
+	return []option.ClientOption{
+		internaloption.WithDefaultEndpoint("https://logging.googleapis.com"),
+		internaloption.WithDefaultEndpointTemplate("https://logging.UNIVERSE_DOMAIN"),
+		internaloption.WithDefaultMTLSEndpoint("https://logging.mtls.googleapis.com"),
+		internaloption.WithDefaultUniverseDomain("googleapis.com"),
+		internaloption.WithDefaultAudience("https://logging.googleapis.com/"),
+		internaloption.WithDefaultScopes(DefaultAuthScopes()...),
+		internaloption.EnableNewAuthLibrary(),
+	}
+}
+
+// setGoogleClientInfo sets the name and version of the application in
+// the `x-goog-api-client` header passed on each request. Intended for
+// use by Google-written clients.
+func (c *restClient) setGoogleClientInfo(keyval ...string) {
+	kv := append([]string{"gl-go", gax.GoVersion}, keyval...)
+	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "rest", "UNKNOWN", "pb", protoVersion)
+	c.xGoogHeaders = []string{
+		"x-goog-api-client", gax.XGoogHeader(kv...),
+	}
+}
+
+// Close closes the connection to the API service. **Always** call Close() when
+// the client is no longer required.
+func (c *restClient) Close() error {
+	// Replace httpClient with nil to force cleanup.
+	c.httpClient = nil
+	return nil
+}
+
+// Connection returns a connection to the API service.
+//
+// Deprecated: This method always returns nil.
+func (c *restClient) Connection() *grpc.ClientConn {
+	return nil
+}
 func (c *gRPCClient) DeleteLog(ctx context.Context, req *loggingpb.DeleteLogRequest, opts ...gax.CallOption) error {
 	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "log_name", url.QueryEscape(req.GetLogName()))}
 
 	hds = append(c.xGoogHeaders, hds...)
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	if gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "resource_name", fmt.Sprintf("//logging.googleapis.com/%v", req.GetLogName()))
+	}
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.logging.v2.LoggingServiceV2/DeleteLog")
+	}
 	opts = append((*c.CallOptions).DeleteLog[0:len((*c.CallOptions).DeleteLog):len((*c.CallOptions).DeleteLog)], opts...)
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		_, err = c.client.DeleteLog(ctx, req, settings.GRPC...)
+		_, err = executeRPC(ctx, c.client.DeleteLog, req, settings.GRPC, c.logger, "DeleteLog")
 		return err
 	}, opts...)
 	return err
@@ -355,11 +616,14 @@ func (c *gRPCClient) DeleteLog(ctx context.Context, req *loggingpb.DeleteLogRequ
 
 func (c *gRPCClient) WriteLogEntries(ctx context.Context, req *loggingpb.WriteLogEntriesRequest, opts ...gax.CallOption) (*loggingpb.WriteLogEntriesResponse, error) {
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, c.xGoogHeaders...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.logging.v2.LoggingServiceV2/WriteLogEntries")
+	}
 	opts = append((*c.CallOptions).WriteLogEntries[0:len((*c.CallOptions).WriteLogEntries):len((*c.CallOptions).WriteLogEntries)], opts...)
 	var resp *loggingpb.WriteLogEntriesResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.client.WriteLogEntries(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.client.WriteLogEntries, req, settings.GRPC, c.logger, "WriteLogEntries")
 		return err
 	}, opts...)
 	if err != nil {
@@ -370,9 +634,12 @@ func (c *gRPCClient) WriteLogEntries(ctx context.Context, req *loggingpb.WriteLo
 
 func (c *gRPCClient) ListLogEntries(ctx context.Context, req *loggingpb.ListLogEntriesRequest, opts ...gax.CallOption) *LogEntryIterator {
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, c.xGoogHeaders...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.logging.v2.LoggingServiceV2/ListLogEntries")
+	}
 	opts = append((*c.CallOptions).ListLogEntries[0:len((*c.CallOptions).ListLogEntries):len((*c.CallOptions).ListLogEntries)], opts...)
 	it := &LogEntryIterator{}
-	req = proto.Clone(req).(*loggingpb.ListLogEntriesRequest)
+	req = proto.CloneOf(req)
 	it.InternalFetch = func(pageSize int, pageToken string) ([]*loggingpb.LogEntry, string, error) {
 		resp := &loggingpb.ListLogEntriesResponse{}
 		if pageToken != "" {
@@ -385,7 +652,7 @@ func (c *gRPCClient) ListLogEntries(ctx context.Context, req *loggingpb.ListLogE
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.client.ListLogEntries(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.client.ListLogEntries, req, settings.GRPC, c.logger, "ListLogEntries")
 			return err
 		}, opts...)
 		if err != nil {
@@ -413,9 +680,12 @@ func (c *gRPCClient) ListLogEntries(ctx context.Context, req *loggingpb.ListLogE
 
 func (c *gRPCClient) ListMonitoredResourceDescriptors(ctx context.Context, req *loggingpb.ListMonitoredResourceDescriptorsRequest, opts ...gax.CallOption) *MonitoredResourceDescriptorIterator {
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, c.xGoogHeaders...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.logging.v2.LoggingServiceV2/ListMonitoredResourceDescriptors")
+	}
 	opts = append((*c.CallOptions).ListMonitoredResourceDescriptors[0:len((*c.CallOptions).ListMonitoredResourceDescriptors):len((*c.CallOptions).ListMonitoredResourceDescriptors)], opts...)
 	it := &MonitoredResourceDescriptorIterator{}
-	req = proto.Clone(req).(*loggingpb.ListMonitoredResourceDescriptorsRequest)
+	req = proto.CloneOf(req)
 	it.InternalFetch = func(pageSize int, pageToken string) ([]*monitoredrespb.MonitoredResourceDescriptor, string, error) {
 		resp := &loggingpb.ListMonitoredResourceDescriptorsResponse{}
 		if pageToken != "" {
@@ -428,7 +698,7 @@ func (c *gRPCClient) ListMonitoredResourceDescriptors(ctx context.Context, req *
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.client.ListMonitoredResourceDescriptors(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.client.ListMonitoredResourceDescriptors, req, settings.GRPC, c.logger, "ListMonitoredResourceDescriptors")
 			return err
 		}, opts...)
 		if err != nil {
@@ -459,9 +729,15 @@ func (c *gRPCClient) ListLogs(ctx context.Context, req *loggingpb.ListLogsReques
 
 	hds = append(c.xGoogHeaders, hds...)
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	if gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "resource_name", fmt.Sprintf("//logging.googleapis.com/%v", req.GetParent()))
+	}
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.logging.v2.LoggingServiceV2/ListLogs")
+	}
 	opts = append((*c.CallOptions).ListLogs[0:len((*c.CallOptions).ListLogs):len((*c.CallOptions).ListLogs)], opts...)
 	it := &StringIterator{}
-	req = proto.Clone(req).(*loggingpb.ListLogsRequest)
+	req = proto.CloneOf(req)
 	it.InternalFetch = func(pageSize int, pageToken string) ([]string, string, error) {
 		resp := &loggingpb.ListLogsResponse{}
 		if pageToken != "" {
@@ -474,7 +750,7 @@ func (c *gRPCClient) ListLogs(ctx context.Context, req *loggingpb.ListLogsReques
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.client.ListLogs(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.client.ListLogs, req, settings.GRPC, c.logger, "ListLogs")
 			return err
 		}, opts...)
 		if err != nil {
@@ -502,11 +778,16 @@ func (c *gRPCClient) ListLogs(ctx context.Context, req *loggingpb.ListLogsReques
 
 func (c *gRPCClient) TailLogEntries(ctx context.Context, opts ...gax.CallOption) (loggingpb.LoggingServiceV2_TailLogEntriesClient, error) {
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, c.xGoogHeaders...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.logging.v2.LoggingServiceV2/TailLogEntries")
+	}
 	var resp loggingpb.LoggingServiceV2_TailLogEntriesClient
 	opts = append((*c.CallOptions).TailLogEntries[0:len((*c.CallOptions).TailLogEntries):len((*c.CallOptions).TailLogEntries)], opts...)
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
+		c.logger.DebugContext(ctx, "api streaming client request", "serviceName", serviceName, "rpcName", "TailLogEntries")
 		resp, err = c.client.TailLogEntries(ctx, settings.GRPC...)
+		c.logger.DebugContext(ctx, "api streaming client response", "serviceName", serviceName, "rpcName", "TailLogEntries")
 		return err
 	}, opts...)
 	if err != nil {
@@ -520,10 +801,13 @@ func (c *gRPCClient) CancelOperation(ctx context.Context, req *longrunningpb.Can
 
 	hds = append(c.xGoogHeaders, hds...)
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/CancelOperation")
+	}
 	opts = append((*c.CallOptions).CancelOperation[0:len((*c.CallOptions).CancelOperation):len((*c.CallOptions).CancelOperation)], opts...)
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		_, err = c.operationsClient.CancelOperation(ctx, req, settings.GRPC...)
+		_, err = executeRPC(ctx, c.operationsClient.CancelOperation, req, settings.GRPC, c.logger, "CancelOperation")
 		return err
 	}, opts...)
 	return err
@@ -534,11 +818,14 @@ func (c *gRPCClient) GetOperation(ctx context.Context, req *longrunningpb.GetOpe
 
 	hds = append(c.xGoogHeaders, hds...)
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/GetOperation")
+	}
 	opts = append((*c.CallOptions).GetOperation[0:len((*c.CallOptions).GetOperation):len((*c.CallOptions).GetOperation)], opts...)
 	var resp *longrunningpb.Operation
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.operationsClient.GetOperation(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.operationsClient.GetOperation, req, settings.GRPC, c.logger, "GetOperation")
 		return err
 	}, opts...)
 	if err != nil {
@@ -552,9 +839,12 @@ func (c *gRPCClient) ListOperations(ctx context.Context, req *longrunningpb.List
 
 	hds = append(c.xGoogHeaders, hds...)
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/ListOperations")
+	}
 	opts = append((*c.CallOptions).ListOperations[0:len((*c.CallOptions).ListOperations):len((*c.CallOptions).ListOperations)], opts...)
 	it := &OperationIterator{}
-	req = proto.Clone(req).(*longrunningpb.ListOperationsRequest)
+	req = proto.CloneOf(req)
 	it.InternalFetch = func(pageSize int, pageToken string) ([]*longrunningpb.Operation, string, error) {
 		resp := &longrunningpb.ListOperationsResponse{}
 		if pageToken != "" {
@@ -567,7 +857,7 @@ func (c *gRPCClient) ListOperations(ctx context.Context, req *longrunningpb.List
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.operationsClient.ListOperations(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.operationsClient.ListOperations, req, settings.GRPC, c.logger, "ListOperations")
 			return err
 		}, opts...)
 		if err != nil {
@@ -577,6 +867,548 @@ func (c *gRPCClient) ListOperations(ctx context.Context, req *longrunningpb.List
 		it.Response = resp
 		return resp.GetOperations(), resp.GetNextPageToken(), nil
 	}
+	fetch := func(pageSize int, pageToken string) (string, error) {
+		items, nextPageToken, err := it.InternalFetch(pageSize, pageToken)
+		if err != nil {
+			return "", err
+		}
+		it.items = append(it.items, items...)
+		return nextPageToken, nil
+	}
+
+	it.pageInfo, it.nextFunc = iterator.NewPageInfo(fetch, it.bufLen, it.takeBuf)
+	it.pageInfo.MaxSize = int(req.GetPageSize())
+	it.pageInfo.Token = req.GetPageToken()
+
+	return it
+}
+
+// DeleteLog deletes all the log entries in a log for the _Default Log Bucket. The log
+// reappears if it receives new entries. Log entries written shortly before
+// the delete operation might not be deleted. Entries received after the
+// delete operation with a timestamp before the operation will be deleted.
+func (c *restClient) DeleteLog(ctx context.Context, req *loggingpb.DeleteLogRequest, opts ...gax.CallOption) error {
+	baseUrl, err := url.Parse(c.endpoint)
+	if err != nil {
+		return err
+	}
+	baseUrl.Path += fmt.Sprintf("/v2/%v", req.GetLogName())
+
+	params := url.Values{}
+	params.Add("$alt", "json;enum-encoding=int")
+
+	baseUrl.RawQuery = params.Encode()
+
+	// Build HTTP headers from client and context metadata.
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "log_name", url.QueryEscape(req.GetLogName()))}
+
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
+	if gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "resource_name", fmt.Sprintf("//logging.googleapis.com/%v", req.GetLogName()))
+	}
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.logging.v2.LoggingServiceV2/DeleteLog")
+		ctx = callctx.WithTelemetryContext(ctx, "url_template", "/v2/{log_name=projects/*/logs/*}")
+	}
+	return gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+		if settings.Path != "" {
+			baseUrl.Path = settings.Path
+		}
+		httpReq, err := http.NewRequest("DELETE", baseUrl.String(), nil)
+		if err != nil {
+			return err
+		}
+		httpReq = httpReq.WithContext(ctx)
+		httpReq.Header = headers
+
+		_, err = executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "DeleteLog")
+		return err
+	}, opts...)
+}
+
+// WriteLogEntries writes log entries to Logging. This API method is the
+// only way to send log entries to Logging. This method
+// is used, directly or indirectly, by the Logging agent
+// (fluentd) and all logging libraries configured to use Logging.
+// A single request may contain log entries for a maximum of 1000
+// different resources (projects, organizations, billing accounts or
+// folders)
+func (c *restClient) WriteLogEntries(ctx context.Context, req *loggingpb.WriteLogEntriesRequest, opts ...gax.CallOption) (*loggingpb.WriteLogEntriesResponse, error) {
+	m := protojson.MarshalOptions{AllowPartial: true, UseEnumNumbers: true}
+	jsonReq, err := m.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	baseUrl, err := url.Parse(c.endpoint)
+	if err != nil {
+		return nil, err
+	}
+	baseUrl.Path += fmt.Sprintf("/v2/entries:write")
+
+	params := url.Values{}
+	params.Add("$alt", "json;enum-encoding=int")
+
+	baseUrl.RawQuery = params.Encode()
+
+	// Build HTTP headers from client and context metadata.
+	hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.logging.v2.LoggingServiceV2/WriteLogEntries")
+		ctx = callctx.WithTelemetryContext(ctx, "url_template", "/v2/entries:write")
+	}
+	opts = append((*c.CallOptions).WriteLogEntries[0:len((*c.CallOptions).WriteLogEntries):len((*c.CallOptions).WriteLogEntries)], opts...)
+	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	resp := &loggingpb.WriteLogEntriesResponse{}
+	e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+		if settings.Path != "" {
+			baseUrl.Path = settings.Path
+		}
+		httpReq, err := http.NewRequest("POST", baseUrl.String(), bytes.NewReader(jsonReq))
+		if err != nil {
+			return err
+		}
+		httpReq = httpReq.WithContext(ctx)
+		httpReq.Header = headers
+
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "WriteLogEntries")
+		if err != nil {
+			return err
+		}
+
+		if err := unm.Unmarshal(buf, resp); err != nil {
+			return err
+		}
+
+		return nil
+	}, opts...)
+	if e != nil {
+		return nil, e
+	}
+	return resp, nil
+}
+
+// ListLogEntries lists log entries.  Use this method to retrieve log entries that originated
+// from a project/folder/organization/billing account.  For ways to export log
+// entries, see Exporting
+// Logs (at https://cloud.google.com/logging/docs/export).
+func (c *restClient) ListLogEntries(ctx context.Context, req *loggingpb.ListLogEntriesRequest, opts ...gax.CallOption) *LogEntryIterator {
+	it := &LogEntryIterator{}
+	req = proto.CloneOf(req)
+	m := protojson.MarshalOptions{AllowPartial: true, UseEnumNumbers: true}
+	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	it.InternalFetch = func(pageSize int, pageToken string) ([]*loggingpb.LogEntry, string, error) {
+		resp := &loggingpb.ListLogEntriesResponse{}
+		if pageToken != "" {
+			req.PageToken = pageToken
+		}
+		if pageSize > math.MaxInt32 {
+			req.PageSize = math.MaxInt32
+		} else if pageSize != 0 {
+			req.PageSize = int32(pageSize)
+		}
+		jsonReq, err := m.Marshal(req)
+		if err != nil {
+			return nil, "", err
+		}
+
+		baseUrl, err := url.Parse(c.endpoint)
+		if err != nil {
+			return nil, "", err
+		}
+		baseUrl.Path += fmt.Sprintf("/v2/entries:list")
+
+		params := url.Values{}
+		params.Add("$alt", "json;enum-encoding=int")
+
+		baseUrl.RawQuery = params.Encode()
+
+		// Build HTTP headers from client and context metadata.
+		hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+		headers := gax.BuildHeaders(ctx, hds...)
+		e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+			if settings.Path != "" {
+				baseUrl.Path = settings.Path
+			}
+			httpReq, err := http.NewRequest("POST", baseUrl.String(), bytes.NewReader(jsonReq))
+			if err != nil {
+				return err
+			}
+			httpReq.Header = headers
+
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "ListLogEntries")
+			if err != nil {
+				return err
+			}
+			if err := unm.Unmarshal(buf, resp); err != nil {
+				return err
+			}
+
+			return nil
+		}, opts...)
+		if e != nil {
+			return nil, "", e
+		}
+		it.Response = resp
+		return resp.GetEntries(), resp.GetNextPageToken(), nil
+	}
+
+	fetch := func(pageSize int, pageToken string) (string, error) {
+		items, nextPageToken, err := it.InternalFetch(pageSize, pageToken)
+		if err != nil {
+			return "", err
+		}
+		it.items = append(it.items, items...)
+		return nextPageToken, nil
+	}
+
+	it.pageInfo, it.nextFunc = iterator.NewPageInfo(fetch, it.bufLen, it.takeBuf)
+	it.pageInfo.MaxSize = int(req.GetPageSize())
+	it.pageInfo.Token = req.GetPageToken()
+
+	return it
+}
+
+// ListMonitoredResourceDescriptors lists the descriptors for monitored resource types used by Logging.
+func (c *restClient) ListMonitoredResourceDescriptors(ctx context.Context, req *loggingpb.ListMonitoredResourceDescriptorsRequest, opts ...gax.CallOption) *MonitoredResourceDescriptorIterator {
+	it := &MonitoredResourceDescriptorIterator{}
+	req = proto.CloneOf(req)
+	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	it.InternalFetch = func(pageSize int, pageToken string) ([]*monitoredrespb.MonitoredResourceDescriptor, string, error) {
+		resp := &loggingpb.ListMonitoredResourceDescriptorsResponse{}
+		if pageToken != "" {
+			req.PageToken = pageToken
+		}
+		if pageSize > math.MaxInt32 {
+			req.PageSize = math.MaxInt32
+		} else if pageSize != 0 {
+			req.PageSize = int32(pageSize)
+		}
+		baseUrl, err := url.Parse(c.endpoint)
+		if err != nil {
+			return nil, "", err
+		}
+		baseUrl.Path += fmt.Sprintf("/v2/monitoredResourceDescriptors")
+
+		params := url.Values{}
+		params.Add("$alt", "json;enum-encoding=int")
+		if req.GetPageSize() != 0 {
+			params.Add("pageSize", fmt.Sprintf("%v", req.GetPageSize()))
+		}
+		if req.GetPageToken() != "" {
+			params.Add("pageToken", fmt.Sprintf("%v", req.GetPageToken()))
+		}
+
+		baseUrl.RawQuery = params.Encode()
+
+		// Build HTTP headers from client and context metadata.
+		hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+		headers := gax.BuildHeaders(ctx, hds...)
+		e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+			if settings.Path != "" {
+				baseUrl.Path = settings.Path
+			}
+			httpReq, err := http.NewRequest("GET", baseUrl.String(), nil)
+			if err != nil {
+				return err
+			}
+			httpReq.Header = headers
+
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "ListMonitoredResourceDescriptors")
+			if err != nil {
+				return err
+			}
+			if err := unm.Unmarshal(buf, resp); err != nil {
+				return err
+			}
+
+			return nil
+		}, opts...)
+		if e != nil {
+			return nil, "", e
+		}
+		it.Response = resp
+		return resp.GetResourceDescriptors(), resp.GetNextPageToken(), nil
+	}
+
+	fetch := func(pageSize int, pageToken string) (string, error) {
+		items, nextPageToken, err := it.InternalFetch(pageSize, pageToken)
+		if err != nil {
+			return "", err
+		}
+		it.items = append(it.items, items...)
+		return nextPageToken, nil
+	}
+
+	it.pageInfo, it.nextFunc = iterator.NewPageInfo(fetch, it.bufLen, it.takeBuf)
+	it.pageInfo.MaxSize = int(req.GetPageSize())
+	it.pageInfo.Token = req.GetPageToken()
+
+	return it
+}
+
+// ListLogs lists the logs in projects, organizations, folders, or billing accounts.
+// Only logs that have entries are listed.
+func (c *restClient) ListLogs(ctx context.Context, req *loggingpb.ListLogsRequest, opts ...gax.CallOption) *StringIterator {
+	it := &StringIterator{}
+	req = proto.CloneOf(req)
+	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	it.InternalFetch = func(pageSize int, pageToken string) ([]string, string, error) {
+		resp := &loggingpb.ListLogsResponse{}
+		if pageToken != "" {
+			req.PageToken = pageToken
+		}
+		if pageSize > math.MaxInt32 {
+			req.PageSize = math.MaxInt32
+		} else if pageSize != 0 {
+			req.PageSize = int32(pageSize)
+		}
+		baseUrl, err := url.Parse(c.endpoint)
+		if err != nil {
+			return nil, "", err
+		}
+		baseUrl.Path += fmt.Sprintf("/v2/%v/logs", req.GetParent())
+
+		params := url.Values{}
+		params.Add("$alt", "json;enum-encoding=int")
+		if req.GetPageSize() != 0 {
+			params.Add("pageSize", fmt.Sprintf("%v", req.GetPageSize()))
+		}
+		if req.GetPageToken() != "" {
+			params.Add("pageToken", fmt.Sprintf("%v", req.GetPageToken()))
+		}
+		if items := req.GetResourceNames(); len(items) > 0 {
+			for _, item := range items {
+				params.Add("resourceNames", fmt.Sprintf("%v", item))
+			}
+		}
+
+		baseUrl.RawQuery = params.Encode()
+
+		// Build HTTP headers from client and context metadata.
+		hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+		headers := gax.BuildHeaders(ctx, hds...)
+		e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+			if settings.Path != "" {
+				baseUrl.Path = settings.Path
+			}
+			httpReq, err := http.NewRequest("GET", baseUrl.String(), nil)
+			if err != nil {
+				return err
+			}
+			httpReq.Header = headers
+
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "ListLogs")
+			if err != nil {
+				return err
+			}
+			if err := unm.Unmarshal(buf, resp); err != nil {
+				return err
+			}
+
+			return nil
+		}, opts...)
+		if e != nil {
+			return nil, "", e
+		}
+		it.Response = resp
+		return resp.GetLogNames(), resp.GetNextPageToken(), nil
+	}
+
+	fetch := func(pageSize int, pageToken string) (string, error) {
+		items, nextPageToken, err := it.InternalFetch(pageSize, pageToken)
+		if err != nil {
+			return "", err
+		}
+		it.items = append(it.items, items...)
+		return nextPageToken, nil
+	}
+
+	it.pageInfo, it.nextFunc = iterator.NewPageInfo(fetch, it.bufLen, it.takeBuf)
+	it.pageInfo.MaxSize = int(req.GetPageSize())
+	it.pageInfo.Token = req.GetPageToken()
+
+	return it
+}
+
+// TailLogEntries streaming read of log entries as they are ingested. Until the stream is
+// terminated, it will continue reading logs.
+//
+// This method is not supported for the REST transport.
+func (c *restClient) TailLogEntries(ctx context.Context, opts ...gax.CallOption) (loggingpb.LoggingServiceV2_TailLogEntriesClient, error) {
+	return nil, errors.New("TailLogEntries not yet supported for REST clients")
+}
+
+// CancelOperation is a utility method from google.longrunning.Operations.
+func (c *restClient) CancelOperation(ctx context.Context, req *longrunningpb.CancelOperationRequest, opts ...gax.CallOption) error {
+	m := protojson.MarshalOptions{AllowPartial: true, UseEnumNumbers: true}
+	jsonReq, err := m.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	baseUrl, err := url.Parse(c.endpoint)
+	if err != nil {
+		return err
+	}
+	baseUrl.Path += fmt.Sprintf("/v2/%v:cancel", req.GetName())
+
+	params := url.Values{}
+	params.Add("$alt", "json;enum-encoding=int")
+
+	baseUrl.RawQuery = params.Encode()
+
+	// Build HTTP headers from client and context metadata.
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
+
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/CancelOperation")
+		ctx = callctx.WithTelemetryContext(ctx, "url_template", "/v2/{name=*/*/locations/*/operations/*}:cancel")
+	}
+	return gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+		if settings.Path != "" {
+			baseUrl.Path = settings.Path
+		}
+		httpReq, err := http.NewRequest("POST", baseUrl.String(), bytes.NewReader(jsonReq))
+		if err != nil {
+			return err
+		}
+		httpReq = httpReq.WithContext(ctx)
+		httpReq.Header = headers
+
+		_, err = executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "CancelOperation")
+		return err
+	}, opts...)
+}
+
+// GetOperation is a utility method from google.longrunning.Operations.
+func (c *restClient) GetOperation(ctx context.Context, req *longrunningpb.GetOperationRequest, opts ...gax.CallOption) (*longrunningpb.Operation, error) {
+	baseUrl, err := url.Parse(c.endpoint)
+	if err != nil {
+		return nil, err
+	}
+	baseUrl.Path += fmt.Sprintf("/v2/%v", req.GetName())
+
+	params := url.Values{}
+	params.Add("$alt", "json;enum-encoding=int")
+
+	baseUrl.RawQuery = params.Encode()
+
+	// Build HTTP headers from client and context metadata.
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
+
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/GetOperation")
+		ctx = callctx.WithTelemetryContext(ctx, "url_template", "/v2/{name=*/*/locations/*/operations/*}")
+	}
+	opts = append((*c.CallOptions).GetOperation[0:len((*c.CallOptions).GetOperation):len((*c.CallOptions).GetOperation)], opts...)
+	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	resp := &longrunningpb.Operation{}
+	e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+		if settings.Path != "" {
+			baseUrl.Path = settings.Path
+		}
+		httpReq, err := http.NewRequest("GET", baseUrl.String(), nil)
+		if err != nil {
+			return err
+		}
+		httpReq = httpReq.WithContext(ctx)
+		httpReq.Header = headers
+
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetOperation")
+		if err != nil {
+			return err
+		}
+
+		if err := unm.Unmarshal(buf, resp); err != nil {
+			return err
+		}
+
+		return nil
+	}, opts...)
+	if e != nil {
+		return nil, e
+	}
+	return resp, nil
+}
+
+// ListOperations is a utility method from google.longrunning.Operations.
+func (c *restClient) ListOperations(ctx context.Context, req *longrunningpb.ListOperationsRequest, opts ...gax.CallOption) *OperationIterator {
+	it := &OperationIterator{}
+	req = proto.CloneOf(req)
+	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	it.InternalFetch = func(pageSize int, pageToken string) ([]*longrunningpb.Operation, string, error) {
+		resp := &longrunningpb.ListOperationsResponse{}
+		if pageToken != "" {
+			req.PageToken = pageToken
+		}
+		if pageSize > math.MaxInt32 {
+			req.PageSize = math.MaxInt32
+		} else if pageSize != 0 {
+			req.PageSize = int32(pageSize)
+		}
+		baseUrl, err := url.Parse(c.endpoint)
+		if err != nil {
+			return nil, "", err
+		}
+		baseUrl.Path += fmt.Sprintf("/v2/%v/operations", req.GetName())
+
+		params := url.Values{}
+		params.Add("$alt", "json;enum-encoding=int")
+		if req.GetFilter() != "" {
+			params.Add("filter", fmt.Sprintf("%v", req.GetFilter()))
+		}
+		if req.GetPageSize() != 0 {
+			params.Add("pageSize", fmt.Sprintf("%v", req.GetPageSize()))
+		}
+		if req.GetPageToken() != "" {
+			params.Add("pageToken", fmt.Sprintf("%v", req.GetPageToken()))
+		}
+		if req.GetReturnPartialSuccess() {
+			params.Add("returnPartialSuccess", fmt.Sprintf("%v", req.GetReturnPartialSuccess()))
+		}
+
+		baseUrl.RawQuery = params.Encode()
+
+		// Build HTTP headers from client and context metadata.
+		hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+		headers := gax.BuildHeaders(ctx, hds...)
+		e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+			if settings.Path != "" {
+				baseUrl.Path = settings.Path
+			}
+			httpReq, err := http.NewRequest("GET", baseUrl.String(), nil)
+			if err != nil {
+				return err
+			}
+			httpReq.Header = headers
+
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "ListOperations")
+			if err != nil {
+				return err
+			}
+			if err := unm.Unmarshal(buf, resp); err != nil {
+				return err
+			}
+
+			return nil
+		}, opts...)
+		if e != nil {
+			return nil, "", e
+		}
+		it.Response = resp
+		return resp.GetOperations(), resp.GetNextPageToken(), nil
+	}
+
 	fetch := func(pageSize int, pageToken string) (string, error) {
 		items, nextPageToken, err := it.InternalFetch(pageSize, pageToken)
 		if err != nil {

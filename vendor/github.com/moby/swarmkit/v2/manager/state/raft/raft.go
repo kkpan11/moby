@@ -30,8 +30,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/pkg/v3/idutil"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -114,8 +114,8 @@ type Node struct {
 	reqIDGen            *idutil.Generator
 	wait                *wait
 	campaignWhenAble    bool
-	signalledLeadership uint32
-	isMember            uint32
+	signalledLeadership atomic.Uint32
+	isMember            atomic.Uint32
 	bootstrapMembers    []*api.RaftMember
 
 	// waitProp waits for all the proposals to be terminated before
@@ -161,7 +161,7 @@ type Node struct {
 	// an raft DEK during a raft DEK rotation, so that we won't finish a rotation until
 	// a snapshot covering that index has been written encrypted with the new raft DEK
 	waitForAppliedIndex uint64
-	ticksWithNoLeader   uint32
+	ticksWithNoLeader   atomic.Uint32
 }
 
 // NodeOptions provides node-level options.
@@ -275,7 +275,7 @@ func (n *Node) IsIDRemoved(id uint64) bool {
 // Part of transport.Raft interface.
 func (n *Node) NodeRemoved() {
 	n.removeRaftOnce.Do(func() {
-		atomic.StoreUint32(&n.isMember, 0)
+		n.isMember.Store(0)
 		close(n.RemovedFromRaft)
 	})
 }
@@ -331,7 +331,7 @@ func (n *Node) SetAddr(ctx context.Context, addr string) error {
 	ctx, cancelCtx := n.WithContext(ctx)
 	defer cancelCtx()
 
-	isLeader := atomic.LoadUint32(&n.signalledLeadership) == 1
+	isLeader := n.signalledLeadership.Load() == 1
 	for !isLeader {
 		select {
 		case leadershipChange := <-leadershipCh:
@@ -383,7 +383,7 @@ func (n *Node) JoinAndStart(ctx context.Context) (err error) {
 			n.stopMu.Unlock()
 			n.done()
 		} else {
-			atomic.StoreUint32(&n.isMember, 1)
+			n.isMember.Store(1)
 		}
 	}()
 
@@ -574,9 +574,9 @@ func (n *Node) Run(ctx context.Context) error {
 			n.raftNode.Tick()
 
 			if n.leader() == raft.None {
-				atomic.AddUint32(&n.ticksWithNoLeader, 1)
+				n.ticksWithNoLeader.Add(1)
 			} else {
-				atomic.StoreUint32(&n.ticksWithNoLeader, 0)
+				n.ticksWithNoLeader.Store(0)
 			}
 		case rd := <-n.raftNode.Ready():
 			raftConfig := n.getCurrentRaftConfig()
@@ -646,8 +646,8 @@ func (n *Node) Run(ctx context.Context) error {
 					wasLeader = false
 					log.G(ctx).Error("soft state changed, node no longer a leader, resetting and cancelling all waits")
 
-					if atomic.LoadUint32(&n.signalledLeadership) == 1 {
-						atomic.StoreUint32(&n.signalledLeadership, 0)
+					if n.signalledLeadership.Load() == 1 {
+						n.signalledLeadership.Store(0)
 						n.leadershipBroadcast.Publish(IsFollower)
 					}
 
@@ -686,11 +686,11 @@ func (n *Node) Run(ctx context.Context) error {
 				n.triggerSnapshot(ctx, raftConfig)
 			}
 
-			if wasLeader && atomic.LoadUint32(&n.signalledLeadership) != 1 {
+			if wasLeader && n.signalledLeadership.Load() != 1 {
 				// If all the entries in the log have become
 				// committed, broadcast our leadership status.
 				if n.caughtUp() {
-					atomic.StoreUint32(&n.signalledLeadership, 1)
+					n.signalledLeadership.Store(1)
 					n.leadershipBroadcast.Publish(IsLeader)
 				}
 			}
@@ -860,7 +860,7 @@ func (n *Node) stop(ctx context.Context) {
 	n.raftNode.Stop()
 	n.ticker.Stop()
 	n.raftLogger.Close(ctx)
-	atomic.StoreUint32(&n.isMember, 0)
+	n.isMember.Store(0)
 	// TODO(stevvooe): Handle ctx.Done()
 }
 
@@ -910,7 +910,7 @@ func (n *Node) Leader() (uint64, error) {
 // saying that it has become the leader. This means it is ready to accept
 // proposals.
 func (n *Node) ReadyForProposals() bool {
-	return atomic.LoadUint32(&n.signalledLeadership) == 1
+	return n.signalledLeadership.Load() == 1
 }
 
 func (n *Node) caughtUp() bool {
@@ -948,11 +948,11 @@ func (n *Node) Join(ctx context.Context, req *api.JoinRequest) (*api.JoinRespons
 	defer n.membershipLock.Unlock()
 
 	if !n.IsMember() {
-		return nil, status.Errorf(codes.FailedPrecondition, "%s", ErrNoRaftMember.Error())
+		return nil, status.Error(codes.FailedPrecondition, ErrNoRaftMember.Error())
 	}
 
 	if !n.isLeader() {
-		return nil, status.Errorf(codes.FailedPrecondition, "%s", ErrLostLeadership.Error())
+		return nil, status.Error(codes.FailedPrecondition, ErrLostLeadership.Error())
 	}
 
 	remoteAddr := req.Addr
@@ -1365,8 +1365,8 @@ func (n *Node) StreamRaftMessage(stream api.Raft_StreamRaftMessageServer) error 
 		if recvdMsg.Message.Index != raftMsgIndex {
 			errMsg := fmt.Sprintf("Raft message chunk with index %d is different from the previously received raft message index %d",
 				recvdMsg.Message.Index, raftMsgIndex)
-			log.G(stream.Context()).Errorf(errMsg)
-			return status.Errorf(codes.InvalidArgument, "%s", errMsg)
+			log.G(stream.Context()).Error(errMsg)
+			return status.Error(codes.InvalidArgument, errMsg)
 		}
 
 		// Verify that multiple message received on a stream
@@ -1374,8 +1374,8 @@ func (n *Node) StreamRaftMessage(stream api.Raft_StreamRaftMessageServer) error 
 		if recvdMsg.Message.Type != raftpb.MsgSnap {
 			errMsg := fmt.Sprintf("Raft message chunk is not of type %d",
 				raftpb.MsgSnap)
-			log.G(stream.Context()).Errorf(errMsg)
-			return status.Errorf(codes.InvalidArgument, "%s", errMsg)
+			log.G(stream.Context()).Error(errMsg)
+			return status.Error(codes.InvalidArgument, errMsg)
 		}
 
 		// Append the received snapshot data.
@@ -1408,7 +1408,7 @@ func (n *Node) ProcessRaftMessage(ctx context.Context, msg *api.ProcessRaftMessa
 	// a node in the remove set
 	if n.cluster.IsIDRemoved(msg.Message.From) {
 		n.processRaftMessageLogger(ctx, msg).Debug("received message from removed member")
-		return nil, status.Errorf(codes.NotFound, "%s", membership.ErrMemberRemoved.Error())
+		return nil, status.Error(codes.NotFound, membership.ErrMemberRemoved.Error())
 	}
 
 	ctx, cancel := n.WithContext(ctx)
@@ -1517,7 +1517,7 @@ func (n *Node) LeaderConn(ctx context.Context) (*grpc.ClientConn, error) {
 	if err == raftselector.ErrIsLeader {
 		return nil, err
 	}
-	if atomic.LoadUint32(&n.ticksWithNoLeader) > lostQuorumTimeout {
+	if n.ticksWithNoLeader.Load() > lostQuorumTimeout {
 		return nil, errLostQuorum
 	}
 
@@ -1732,7 +1732,7 @@ func (n *Node) GetNodeIDByRaftID(raftID uint64) (string, error) {
 // IsMember checks if the raft node has effectively joined
 // a cluster of existing members.
 func (n *Node) IsMember() bool {
-	return atomic.LoadUint32(&n.isMember) == 1
+	return n.isMember.Load() == 1
 }
 
 // Saves a log entry to our Store
@@ -1801,7 +1801,7 @@ func (n *Node) processInternalRaftRequest(ctx context.Context, r *api.InternalRa
 	ch := n.wait.register(r.ID, cb, cancel)
 
 	// Do this check after calling register to avoid a race.
-	if atomic.LoadUint32(&n.signalledLeadership) != 1 {
+	if n.signalledLeadership.Load() != 1 {
 		log.G(ctx).Error("node is no longer leader, aborting propose")
 		n.wait.cancel(r.ID)
 		return nil, ErrLostLeadership
@@ -1829,7 +1829,7 @@ func (n *Node) processInternalRaftRequest(ctx context.Context, r *api.InternalRa
 		if !ok {
 			// Wait notification channel was closed. This should only happen if the wait was cancelled.
 			log.G(ctx).Error("wait cancelled")
-			if atomic.LoadUint32(&n.signalledLeadership) == 1 {
+			if n.signalledLeadership.Load() == 1 {
 				log.G(ctx).Error("wait cancelled but node is still a leader")
 			}
 			return nil, ErrLostLeadership
@@ -1841,7 +1841,7 @@ func (n *Node) processInternalRaftRequest(ctx context.Context, r *api.InternalRa
 		x, ok := <-ch
 		if !ok {
 			log.G(ctx).WithError(waitCtx.Err()).Error("wait context cancelled")
-			if atomic.LoadUint32(&n.signalledLeadership) == 1 {
+			if n.signalledLeadership.Load() == 1 {
 				log.G(ctx).Error("wait context cancelled but node is still a leader")
 			}
 			return nil, ErrLostLeadership
@@ -1988,7 +1988,7 @@ func (n *Node) applyAddNode(cc raftpb.ConfChange) error {
 
 // applyUpdateNode is called when we receive a ConfChange from a member in the
 // raft cluster which update the address of an existing node.
-func (n *Node) applyUpdateNode(ctx context.Context, cc raftpb.ConfChange) error {
+func (n *Node) applyUpdateNode(_ context.Context, cc raftpb.ConfChange) error {
 	newMember := &api.RaftMember{}
 	err := proto.Unmarshal(cc.Context, newMember)
 	if err != nil {

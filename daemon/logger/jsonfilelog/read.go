@@ -1,15 +1,15 @@
-package jsonfilelog // import "github.com/docker/docker/daemon/logger/jsonfilelog"
+package jsonfilelog
 
 import (
 	"context"
 	"encoding/json"
 	"io"
 
-	"github.com/docker/docker/api/types/backend"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/jsonfilelog/jsonlog"
-	"github.com/docker/docker/daemon/logger/loggerutils"
-	"github.com/docker/docker/pkg/tailfile"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/jsonfilelog/jsonlog"
+	"github.com/moby/moby/v2/daemon/logger/loggerutils"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/pkg/tailfile"
 )
 
 var _ logger.LogReader = (*JSONFileLogger)(nil)
@@ -62,7 +62,7 @@ func (d *decoder) Close() {
 	d.jl = nil
 }
 
-func (d *decoder) Decode() (msg *logger.Message, err error) {
+func (d *decoder) Decode() (*logger.Message, error) {
 	if d.dec == nil {
 		d.dec = json.NewDecoder(d.rdr)
 	}

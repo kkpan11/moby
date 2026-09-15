@@ -5,9 +5,11 @@ import (
 	"maps"
 	"strconv"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/containerd/snapshots"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/pkg/snapshotters"
+
 	"github.com/distribution/reference"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/session"
@@ -69,13 +71,15 @@ func ResolveCacheExporterFunc(sm *session.Manager, hosts docker.RegistryHosts) r
 			}
 			ociMediatypes = b
 		}
-		imageManifest := false
+		imageManifest := true
 		if v, ok := attrs[attrImageManifest]; ok {
 			b, err := strconv.ParseBool(v)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to parse %s", attrImageManifest)
 			}
 			imageManifest = b
+		} else if !ociMediatypes {
+			imageManifest = false
 		}
 		insecure := false
 		if v, ok := attrs[attrInsecure]; ok {
@@ -86,7 +90,7 @@ func ResolveCacheExporterFunc(sm *session.Manager, hosts docker.RegistryHosts) r
 			insecure = b
 		}
 
-		scope, hosts := registryConfig(hosts, ref, "push", insecure)
+		scope, hosts := registryConfig(hosts, ref, resolver.ScopeType{Push: true}, insecure)
 		remote := resolver.DefaultPool.GetResolver(hosts, refString, scope, sm, g)
 		pusher, err := push.Pusher(ctx, remote, refString)
 		if err != nil {
@@ -112,35 +116,49 @@ func ResolveCacheImporterFunc(sm *session.Manager, cs content.Store, hosts docke
 			insecure = b
 		}
 
-		scope, hosts := registryConfig(hosts, ref, "pull", insecure)
+		scope, hosts := registryConfig(hosts, ref, resolver.ScopeType{}, insecure)
 		remote := resolver.DefaultPool.GetResolver(hosts, refString, scope, sm, g)
 		xref, desc, err := remote.Resolve(ctx, refString)
 		if err != nil {
 			return nil, ocispecs.Descriptor{}, err
 		}
-		fetcher, err := remote.Fetcher(ctx, xref)
-		if err != nil {
-			return nil, ocispecs.Descriptor{}, err
-		}
-		src := &withDistributionSourceLabel{
-			Provider: contentutil.FromFetcher(limited.Default.WrapFetcher(fetcher, refString)),
+		src := &registryCacheProvider{
+			resolver: remote,
 			ref:      refString,
+			xref:     xref,
 			source:   cs,
 		}
 		return remotecache.NewImporter(src), desc, nil
 	}
 }
 
-type withDistributionSourceLabel struct {
-	content.Provider
-	ref    string
-	source content.Manager
+type registryCacheProvider struct {
+	resolver *resolver.Resolver
+	ref      string
+	xref     string
+	source   content.Manager
 }
 
-var _ remotecache.DistributionSourceLabelSetter = &withDistributionSourceLabel{}
+var _ remotecache.DistributionSourceLabelSetter = &registryCacheProvider{}
 
-func (dsl *withDistributionSourceLabel) SetDistributionSourceLabel(ctx context.Context, dgst digest.Digest) error {
-	hf, err := docker.AppendDistributionSourceLabel(dsl.source, dsl.ref)
+// ProviderForSession prevents cache providers shared across Solves from using
+// the credentials of the Solve that originally imported the cache manifest.
+func (p *registryCacheProvider) ProviderForSession(g session.Group) content.Provider {
+	p2 := *p
+	p2.resolver = p.resolver.WithSession(g)
+	return &p2
+}
+
+func (p *registryCacheProvider) ReaderAt(ctx context.Context, desc ocispecs.Descriptor) (content.ReaderAt, error) {
+	fetcher, err := p.resolver.Fetcher(ctx, p.xref)
+	if err != nil {
+		return nil, err
+	}
+	return contentutil.FromFetcher(limited.Default.WrapFetcher(fetcher, p.ref)).ReaderAt(ctx, desc)
+}
+
+func (p *registryCacheProvider) SetDistributionSourceLabel(ctx context.Context, dgst digest.Digest) error {
+	hf, err := docker.AppendDistributionSourceLabel(p.source, p.ref)
 	if err != nil {
 		return err
 	}
@@ -148,15 +166,15 @@ func (dsl *withDistributionSourceLabel) SetDistributionSourceLabel(ctx context.C
 	return err
 }
 
-func (dsl *withDistributionSourceLabel) SetDistributionSourceAnnotation(desc ocispecs.Descriptor) ocispecs.Descriptor {
+func (p *registryCacheProvider) SetDistributionSourceAnnotation(desc ocispecs.Descriptor) ocispecs.Descriptor {
 	if desc.Annotations == nil {
 		desc.Annotations = map[string]string{}
 	}
-	desc.Annotations["containerd.io/distribution.source.ref"] = dsl.ref
+	desc.Annotations["containerd.io/distribution.source.ref"] = p.ref
 	return desc
 }
 
-func (dsl *withDistributionSourceLabel) SnapshotLabels(descs []ocispecs.Descriptor, index int) map[string]string {
+func (p *registryCacheProvider) SnapshotLabels(descs []ocispecs.Descriptor, index int) map[string]string {
 	if len(descs) < index {
 		return nil
 	}
@@ -164,11 +182,12 @@ func (dsl *withDistributionSourceLabel) SnapshotLabels(descs []ocispecs.Descript
 	if labels == nil {
 		labels = make(map[string]string)
 	}
-	maps.Copy(labels, estargz.SnapshotLabels(dsl.ref, descs, index))
+	maps.Copy(labels, estargz.SnapshotLabels(p.ref, descs, index))
+	labels[snapshotters.TargetRefLabel] = p.ref
 	return labels
 }
 
-func registryConfig(hosts docker.RegistryHosts, ref reference.Named, scope string, insecure bool) (string, docker.RegistryHosts) {
+func registryConfig(hosts docker.RegistryHosts, ref reference.Named, scope resolver.ScopeType, insecure bool) (resolver.ScopeType, docker.RegistryHosts) {
 	if insecure {
 		insecureTrue := true
 		httpTrue := true
@@ -178,7 +197,7 @@ func registryConfig(hosts docker.RegistryHosts, ref reference.Named, scope strin
 				PlainHTTP: &httpTrue,
 			},
 		})
-		scope += ":insecure"
+		scope.Insecure = true
 	}
 	return scope, hosts
 }

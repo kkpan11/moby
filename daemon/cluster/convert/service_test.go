@@ -1,13 +1,13 @@
-package convert // import "github.com/docker/docker/daemon/cluster/convert"
+package convert
 
 import (
+	"errors"
 	"testing"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
-	swarmtypes "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/api/types/swarm/runtime"
 	google_protobuf3 "github.com/gogo/protobuf/types"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	swarmtypes "github.com/moby/moby/api/types/swarm"
 	swarmapi "github.com/moby/swarmkit/v2/api"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -88,7 +88,7 @@ func TestServiceConvertToGRPCGenericRuntimePlugin(t *testing.T) {
 	s := swarmtypes.ServiceSpec{
 		TaskTemplate: swarmtypes.TaskSpec{
 			Runtime:    swarmtypes.RuntimePlugin,
-			PluginSpec: &runtime.PluginSpec{},
+			PluginSpec: &swarmtypes.RuntimeSpec{},
 		},
 		Mode: swarmtypes.ServiceMode{
 			Global: &swarmtypes.GlobalService{},
@@ -148,7 +148,7 @@ func TestServiceConvertToGRPCGenericRuntimeCustom(t *testing.T) {
 		},
 	}
 
-	if _, err := ServiceSpecToGRPC(s); err != ErrUnsupportedRuntime {
+	if _, err := ServiceSpecToGRPC(s); !errors.Is(err, ErrUnsupportedRuntime) {
 		t.Fatal(err)
 	}
 }
@@ -236,7 +236,7 @@ func TestServiceConvertFromGRPCIsolation(t *testing.T) {
 }
 
 func TestServiceConvertToGRPCCredentialSpec(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		name        string
 		from        swarmtypes.CredentialSpec
 		to          swarmapi.Privileges_CredentialSpec
@@ -308,22 +308,21 @@ func TestServiceConvertToGRPCCredentialSpec(t *testing.T) {
 		},
 	}
 
-	for _, c := range cases {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			s := swarmtypes.ServiceSpec{
 				TaskTemplate: swarmtypes.TaskSpec{
 					ContainerSpec: &swarmtypes.ContainerSpec{
 						Privileges: &swarmtypes.Privileges{
-							CredentialSpec: &c.from,
+							CredentialSpec: &tc.from,
 						},
 					},
 				},
 			}
 
 			res, err := ServiceSpecToGRPC(s)
-			if c.expectedErr != "" {
-				assert.Error(t, err, c.expectedErr)
+			if tc.expectedErr != "" {
+				assert.Error(t, err, tc.expectedErr)
 				return
 			}
 
@@ -332,13 +331,13 @@ func TestServiceConvertToGRPCCredentialSpec(t *testing.T) {
 			if !ok {
 				t.Fatal("expected type swarmapi.TaskSpec_Container")
 			}
-			assert.DeepEqual(t, c.to, *v.Container.Privileges.CredentialSpec)
+			assert.DeepEqual(t, tc.to, *v.Container.Privileges.CredentialSpec)
 		})
 	}
 }
 
 func TestServiceConvertFromGRPCCredentialSpec(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		name string
 		from swarmapi.Privileges_CredentialSpec
 		to   *swarmtypes.CredentialSpec
@@ -371,9 +370,7 @@ func TestServiceConvertFromGRPCCredentialSpec(t *testing.T) {
 		},
 	}
 
-	for _, tc := range cases {
-		tc := tc
-
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			gs := swarmapi.Service{
 				Spec: swarmapi.ServiceSpec{
@@ -412,7 +409,7 @@ func TestServiceConvertToGRPCNetworkAttachmentRuntime(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error %v but got no error", ErrUnsupportedRuntime)
 	}
-	if err != ErrUnsupportedRuntime {
+	if !errors.Is(err, ErrUnsupportedRuntime) {
 		t.Fatalf("expected error %v but got error %v", ErrUnsupportedRuntime, err)
 	}
 }
@@ -427,7 +424,7 @@ func TestServiceConvertToGRPCMismatchedRuntime(t *testing.T) {
 	} {
 		for j, spec := range []swarmtypes.TaskSpec{
 			{ContainerSpec: &swarmtypes.ContainerSpec{}},
-			{PluginSpec: &runtime.PluginSpec{}},
+			{PluginSpec: &swarmtypes.RuntimeSpec{}},
 		} {
 			// skip the cases, where the indices match, which would not error
 			if i == j {
@@ -439,7 +436,7 @@ func TestServiceConvertToGRPCMismatchedRuntime(t *testing.T) {
 			}
 			s.TaskTemplate.Runtime = rt
 
-			if _, err := ServiceSpecToGRPC(s); err != ErrMismatchedRuntime {
+			if _, err := ServiceSpecToGRPC(s); !errors.Is(err, ErrMismatchedRuntime) {
 				t.Fatalf("expected %v got %v", ErrMismatchedRuntime, err)
 			}
 		}

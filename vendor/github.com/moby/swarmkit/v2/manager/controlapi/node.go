@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"slices"
 
 	gogotypes "github.com/gogo/protobuf/types"
 	"github.com/moby/swarmkit/v2/api"
@@ -15,7 +16,7 @@ import (
 
 func validateNodeSpec(spec *api.NodeSpec) error {
 	if spec == nil {
-		return status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return status.Error(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 	return nil
 }
@@ -23,9 +24,9 @@ func validateNodeSpec(spec *api.NodeSpec) error {
 // GetNode returns a Node given a NodeID.
 // - Returns `InvalidArgument` if NodeID is not provided.
 // - Returns `NotFound` if the Node is not found.
-func (s *Server) GetNode(ctx context.Context, request *api.GetNodeRequest) (*api.GetNodeResponse, error) {
+func (s *Server) GetNode(_ context.Context, request *api.GetNodeRequest) (*api.GetNodeResponse, error) {
 	if request.NodeID == "" {
-		return nil, status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return nil, status.Error(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 
 	var node *api.Node
@@ -76,7 +77,7 @@ func filterNodes(candidates []*api.Node, filters ...func(*api.Node) bool) []*api
 }
 
 // ListNodes returns a list of all nodes.
-func (s *Server) ListNodes(ctx context.Context, request *api.ListNodesRequest) (*api.ListNodesResponse, error) {
+func (s *Server) ListNodes(_ context.Context, request *api.ListNodesRequest) (*api.ListNodesResponse, error) {
 	var (
 		nodes []*api.Node
 		err   error
@@ -115,19 +116,13 @@ func (s *Server) ListNodes(ctx context.Context, request *api.ListNodesRequest) (
 				if len(request.Filters.Names) == 0 {
 					return true
 				}
-				if e.Description == nil {
-					return false
-				}
-				return filterContains(e.Description.Hostname, request.Filters.Names)
+				return e.Description != nil && filterContains(e.Description.Hostname, request.Filters.Names)
 			},
 			func(e *api.Node) bool {
 				if len(request.Filters.NamePrefixes) == 0 {
 					return true
 				}
-				if e.Description == nil {
-					return false
-				}
-				return filterContainsPrefix(e.Description.Hostname, request.Filters.NamePrefixes)
+				return e.Description != nil && filterContainsPrefix(e.Description.Hostname, request.Filters.NamePrefixes)
 			},
 			func(e *api.Node) bool {
 				return filterContainsPrefix(e.ID, request.Filters.IDPrefixes)
@@ -136,38 +131,16 @@ func (s *Server) ListNodes(ctx context.Context, request *api.ListNodesRequest) (
 				if len(request.Filters.Labels) == 0 {
 					return true
 				}
-				if e.Description == nil {
-					return false
-				}
-				return filterMatchLabels(e.Description.Engine.Labels, request.Filters.Labels)
+				return e.Description != nil && e.Description.Engine != nil && filterMatchLabels(e.Description.Engine.Labels, request.Filters.Labels)
 			},
 			func(e *api.Node) bool {
-				if len(request.Filters.NodeLabels) == 0 {
-					return true
-				}
-				return filterMatchLabels(e.Spec.Annotations.Labels, request.Filters.NodeLabels)
+				return len(request.Filters.NodeLabels) == 0 || filterMatchLabels(e.Spec.Annotations.Labels, request.Filters.NodeLabels)
 			},
 			func(e *api.Node) bool {
-				if len(request.Filters.Roles) == 0 {
-					return true
-				}
-				for _, c := range request.Filters.Roles {
-					if c == e.Role {
-						return true
-					}
-				}
-				return false
+				return len(request.Filters.Roles) == 0 || slices.Contains(request.Filters.Roles, e.Role)
 			},
 			func(e *api.Node) bool {
-				if len(request.Filters.Memberships) == 0 {
-					return true
-				}
-				for _, c := range request.Filters.Memberships {
-					if c == e.Spec.Membership {
-						return true
-					}
-				}
-				return false
+				return len(request.Filters.Memberships) == 0 || slices.Contains(request.Filters.Memberships, e.Spec.Membership)
 			},
 		)
 	}
@@ -200,9 +173,9 @@ func (s *Server) ListNodes(ctx context.Context, request *api.ListNodesRequest) (
 // - Returns `NotFound` if the Node is not found.
 // - Returns `InvalidArgument` if the NodeSpec is malformed.
 // - Returns an error if the update fails.
-func (s *Server) UpdateNode(ctx context.Context, request *api.UpdateNodeRequest) (*api.UpdateNodeResponse, error) {
+func (s *Server) UpdateNode(_ context.Context, request *api.UpdateNodeRequest) (*api.UpdateNodeResponse, error) {
 	if request.NodeID == "" || request.NodeVersion == nil {
-		return nil, status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return nil, status.Error(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 	if err := validateNodeSpec(request.Spec); err != nil {
 		return nil, err
@@ -291,9 +264,9 @@ func orphanNodeTasks(tx store.Tx, nodeID string) error {
 // - Returns FailedPrecondition if the Node has manager role (and is part of the memberlist) or is not shut down.
 // - Returns InvalidArgument if NodeID or NodeVersion is not valid.
 // - Returns an error if the delete fails.
-func (s *Server) RemoveNode(ctx context.Context, request *api.RemoveNodeRequest) (*api.RemoveNodeResponse, error) {
+func (s *Server) RemoveNode(_ context.Context, request *api.RemoveNodeRequest) (*api.RemoveNodeResponse, error) {
 	if request.NodeID == "" {
-		return nil, status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return nil, status.Error(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 
 	err := s.store.Update(func(tx store.Tx) error {

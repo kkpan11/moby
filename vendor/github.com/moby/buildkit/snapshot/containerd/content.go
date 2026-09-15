@@ -3,8 +3,8 @@ package containerd
 import (
 	"context"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	cerrdefs "github.com/containerd/errdefs"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -44,7 +44,7 @@ func (c *Store) Walk(ctx context.Context, fn content.WalkFunc, filters ...string
 }
 
 func (c *Store) Delete(ctx context.Context, dgst digest.Digest) error {
-	return errors.Errorf("contentstore.Delete usage is forbidden")
+	return errors.New("contentstore.Delete usage is forbidden")
 }
 
 func (c *Store) Status(ctx context.Context, ref string) (content.Status, error) {
@@ -115,7 +115,20 @@ func (c *nsFallbackStore) Update(ctx context.Context, info content.Info, fieldpa
 }
 
 func (c *nsFallbackStore) Walk(ctx context.Context, fn content.WalkFunc, filters ...string) error {
-	return c.main.Walk(ctx, fn, filters...)
+	seen := make(map[digest.Digest]struct{})
+	err := c.main.Walk(ctx, func(i content.Info) error {
+		seen[i.Digest] = struct{}{}
+		return fn(i)
+	}, filters...)
+	if err != nil {
+		return err
+	}
+	return c.fb.Walk(ctx, func(i content.Info) error {
+		if _, ok := seen[i.Digest]; ok {
+			return nil
+		}
+		return fn(i)
+	}, filters...)
 }
 
 func (c *nsFallbackStore) Delete(ctx context.Context, dgst digest.Digest) error {

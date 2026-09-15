@@ -2,8 +2,8 @@ package builder
 
 import (
 	"context"
+	"maps"
 	"strings"
-	"sync"
 
 	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/client/llb"
@@ -16,13 +16,14 @@ import (
 	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
+	"github.com/moby/buildkit/frontend/subrequests/convertllb"
 	"github.com/moby/buildkit/frontend/subrequests/lint"
 	"github.com/moby/buildkit/frontend/subrequests/outline"
 	"github.com/moby/buildkit/frontend/subrequests/targets"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/solver/result"
-	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
+	"github.com/moby/buildkit/util/bkmaps"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
@@ -96,6 +97,9 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 		Lint: func(ctx context.Context) (*lint.LintResults, error) {
 			return dockerfile2llb.DockerfileLint(ctx, src.Data, convertOpt)
 		},
+		ConvertLLB: func(ctx context.Context) (*convertllb.Result, error) {
+			return dockerfile2llb.DockerfileConvertLLB(ctx, src.Data, convertOpt)
+		},
 	}); err != nil {
 		return nil, err
 	} else if ok {
@@ -103,7 +107,7 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 	}
 
 	defer func() {
-		var el *parser.ErrorLocation
+		var el *parser.LocationError
 		if errors.As(err, &el) {
 			for _, l := range el.Locations {
 				err = wrapSource(err, src.SourceMap, l)
@@ -114,33 +118,36 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 	var scanner sbom.Scanner
 	if bc.SBOM != nil {
 		// TODO: scanner should pass policy
-		scanner, err = sbom.CreateSBOMScanner(ctx, c, bc.SBOM.Generator, sourceresolver.Opt{
+		scannerPlatform := bc.BuildPlatforms[0]
+		scanner, err = sbom.CreateSBOMScanner(ctx, c, bc.SBOM.Generator, scannerPlatform, sourceresolver.Opt{
 			ImageOpt: &sourceresolver.ResolveImageOpt{
 				ResolveMode: opts["image-resolve-mode"],
+				Platform:    &scannerPlatform,
 			},
-		})
+		}, bc.SBOM.Parameters)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	scanTargets := sync.Map{}
+	scanTargets := bkmaps.SyncMap[string, *dockerfile2llb.Result]{}
 
-	rb, err := bc.Build(ctx, func(ctx context.Context, platform *ocispecs.Platform, idx int) (client.Reference, *dockerspec.DockerOCIImage, *dockerspec.DockerOCIImage, error) {
+	rb, err := bc.Build(ctx, func(ctx context.Context, platform *ocispecs.Platform, idx int) (*dockerui.BuildResult, error) {
 		opt := convertOpt
+		opt.BuildArgs = maps.Clone(opt.BuildArgs)
 		opt.TargetPlatform = platform
 		if idx != 0 {
 			opt.Warn = nil
 		}
 
-		st, img, baseImg, scanTarget, err := dockerfile2llb.Dockerfile2LLB(ctx, src.Data, opt)
+		dfRes, err := dockerfile2llb.Dockerfile2LLB(ctx, src.Data, opt)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 
-		def, err := st.Marshal(ctx)
+		def, err := dfRes.State.Marshal(ctx)
 		if err != nil {
-			return nil, nil, nil, errors.Wrapf(err, "failed to marshal LLB definition")
+			return nil, errors.Wrapf(err, "failed to marshal LLB definition")
 		}
 
 		r, err := c.Solve(ctx, client.SolveRequest{
@@ -148,21 +155,28 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 			CacheImports: bc.CacheImports,
 		})
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 
 		ref, err := r.SingleRef()
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 
-		p := platforms.DefaultSpec()
+		var p ocispecs.Platform
 		if platform != nil {
 			p = *platform
+		} else {
+			p = platforms.DefaultSpec()
 		}
-		scanTargets.Store(platforms.Format(platforms.Normalize(p)), scanTarget)
-
-		return ref, img, baseImg, nil
+		id := platforms.FormatAll(platforms.Normalize(p))
+		scanTargets.Store(id, dfRes)
+		return &dockerui.BuildResult{
+			Reference: ref,
+			Image:     dfRes.Image,
+			BaseImage: dfRes.BaseImage,
+			Epoch:     dfRes.Epoch,
+		}, nil
 	})
 	if err != nil {
 		return nil, err
@@ -170,20 +184,16 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 
 	if scanner != nil {
 		if err := rb.EachPlatform(ctx, func(ctx context.Context, id string, p ocispecs.Platform) error {
-			v, ok := scanTargets.Load(id)
+			target, ok := scanTargets.Load(id)
 			if !ok {
 				return errors.Errorf("no scan targets for %s", id)
 			}
-			target, ok := v.(*dockerfile2llb.SBOMTargets)
-			if !ok {
-				return errors.Errorf("invalid scan targets for %T", v)
-			}
 
 			var opts []llb.ConstraintsOpt
-			if target.IgnoreCache {
+			if target.IsIgnoreCache {
 				opts = append(opts, llb.IgnoreCache)
 			}
-			att, err := scanner(ctx, id, target.Core, target.Extras, opts...)
+			att, err := scanner(ctx, id, target.SBOM.Core, target.SBOM.Extras, opts...)
 			if err != nil {
 				return err
 			}
@@ -255,11 +265,11 @@ func warnOpts(r []parser.Range, detail [][]byte, url string) client.WarnOpts {
 	opts.Range = []*pb.Range{}
 	for _, r := range r {
 		opts.Range = append(opts.Range, &pb.Range{
-			Start: pb.Position{
+			Start: &pb.Position{
 				Line:      int32(r.Start.Line),
 				Character: int32(r.Start.Character),
 			},
-			End: pb.Position{
+			End: &pb.Position{
 				Line:      int32(r.End.Line),
 				Character: int32(r.End.Character),
 			},
@@ -272,7 +282,7 @@ func wrapSource(err error, sm *llb.SourceMap, ranges []parser.Range) error {
 	if sm == nil {
 		return err
 	}
-	s := errdefs.Source{
+	s := &errdefs.Source{
 		Info: &pb.SourceInfo{
 			Data:       sm.Data,
 			Filename:   sm.Filename,
@@ -283,11 +293,11 @@ func wrapSource(err error, sm *llb.SourceMap, ranges []parser.Range) error {
 	}
 	for _, r := range ranges {
 		s.Ranges = append(s.Ranges, &pb.Range{
-			Start: pb.Position{
+			Start: &pb.Position{
 				Line:      int32(r.Start.Line),
 				Character: int32(r.Start.Character),
 			},
-			End: pb.Position{
+			End: &pb.Position{
 				Line:      int32(r.End.Line),
 				Character: int32(r.End.Character),
 			},

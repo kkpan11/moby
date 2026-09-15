@@ -1,38 +1,35 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
 	cdcgroups "github.com/containerd/cgroups/v3"
-	"github.com/containerd/containerd/containers"
-	coci "github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/pkg/apparmor"
+	"github.com/containerd/containerd/v2/core/containers"
+	coci "github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/log"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
-	dconfig "github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/internal/otelutil"
-	"github.com/docker/docker/internal/rootless/mountopts"
-	"github.com/docker/docker/internal/rootless/specconv"
-	"github.com/docker/docker/oci"
-	"github.com/docker/docker/oci/caps"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/stringid"
-	volumemounts "github.com/docker/docker/volume/mounts"
+	containertypes "github.com/moby/moby/api/types/container"
+	dconfig "github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/rootless/mountopts"
+	"github.com/moby/moby/v2/daemon/internal/rootless/specconv"
+	"github.com/moby/moby/v2/daemon/pkg/oci"
+	"github.com/moby/moby/v2/daemon/pkg/oci/caps"
+	volumemounts "github.com/moby/moby/v2/daemon/volume/mounts"
+	"github.com/moby/moby/v2/errdefs"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
 	"github.com/moby/sys/user"
 	"github.com/moby/sys/userns"
-	"github.com/opencontainers/runc/libcontainer/cgroups"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/cgroups"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
-	"go.opentelemetry.io/otel"
 )
 
 const inContainerInitPath = "/sbin/" + dconfig.DefaultInitBinary
@@ -62,35 +59,8 @@ func withRlimits(daemon *Daemon, daemonCfg *dconfig.Config, c *container.Contain
 	}
 }
 
-// withLibnetwork sets the libnetwork hook
-func withLibnetwork(daemon *Daemon, daemonCfg *dconfig.Config, c *container.Container) coci.SpecOpts {
-	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
-		if c.Config.NetworkDisabled {
-			return nil
-		}
-		for _, ns := range s.Linux.Namespaces {
-			if ns.Type == specs.NetworkNamespace && ns.Path == "" {
-				if s.Hooks == nil {
-					s.Hooks = &specs.Hooks{}
-				}
-				shortNetCtlrID := stringid.TruncateID(daemon.netController.ID())
-
-				var carrier otelutil.EnvironCarrier
-				otel.GetTextMapPropagator().Inject(ctx, &carrier)
-
-				s.Hooks.Prestart = append(s.Hooks.Prestart, specs.Hook{ //nolint:staticcheck // FIXME(thaJeztah); replace prestart hook with a non-deprecated one.
-					Path: filepath.Join("/proc", strconv.Itoa(os.Getpid()), "exe"),
-					Env:  carrier.Environ(),
-					Args: []string{"libnetwork-setkey", "-exec-root=" + daemonCfg.GetExecRoot(), c.ID, shortNetCtlrID},
-				})
-			}
-		}
-		return nil
-	}
-}
-
 // withRootless sets the spec to the rootless configuration
-func withRootless(daemon *Daemon, daemonCfg *dconfig.Config) coci.SpecOpts {
+func withRootless(_ *Daemon, daemonCfg *dconfig.Config) coci.SpecOpts {
 	return func(_ context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
 		var v2Controllers []string
 		if cgroupDriver(daemonCfg) == cgroupSystemdDriver {
@@ -118,7 +88,7 @@ func withRootless(daemon *Daemon, daemonCfg *dconfig.Config) coci.SpecOpts {
 
 // withRootfulInRootless is used for "rootful-in-rootless" dind;
 // the daemon is running in UserNS but has no access to RootlessKit API socket, host filesystem, etc.
-func withRootfulInRootless(daemon *Daemon, daemonCfg *dconfig.Config) coci.SpecOpts {
+func withRootfulInRootless(_ *Daemon, _ *dconfig.Config) coci.SpecOpts {
 	return func(_ context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
 		specconv.ToRootfulInRootless(s)
 		return nil
@@ -152,9 +122,9 @@ func WithSelinux(c *container.Container) coci.SpecOpts {
 }
 
 // WithApparmor sets the apparmor profile
-func WithApparmor(c *container.Container) coci.SpecOpts {
+func WithApparmor(daemon *Daemon, c *container.Container) coci.SpecOpts {
 	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
-		if apparmor.HostSupports() {
+		if appArmorSupported() {
 			var appArmorProfile string
 			if c.AppArmorProfile != "" {
 				appArmorProfile = c.AppArmorProfile
@@ -169,9 +139,9 @@ func WithApparmor(c *container.Container) coci.SpecOpts {
 				// profiles inadvertently. Since we cannot store our profile in
 				// /etc/apparmor.d, nor can we practically add other ways of
 				// telling the system to keep our profile loaded, in order to make
-				// sure that we keep the default profile enabled we dynamically
-				// reload it if necessary.
-				if err := ensureDefaultAppArmorProfile(); err != nil {
+				// sure that we keep the default profile enabled we load it again
+				// if it is missing.
+				if err := daemon.loadDefaultAppArmorProfileIfMissing(); err != nil {
 					return err
 				}
 			}
@@ -184,19 +154,20 @@ func WithApparmor(c *container.Container) coci.SpecOpts {
 	}
 }
 
-// WithCapabilities sets the container's capabilities
-func WithCapabilities(c *container.Container) coci.SpecOpts {
-	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
+// WithCapabilities adjusts the container's capabilities based on the
+// "CapAdd", "CapDrop", and "Privileged" fields in the container's HostConfig.
+func WithCapabilities(ctr *container.Container) coci.SpecOpts {
+	return func(ctx context.Context, client coci.Client, c *containers.Container, s *specs.Spec) (err error) {
 		capabilities, err := caps.TweakCapabilities(
 			caps.DefaultCapabilities(),
-			c.HostConfig.CapAdd,
-			c.HostConfig.CapDrop,
-			c.HostConfig.Privileged,
+			ctr.HostConfig.CapAdd,
+			ctr.HostConfig.CapDrop,
+			ctr.HostConfig.Privileged,
 		)
 		if err != nil {
 			return err
 		}
-		return oci.SetCapabilities(s, capabilities)
+		return coci.WithCapabilities(capabilities)(ctx, client, c, s)
 	}
 }
 
@@ -299,6 +270,16 @@ func WithNamespaces(daemon *Daemon, c *container.Container) coci.SpecOpts {
 			}
 		}
 
+		// Remove time-namespace if not supported. We can remove this once we
+		// drop support for kernel < 5.6.
+		sysInfo, err := daemon.RawSysInfo()
+		if err != nil {
+			return errdefs.System(err)
+		}
+		if !sysInfo.TimeNamespaces {
+			oci.RemoveNamespace(s, specs.TimeNamespace)
+		}
+
 		// ipc
 		ipcMode := c.HostConfig.IpcMode
 		if !ipcMode.Valid() {
@@ -390,13 +371,13 @@ func WithNamespaces(daemon *Daemon, c *container.Container) coci.SpecOpts {
 	}
 }
 
-func specMapping(s []idtools.IDMap) []specs.LinuxIDMapping {
+func specMapping(s []user.IDMap) []specs.LinuxIDMapping {
 	var ids []specs.LinuxIDMapping
 	for _, item := range s {
 		ids = append(ids, specs.LinuxIDMapping{
-			HostID:      uint32(item.HostID),
-			ContainerID: uint32(item.ContainerID),
-			Size:        uint32(item.Size),
+			HostID:      uint32(item.ParentID),
+			ContainerID: uint32(item.ID),
+			Size:        uint32(item.Count),
 		})
 	}
 	return ids
@@ -419,10 +400,11 @@ func getSourceMount(source string) (string, string, error) {
 		return "", "", fmt.Errorf("Can't find mount point of %s", source)
 	}
 
-	// find the longest mount point
+	// find the longest mount point, preferring later entries when there are
+	// multiple mounts at the same path (e.g., with different propagation settings)
 	var idx, maxlen int
 	for i := range mi {
-		if len(mi[i].Mountpoint) > maxlen {
+		if len(mi[i].Mountpoint) >= maxlen {
 			maxlen = len(mi[i].Mountpoint)
 			idx = i
 		}
@@ -438,7 +420,7 @@ const (
 // hasMountInfoOption checks if any of the passed any of the given option values
 // are set in the passed in option string.
 func hasMountInfoOption(opts string, vals ...string) bool {
-	for _, opt := range strings.Split(opts, " ") {
+	for opt := range strings.SplitSeq(opts, " ") {
 		for _, val := range vals {
 			if strings.HasPrefix(opt, val) {
 				return true
@@ -494,21 +476,10 @@ var (
 	}
 )
 
-// inSlice tests whether a string is contained in a slice of strings or not.
-// Comparison is case sensitive
-func inSlice(slice []string, s string) bool {
-	for _, ss := range slice {
-		if s == ss {
-			return true
-		}
-	}
-	return false
-}
-
 // withMounts sets the container's mounts
 func withMounts(daemon *Daemon, daemonCfg *configStore, c *container.Container, mounts []container.Mount) coci.SpecOpts {
-	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) (err error) {
-		sortMounts(mounts)
+	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
+		container.SortMounts(mounts)
 
 		userMounts := make(map[string]struct{})
 		for _, m := range mounts {
@@ -674,7 +645,7 @@ func withMounts(daemon *Daemon, daemonCfg *configStore, c *container.Container, 
 					continue
 				}
 				if _, ok := userMounts[m.Destination]; !ok {
-					if !inSlice(m.Options, "ro") {
+					if !slices.Contains(m.Options, "ro") {
 						s.Mounts[i].Options = append(s.Mounts[i].Options, "ro")
 					}
 				}
@@ -694,9 +665,21 @@ func withMounts(daemon *Daemon, daemonCfg *configStore, c *container.Container, 
 			}
 		}
 
+		// if the user didn't specify otherwise, default to the value of privileged
+		writableCgroups := c.HostConfig.Privileged
+		if c.WritableCgroups != nil {
+			if daemonCfg.Rootless || daemon.idMapping.UIDMaps != nil {
+				// error if the user requested a configuration we can't explicitly support
+				return errors.New("option WritableCgroups conflicts with user namespaces and rootless mode")
+			}
+			writableCgroups = *c.WritableCgroups
+		}
 		// TODO: until a kernel/mount solution exists for handling remount in a user namespace,
 		// we must clear the readonly flag for the cgroups mount (@mrunalp concurs)
-		if uidMap := daemon.idMapping.UIDMaps; uidMap != nil || c.HostConfig.Privileged {
+		if daemon.idMapping.UIDMaps != nil {
+			writableCgroups = true
+		}
+		if writableCgroups {
 			for i, m := range s.Mounts {
 				if m.Type == "cgroup" {
 					clearReadOnly(&s.Mounts[i])
@@ -734,7 +717,7 @@ func withCommonOptions(daemon *Daemon, daemonCfg *dconfig.Config, c *container.C
 			return err
 		}
 		cwd := c.Config.WorkingDir
-		if len(cwd) == 0 {
+		if cwd == "" {
 			cwd = "/"
 		}
 		if s.Process == nil {
@@ -829,15 +812,11 @@ func withCgroups(daemon *Daemon, daemonCfg *dconfig.Config, c *container.Contain
 
 		p := cgroupsPath
 		if useSystemd {
-			initPath, err := cgroups.GetInitCgroup("cpu")
+			path, err := cgroups.GetOwnCgroup("cpu")
 			if err != nil {
 				return errors.Wrap(err, "unable to init CPU RT controller")
 			}
-			_, err = cgroups.GetOwnCgroup("cpu")
-			if err != nil {
-				return errors.Wrap(err, "unable to init CPU RT controller")
-			}
-			p = filepath.Join(initPath, s.Linux.CgroupsPath)
+			p = filepath.Join(path, s.Linux.CgroupsPath)
 		}
 
 		// Clean path to guard against things like ../../../BAD
@@ -1007,9 +986,7 @@ func WithSysctls(c *container.Container) coci.SpecOpts {
 		}
 		// We merge the sysctls injected above with the HostConfig (latter takes
 		// precedence for backwards-compatibility reasons).
-		for k, v := range c.HostConfig.Sysctls {
-			s.Linux.Sysctl[k] = v
-		}
+		maps.Copy(s.Linux.Sysctl, c.HostConfig.Sysctls)
 		return nil
 	}
 }
@@ -1020,13 +997,26 @@ func WithUser(c *container.Container) coci.SpecOpts {
 		if s.Process == nil {
 			s.Process = &specs.Process{}
 		}
-		var err error
-		s.Process.User, err = getUser(c, c.Config.User)
+		user, err := getUser(c, c.Config.User)
+		// Preserve fields already set on the process user, such as Umask.
+		s.Process.User.UID = user.UID
+		s.Process.User.GID = user.GID
+		s.Process.User.AdditionalGids = user.AdditionalGids
 		return err
 	}
 }
 
-func (daemon *Daemon) createSpec(ctx context.Context, daemonCfg *configStore, c *container.Container, mounts []container.Mount) (retSpec *specs.Spec, err error) {
+// WithUmask sets the container's umask.
+func WithUmask(c *container.Container) coci.SpecOpts {
+	return func(ctx context.Context, client coci.Client, ctr *containers.Container, s *coci.Spec) error {
+		if c.HostConfig.Umask == nil {
+			return nil
+		}
+		return coci.WithUmask(*c.HostConfig.Umask)(ctx, client, ctr, s)
+	}
+}
+
+func (daemon *Daemon) createSpec(ctx context.Context, daemonCfg *configStore, c *container.Container, mounts []container.Mount) (retSpec *specs.Spec, _ error) {
 	var (
 		opts []coci.SpecOpts
 		s    = oci.DefaultSpec()
@@ -1036,18 +1026,19 @@ func (daemon *Daemon) createSpec(ctx context.Context, daemonCfg *configStore, c 
 		withCgroups(daemon, &daemonCfg.Config, c),
 		WithResources(c),
 		WithSysctls(c),
+		// Set the user before CDI device injection, which may append supplementary groups.
+		WithUser(c),
+		WithUmask(c),
 		WithDevices(daemon, c),
 		withRlimits(daemon, &daemonCfg.Config, c),
 		WithNamespaces(daemon, c),
 		WithCapabilities(c),
 		WithSeccomp(daemon, c),
 		withMounts(daemon, daemonCfg, c, mounts),
-		withLibnetwork(daemon, &daemonCfg.Config, c),
-		WithApparmor(c),
+		WithApparmor(daemon, c),
 		WithSelinux(c),
 		WithOOMScore(&c.HostConfig.OomScoreAdj),
 		coci.WithAnnotations(c.HostConfig.Annotations),
-		WithUser(c),
 	)
 
 	if c.NoNewPrivileges {

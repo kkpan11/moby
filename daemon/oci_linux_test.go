@@ -1,18 +1,21 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/daemon/network"
-	"github.com/docker/docker/libnetwork"
-	nwconfig "github.com/docker/docker/libnetwork/config"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/libnetwork"
+	nwconfig "github.com/moby/moby/v2/daemon/libnetwork/config"
+	"github.com/moby/moby/v2/daemon/network"
+	daemonoci "github.com/moby/moby/v2/daemon/pkg/oci"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
@@ -28,7 +31,7 @@ func setupFakeDaemon(t *testing.T, c *container.Container) *Daemon {
 	err := os.MkdirAll(rootfs, 0o755)
 	assert.NilError(t, err)
 
-	netController, err := libnetwork.New(nwconfig.OptionDataDir(t.TempDir()))
+	netController, err := libnetwork.New(context.Background(), nwconfig.OptionDataDir(t.TempDir()))
 	assert.NilError(t, err)
 
 	d := &Daemon{
@@ -75,6 +78,155 @@ func (i *fakeImageService) StorageDriver() string {
 	return "overlay"
 }
 
+func TestWithUmask(t *testing.T) {
+	t.Run("omitted", func(t *testing.T) {
+		c := &container.Container{HostConfig: &containertypes.HostConfig{}}
+		s := daemonoci.DefaultSpec()
+
+		err := WithUmask(c)(t.Context(), nil, nil, &s)
+		assert.NilError(t, err)
+		assert.Assert(t, s.Process.User.Umask == nil)
+	})
+
+	t.Run("set", func(t *testing.T) {
+		umask := uint32(0o027)
+		c := &container.Container{HostConfig: &containertypes.HostConfig{Umask: &umask}}
+		s := daemonoci.DefaultSpec()
+
+		err := WithUmask(c)(t.Context(), nil, nil, &s)
+		assert.NilError(t, err)
+		assert.Assert(t, s.Process.User.Umask != nil)
+		assert.Equal(t, *s.Process.User.Umask, umask)
+	})
+}
+
+func TestWithCommonOptionsDockerInit(t *testing.T) {
+	initPath := filepath.Join(t.TempDir(), "docker-init")
+	err := os.WriteFile(initPath, []byte("#!/bin/sh\n"), 0o755)
+	assert.NilError(t, err)
+
+	initEnabled := true
+	initDisabled := false
+	workloadArgs := []string{"/usr/local/bin/workload", "--entrypoint-option", "cmd-arg-1", "cmd-arg-2"}
+	wrappedArgs := append([]string{inContainerInitPath, "--"}, workloadArgs...)
+
+	tests := []struct {
+		name          string
+		containerInit *bool
+		daemonInit    bool
+		pidMode       containertypes.PidMode
+		wantArgs      []string
+		wantInitMount bool
+	}{
+		{
+			name:          "container init enabled",
+			containerInit: &initEnabled,
+			wantArgs:      wrappedArgs,
+			wantInitMount: true,
+		},
+		{
+			name:          "daemon default init enabled",
+			daemonInit:    true,
+			wantArgs:      wrappedArgs,
+			wantInitMount: true,
+		},
+		{
+			name:          "container init explicitly disabled",
+			containerInit: &initDisabled,
+			daemonInit:    true,
+			wantArgs:      workloadArgs,
+		},
+		{
+			name:          "host PID namespace",
+			containerInit: &initEnabled,
+			pidMode:       containertypes.PidMode("host"),
+			wantArgs:      workloadArgs,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &container.Container{
+				BaseFS: t.TempDir(),
+				Path:   workloadArgs[0],
+				Args:   workloadArgs[1:],
+				Config: &containertypes.Config{
+					Entrypoint: workloadArgs[:2],
+					Cmd:        workloadArgs[2:],
+				},
+				HostConfig: &containertypes.HostConfig{
+					Init:    tc.containerInit,
+					PidMode: tc.pidMode,
+				},
+				NetworkSettings: &network.Settings{Networks: make(map[string]*network.EndpointSettings)},
+			}
+			d := &Daemon{linkIndex: newLinkIndex()}
+			daemonCfg := config.Config{Init: tc.daemonInit, InitPath: initPath}
+			s := daemonoci.DefaultSpec()
+
+			err := withCommonOptions(d, &daemonCfg, c)(t.Context(), nil, nil, &s)
+			assert.NilError(t, err)
+			assert.Check(t, is.DeepEqual(s.Process.Args, tc.wantArgs))
+
+			var initMounts []specs.Mount
+			for _, m := range s.Mounts {
+				if m.Destination == inContainerInitPath {
+					initMounts = append(initMounts, m)
+				}
+			}
+			if !tc.wantInitMount {
+				assert.Equal(t, len(initMounts), 0)
+				return
+			}
+			assert.Check(t, is.DeepEqual(initMounts, []specs.Mount{{
+				Destination: inContainerInitPath,
+				Type:        "bind",
+				Source:      initPath,
+				Options:     []string{"bind", "ro"},
+			}}))
+		})
+	}
+}
+
+func TestCreateSpecPreservesCDIAdditionalGIDs(t *testing.T) {
+	cdiDir := t.TempDir()
+	err := os.WriteFile(filepath.Join(cdiDir, "test-device.yaml"), []byte(`
+cdiVersion: "0.7.0"
+kind: "example.com/device"
+devices:
+- name: foo
+  containerEdits:
+    additionalGids:
+    - 1234
+`), 0o644)
+	assert.NilError(t, err)
+
+	origDeviceDrivers := maps.Clone(deviceDrivers)
+	t.Cleanup(func() {
+		deviceDrivers = origDeviceDrivers
+	})
+	RegisterCDIDriver(cdiDir)
+
+	c := &container.Container{
+		Config: &containertypes.Config{},
+		HostConfig: &containertypes.HostConfig{
+			Resources: containertypes.Resources{
+				DeviceRequests: []containertypes.DeviceRequest{
+					{
+						Driver:    "cdi",
+						DeviceIDs: []string{"example.com/device=foo"},
+					},
+				},
+			},
+		},
+	}
+	d := setupFakeDaemon(t, c)
+
+	s, err := d.createSpec(t.Context(), &configStore{}, c, nil)
+	assert.NilError(t, err)
+	assert.Assert(t, slices.Contains(s.Process.User.AdditionalGids, uint32(1234)), "CDI additional GID not present in OCI spec")
+}
+
 // TestTmpfsDevShmNoDupMount checks that a user-specified /dev/shm tmpfs
 // mount (as in "docker run --tmpfs /dev/shm:rw,size=NNN") does not result
 // in "Duplicate mount point" error from the engine.
@@ -93,7 +245,7 @@ func TestTmpfsDevShmNoDupMount(t *testing.T) {
 	}
 	d := setupFakeDaemon(t, c)
 
-	_, err := d.createSpec(context.TODO(), &configStore{}, c, nil)
+	_, err := d.createSpec(t.Context(), &configStore{}, c, nil)
 	assert.Check(t, err)
 }
 
@@ -111,7 +263,7 @@ func TestIpcPrivateVsReadonly(t *testing.T) {
 	}
 	d := setupFakeDaemon(t, c)
 
-	s, err := d.createSpec(context.TODO(), &configStore{}, c, nil)
+	s, err := d.createSpec(t.Context(), &configStore{}, c, nil)
 	assert.Check(t, err)
 
 	// Find the /dev/shm mount in ms, check it does not have ro
@@ -119,7 +271,7 @@ func TestIpcPrivateVsReadonly(t *testing.T) {
 		if m.Destination != "/dev/shm" {
 			continue
 		}
-		assert.Check(t, is.Equal(false, inSlice(m.Options, "ro")))
+		assert.Check(t, is.Equal(false, slices.Contains(m.Options, "ro")))
 	}
 }
 
@@ -127,6 +279,7 @@ func TestIpcPrivateVsReadonly(t *testing.T) {
 // Config.Domainname) are overridden by an explicit sysctl in the HostConfig.
 func TestSysctlOverride(t *testing.T) {
 	skip.If(t, os.Getuid() != 0, "skipping test that requires root")
+	ctx := t.Context()
 	c := &container.Container{
 		Config: &containertypes.Config{
 			Hostname:   "foobar",
@@ -140,7 +293,7 @@ func TestSysctlOverride(t *testing.T) {
 	d := setupFakeDaemon(t, c)
 
 	// Ensure that the implicit sysctl is set correctly.
-	s, err := d.createSpec(context.TODO(), &configStore{}, c, nil)
+	s, err := d.createSpec(ctx, &configStore{}, c, nil)
 	assert.NilError(t, err)
 	assert.Equal(t, s.Hostname, "foobar")
 	assert.Equal(t, s.Linux.Sysctl["kernel.domainname"], c.Config.Domainname)
@@ -156,14 +309,14 @@ func TestSysctlOverride(t *testing.T) {
 	assert.Assert(t, c.HostConfig.Sysctls["kernel.domainname"] != c.Config.Domainname)
 	c.HostConfig.Sysctls["net.ipv4.ip_unprivileged_port_start"] = "1024"
 
-	s, err = d.createSpec(context.TODO(), &configStore{}, c, nil)
+	s, err = d.createSpec(ctx, &configStore{}, c, nil)
 	assert.NilError(t, err)
 	assert.Equal(t, s.Hostname, "foobar")
 	assert.Equal(t, s.Linux.Sysctl["kernel.domainname"], c.HostConfig.Sysctls["kernel.domainname"])
 	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ip_unprivileged_port_start"], c.HostConfig.Sysctls["net.ipv4.ip_unprivileged_port_start"])
 
 	// Ensure the ping_group_range is not set on a daemon with user-namespaces enabled
-	s, err = d.createSpec(context.TODO(), &configStore{Config: config.Config{RemappedRoot: "dummy:dummy"}}, c, nil)
+	s, err = d.createSpec(ctx, &configStore{Config: config.Config{RemappedRoot: "dummy:dummy"}}, c, nil)
 	assert.NilError(t, err)
 	_, ok := s.Linux.Sysctl["net.ipv4.ping_group_range"]
 	assert.Assert(t, !ok)
@@ -171,7 +324,7 @@ func TestSysctlOverride(t *testing.T) {
 	// Ensure the ping_group_range is set on a container in "host" userns mode
 	// on a daemon with user-namespaces enabled
 	c.HostConfig.UsernsMode = "host"
-	s, err = d.createSpec(context.TODO(), &configStore{Config: config.Config{RemappedRoot: "dummy:dummy"}}, c, nil)
+	s, err = d.createSpec(ctx, &configStore{Config: config.Config{RemappedRoot: "dummy:dummy"}}, c, nil)
 	assert.NilError(t, err)
 	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ping_group_range"], "0 2147483647")
 }
@@ -180,6 +333,7 @@ func TestSysctlOverride(t *testing.T) {
 // with host networking
 func TestSysctlOverrideHost(t *testing.T) {
 	skip.If(t, os.Getuid() != 0, "skipping test that requires root")
+	ctx := t.Context()
 	c := &container.Container{
 		Config: &containertypes.Config{},
 		HostConfig: &containertypes.HostConfig{
@@ -190,7 +344,7 @@ func TestSysctlOverrideHost(t *testing.T) {
 	d := setupFakeDaemon(t, c)
 
 	// Ensure that the implicit sysctl is not set
-	s, err := d.createSpec(context.TODO(), &configStore{}, c, nil)
+	s, err := d.createSpec(ctx, &configStore{}, c, nil)
 	assert.NilError(t, err)
 	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ip_unprivileged_port_start"], "")
 	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ping_group_range"], "")
@@ -198,7 +352,7 @@ func TestSysctlOverrideHost(t *testing.T) {
 	// Set an explicit sysctl.
 	c.HostConfig.Sysctls["net.ipv4.ip_unprivileged_port_start"] = "1024"
 
-	s, err = d.createSpec(context.TODO(), &configStore{}, c, nil)
+	s, err = d.createSpec(ctx, &configStore{}, c, nil)
 	assert.NilError(t, err)
 	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ip_unprivileged_port_start"], c.HostConfig.Sysctls["net.ipv4.ip_unprivileged_port_start"])
 }

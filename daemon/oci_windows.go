@@ -1,4 +1,4 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
@@ -6,22 +6,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/Microsoft/hcsshim"
-	coci "github.com/containerd/containerd/oci"
+	coci "github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/log"
-	"github.com/docker/docker/api/types/backend"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/image"
-	"github.com/docker/docker/oci"
-	"github.com/docker/docker/pkg/sysinfo"
-	"github.com/docker/docker/pkg/system"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/image"
+	"github.com/moby/moby/v2/daemon/pkg/oci"
+	"github.com/moby/moby/v2/daemon/server/imagebackend"
+	"github.com/moby/moby/v2/errdefs"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -93,7 +93,7 @@ func (daemon *Daemon) isHyperV(c *container.Container) bool {
 }
 
 func (daemon *Daemon) createSpec(ctx context.Context, daemonCfg *configStore, c *container.Container, mounts []container.Mount) (*specs.Spec, error) {
-	img, err := daemon.imageService.GetImage(ctx, string(c.ImageID), backend.GetImageOpts{})
+	img, err := daemon.imageService.GetImage(ctx, string(c.ImageID), imagebackend.GetImageOpts{})
 	if err != nil {
 		return nil, err
 	}
@@ -167,7 +167,7 @@ func (daemon *Daemon) createSpec(ctx context.Context, daemonCfg *configStore, c 
 			}
 
 			if data["GW_INFO"] != nil {
-				gwInfo := data["GW_INFO"].(map[string]interface{})
+				gwInfo := data["GW_INFO"].(map[string]any)
 				if gwInfo["hnsid"] != nil {
 					gwHNSID = gwInfo["hnsid"].(string)
 				}
@@ -240,7 +240,7 @@ func (daemon *Daemon) createSpecWindowsFields(c *container.Container, s *specs.S
 	if c.Config.ArgsEscaped {
 		s.Process.CommandLine = c.Path
 		if len(c.Args) > 0 {
-			s.Process.CommandLine += " " + system.EscapeArgs(c.Args)
+			s.Process.CommandLine += " " + escapeArgs(c.Args)
 		}
 	} else {
 		s.Process.Args = append([]string{c.Path}, c.Args...)
@@ -292,6 +292,15 @@ func (daemon *Daemon) createSpecWindowsFields(c *container.Container, s *specs.S
 	s.Windows.Devices = append(s.Windows.Devices, devices...)
 
 	return nil
+}
+
+// escapeArgs makes a Windows-style escaped command line from a set of arguments
+func escapeArgs(args []string) string {
+	escapedArgs := make([]string, len(args))
+	for i, a := range args {
+		escapedArgs[i] = windows.EscapeArg(a)
+	}
+	return strings.Join(escapedArgs, " ")
 }
 
 // getBackingDeviceForContainerdMount extracts the backing device or directory mounted at mountPoint
@@ -421,18 +430,14 @@ func setResourcesInSpec(c *container.Container, s *specs.Spec, isHyperV bool) {
 			leftoverNanoCPUs := c.HostConfig.NanoCPUs % 1e9
 			if leftoverNanoCPUs != 0 {
 				cpuCount++
-				cpuMaximum = uint16(c.HostConfig.NanoCPUs / int64(cpuCount) / (1e9 / 10000))
-				if cpuMaximum < 1 {
+				cpuMaximum = max(uint16(c.HostConfig.NanoCPUs/int64(cpuCount)/(1e9/10000)),
 					// The requested NanoCPUs is so small that we rounded to 0, use 1 instead
-					cpuMaximum = 1
-				}
+					1)
 			}
 		} else {
-			cpuMaximum = uint16(c.HostConfig.NanoCPUs / int64(sysinfo.NumCPU()) / (1e9 / 10000))
-			if cpuMaximum < 1 {
+			cpuMaximum = max(uint16(c.HostConfig.NanoCPUs/int64(runtime.NumCPU())/(1e9/10000)),
 				// The requested NanoCPUs is so small that we rounded to 0, use 1 instead
-				cpuMaximum = 1
-			}
+				1)
 		}
 	}
 
@@ -478,7 +483,7 @@ func (daemon *Daemon) mergeUlimits(c *containertypes.HostConfig, daemonCfg *conf
 // listing only the methods we care about here.
 // It's mainly useful to easily allow mocking the registry in tests.
 type registryKey interface {
-	GetStringValue(name string) (val string, valtype uint32, err error)
+	GetStringValue(name string) (val string, valType uint32, err error)
 	Close() error
 }
 
@@ -526,11 +531,12 @@ func readCredentialSpecFile(id, root, location string) (string, error) {
 	return string(bcontents[:]), nil
 }
 
-func setupWindowsDevices(devices []containertypes.DeviceMapping) (specDevices []specs.WindowsDevice, err error) {
+func setupWindowsDevices(devices []containertypes.DeviceMapping) ([]specs.WindowsDevice, error) {
+	var specDevices []specs.WindowsDevice
 	for _, deviceMapping := range devices {
-		if strings.HasPrefix(deviceMapping.PathOnHost, "class/") {
+		if after, ok := strings.CutPrefix(deviceMapping.PathOnHost, "class/"); ok {
 			specDevices = append(specDevices, specs.WindowsDevice{
-				ID:     strings.TrimPrefix(deviceMapping.PathOnHost, "class/"),
+				ID:     after,
 				IDType: "class",
 			})
 		} else {
@@ -549,4 +555,9 @@ func setupWindowsDevices(devices []containertypes.DeviceMapping) (specDevices []
 	}
 
 	return specDevices, nil
+}
+
+// getUser is a no-op on Windows.
+func getUser(c *container.Container, username string) (specs.User, error) {
+	return specs.User{}, nil
 }

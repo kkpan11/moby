@@ -1,11 +1,11 @@
-package container // import "github.com/docker/docker/integration/container"
+package container
 
 import (
 	"net/http"
 	"testing"
 
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/request"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -25,7 +25,6 @@ func TestContainerInvalidJSON(t *testing.T) {
 	}
 
 	for _, ep := range endpoints {
-		ep := ep
 		t.Run(ep[1:], func(t *testing.T) {
 			t.Parallel()
 

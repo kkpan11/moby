@@ -7,10 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/cli/build"
-	"github.com/docker/docker/pkg/stringid"
+	"github.com/moby/moby/client/pkg/stringid"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli/build"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
 	"gotest.tools/v3/skip"
 )
@@ -19,12 +20,12 @@ type DockerCLIRmiSuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerCLIRmiSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIRmiSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIRmiSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIRmiSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 func (s *DockerCLIRmiSuite) TestRmiWithContainerFails(c *testing.T) {
@@ -43,10 +44,13 @@ func (s *DockerCLIRmiSuite) TestRmiWithContainerFails(c *testing.T) {
 	// make sure it didn't delete the busybox name
 	images := cli.DockerCmd(c, "images").Stdout()
 	// The name 'busybox' should not have been removed from images
-	assert.Assert(c, strings.Contains(images, "busybox"))
+	assert.Assert(c, is.Contains(images, "busybox"))
 }
 
 func (s *DockerCLIRmiSuite) TestRmiTag(c *testing.T) {
+	images := cli.DockerCmd(c, "images").Stdout()
+	assert.Assert(c, is.Contains(images, "busybox"))
+
 	imagesBefore := cli.DockerCmd(c, "images", "-a").Stdout()
 	cli.DockerCmd(c, "tag", "busybox", "utest:tag1")
 	cli.DockerCmd(c, "tag", "busybox", "utest/docker:tag2")
@@ -150,10 +154,10 @@ func (s *DockerCLIRmiSuite) TestRmiImgIDForce(c *testing.T) {
 	}
 }
 
-// See https://github.com/docker/docker/issues/14116
+// See https://github.com/moby/moby/issues/14116
 func (s *DockerCLIRmiSuite) TestRmiImageIDForceWithRunningContainersAndMultipleTags(c *testing.T) {
 	dockerfile := "FROM busybox\nRUN echo test 14116\n"
-	buildImageSuccessfully(c, "test-14116", build.WithDockerfile(dockerfile))
+	cli.BuildCmd(c, "test-14116", build.WithDockerfile(dockerfile))
 	imgID := getIDByName(c, "test-14116")
 
 	newTag := "newtag"
@@ -163,7 +167,7 @@ func (s *DockerCLIRmiSuite) TestRmiImageIDForceWithRunningContainersAndMultipleT
 	out, _, err := dockerCmdWithError("rmi", "-f", imgID)
 	// rmi -f should not delete image with running containers
 	assert.ErrorContains(c, err, "")
-	assert.Assert(c, strings.Contains(out, "(cannot be forced) - image is being used by running container"))
+	assert.Assert(c, is.Contains(out, "(cannot be forced) - image is being used by running container"))
 }
 
 func (s *DockerCLIRmiSuite) TestRmiTagWithExistingContainers(c *testing.T) {
@@ -203,7 +207,7 @@ func (s *DockerCLIRmiSuite) TestRmiWithMultipleRepositories(c *testing.T) {
 	cli.DockerCmd(c, "commit", "test", newTag)
 
 	out := cli.DockerCmd(c, "rmi", newTag).Combined()
-	assert.Assert(c, strings.Contains(out, "Untagged: "+newTag))
+	assert.Assert(c, is.Contains(out, "Untagged: "+newTag))
 }
 
 func (s *DockerCLIRmiSuite) TestRmiForceWithMultipleRepositories(c *testing.T) {
@@ -211,12 +215,12 @@ func (s *DockerCLIRmiSuite) TestRmiForceWithMultipleRepositories(c *testing.T) {
 	tag1 := imageName + ":tag1"
 	tag2 := imageName + ":tag2"
 
-	buildImageSuccessfully(c, tag1, build.WithDockerfile(`FROM busybox
+	cli.BuildCmd(c, tag1, build.WithDockerfile(`FROM busybox
 		MAINTAINER "docker"`))
 	cli.DockerCmd(c, "tag", tag1, tag2)
 
 	out := cli.DockerCmd(c, "rmi", "-f", tag2).Combined()
-	assert.Assert(c, strings.Contains(out, "Untagged: "+tag2))
+	assert.Assert(c, is.Contains(out, "Untagged: "+tag2))
 	assert.Assert(c, !strings.Contains(out, "Untagged: "+tag1))
 	// Check built image still exists
 	images := cli.DockerCmd(c, "images", "-a").Stdout()
@@ -239,7 +243,7 @@ func (s *DockerCLIRmiSuite) TestRmiContainerImageNotFound(c *testing.T) {
 	imageIds := make([]string, 2)
 	for i, name := range imageNames {
 		dockerfile := fmt.Sprintf("FROM busybox\nMAINTAINER %s\nRUN echo %s\n", name, name)
-		buildImageSuccessfully(c, name, build.WithoutCache, build.WithDockerfile(dockerfile))
+		cli.BuildCmd(c, name, build.WithoutCache, build.WithDockerfile(dockerfile))
 		id := getIDByName(c, name)
 		imageIds[i] = id
 	}
@@ -260,6 +264,8 @@ func (s *DockerCLIRmiSuite) TestRmiContainerImageNotFound(c *testing.T) {
 
 // #13422
 func (s *DockerCLIRmiSuite) TestRmiUntagHistoryLayer(c *testing.T) {
+	c.Skip("FIXME(thaJeztah): broken because v25.0 uses BuildKit?")
+
 	const imgName = "tmp1"
 	// Build an image for testing.
 	dockerfile := `FROM busybox
@@ -268,21 +274,21 @@ RUN echo 0 #layer0
 RUN echo 1 #layer1
 RUN echo 2 #layer2
 `
-	buildImageSuccessfully(c, imgName, build.WithoutCache, build.WithDockerfile(dockerfile))
+	cli.BuildCmd(c, imgName, build.WithoutCache, build.WithDockerfile(dockerfile))
 	out := cli.DockerCmd(c, "history", "-q", imgName).Stdout()
 	ids := strings.Split(out, "\n")
 	idToTag := ids[2]
 
 	// Tag layer0 to "tmp2".
 	newTag := "tmp2"
-	cli.DockerCmd(c, "tag", idToTag, newTag)
+	cli.DockerCmd(c, "tag", idToTag, newTag) // FIXME(thaJeztah): this fails, because history shows `<missing>` (---> "docker tag <missing> tmp2")
 	// Create a container based on "tmp1".
 	cli.DockerCmd(c, "run", "-d", imgName, "true")
 
 	// See if the "tmp2" can be untagged.
 	out = cli.DockerCmd(c, "rmi", newTag).Combined()
 	// Expected 1 untagged entry
-	assert.Equal(c, strings.Count(out, "Untagged: "), 1, fmt.Sprintf("out: %s", out))
+	assert.Equal(c, strings.Count(out, "Untagged: "), 1, "out: "+out)
 
 	// Now let's add the tag again and create a container based on it.
 	cli.DockerCmd(c, "tag", idToTag, newTag)
@@ -294,18 +300,19 @@ RUN echo 2 #layer2
 	out, _, err := dockerCmdWithError("rmi", newTag)
 	// should not be untagged without the -f flag
 	assert.ErrorContains(c, err, "")
-	assert.Assert(c, strings.Contains(out, cID[:12]))
+	assert.Assert(c, is.Contains(out, cID[:12]))
 	assert.Assert(c, strings.Contains(out, "(must force)") || strings.Contains(out, "(must be forced)"))
 	// Add the -f flag and test again.
 	out = cli.DockerCmd(c, "rmi", "-f", newTag).Combined()
 	// should be allowed to untag with the -f flag
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf("Untagged: %s:latest", newTag)))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf("Untagged: %s:latest", newTag)))
 }
 
 func (*DockerCLIRmiSuite) TestRmiParentImageFail(c *testing.T) {
 	skip.If(c, testEnv.UsingSnapshotter(), "image are independent when using the containerd image store")
+	c.Skip("FIXME(thaJeztah): test is broken with CLI v25.0: perhaps using buildkit now?")
 
-	buildImageSuccessfully(c, "test", build.WithDockerfile(`
+	cli.BuildCmd(c, "test", build.WithDockerfile(`
 	FROM busybox
 	RUN echo hello`))
 

@@ -1,20 +1,19 @@
-package container // import "github.com/docker/docker/daemon/cluster/executor/container"
+package container
 
 import (
 	"context"
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	executorpkg "github.com/docker/docker/daemon/cluster/executor"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/libnetwork"
-	"github.com/docker/go-connections/nat"
+	cerrdefs "github.com/containerd/errdefs"
 	gogotypes "github.com/gogo/protobuf/types"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/network"
+	executorpkg "github.com/moby/moby/v2/daemon/cluster/executor"
+	"github.com/moby/moby/v2/daemon/libnetwork"
 	"github.com/moby/swarmkit/v2/agent/exec"
 	"github.com/moby/swarmkit/v2/api"
 	"github.com/moby/swarmkit/v2/log"
@@ -66,7 +65,7 @@ func (r *controller) Task() (*api.Task, error) {
 func (r *controller) ContainerStatus(ctx context.Context) (*api.ContainerStatus, error) {
 	ctnr, err := r.adapter.inspect(ctx)
 	if err != nil {
-		if errdefs.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -77,7 +76,7 @@ func (r *controller) ContainerStatus(ctx context.Context) (*api.ContainerStatus,
 func (r *controller) PortStatus(ctx context.Context) (*api.PortStatus, error) {
 	ctnr, err := r.adapter.inspect(ctx)
 	if err != nil {
-		if errdefs.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil, nil
 		}
 
@@ -175,11 +174,22 @@ func (r *controller) Prepare(ctx context.Context) error {
 				// If you don't want this behavior, lock down your image to an
 				// immutable tag or digest.
 				log.G(ctx).WithError(r.pullErr).Error("pulling image failed")
+
+				// If the image is not available locally, the pull error is the
+				// actual cause, so return it instead of the misleading
+				// "No such image" error that would otherwise result from the
+				// container create below. If the image _is_ available, keep
+				// going: a task whose image is already on the node must not be
+				// failed just because the registry could not be reached, for
+				// example when the task carries no registry credentials.
+				if !r.adapter.imageExists(ctx) {
+					return r.pullErr
+				}
 			}
 		}
 	}
 	if err := r.adapter.create(ctx); err != nil {
-		if errdefs.IsConflict(err) {
+		if cerrdefs.IsConflict(err) {
 			if _, err := r.adapter.inspect(ctx); err != nil {
 				return err
 			}
@@ -210,7 +220,7 @@ func (r *controller) Start(ctx context.Context) error {
 	//
 	// TODO(stevvooe): This is very racy. While reading inspect, another could
 	// start the process and we could end up starting it twice.
-	if ctnr.State.Status != "created" {
+	if ctnr.State.Status != container.StateCreated {
 		return exec.ErrTaskStarted
 	}
 
@@ -256,11 +266,10 @@ func (r *controller) Start(ctx context.Context) error {
 
 			switch event.Action {
 			case events.ActionDie: // exit on terminal events
-				ctnr, err := r.adapter.inspect(ctx)
-				if err != nil {
+				if ctr, err := r.adapter.inspect(ctx); err != nil {
 					return errors.Wrap(err, "die event received")
-				} else if ctnr.State.ExitCode != 0 {
-					return &exitError{code: ctnr.State.ExitCode, cause: healthErr}
+				} else if ctr.State.ExitCode != 0 {
+					return &exitError{code: ctr.State.ExitCode, cause: healthErr}
 				}
 
 				return nil
@@ -281,6 +290,8 @@ func (r *controller) Start(ctx context.Context) error {
 					return err
 				}
 				return nil
+			default:
+				// TODO(thaJeztah): make switch exhaustive
 			}
 		case <-ctx.Done():
 			return ctx.Err()
@@ -303,7 +314,7 @@ func (r *controller) Wait(pctx context.Context) error {
 	go func() {
 		ectx, cancel := context.WithCancel(ctx) // cancel event context on first event
 		defer cancel()
-		if err := r.checkHealth(ectx); err == ErrContainerUnhealthy {
+		if err := r.checkHealth(ectx); errors.Is(err, ErrContainerUnhealthy) {
 			healthErr <- ErrContainerUnhealthy
 			if err := r.Shutdown(ectx); err != nil {
 				log.G(ectx).WithError(err).Debug("shutdown failed on unhealthy")
@@ -380,7 +391,7 @@ func (r *controller) Shutdown(ctx context.Context) error {
 	}
 
 	if err := r.adapter.shutdown(ctx); err != nil {
-		if !(errdefs.IsNotFound(err) || errdefs.IsNotModified(err)) {
+		if !cerrdefs.IsNotFound(err) && !cerrdefs.IsNotModified(err) {
 			return err
 		}
 	}
@@ -388,7 +399,7 @@ func (r *controller) Shutdown(ctx context.Context) error {
 	// Try removing networks referenced in this task in case this
 	// task is the last one referencing it
 	if err := r.adapter.removeNetworks(ctx); err != nil {
-		if !errdefs.IsNotFound(err) {
+		if !cerrdefs.IsNotFound(err) {
 			return err
 		}
 	}
@@ -407,7 +418,7 @@ func (r *controller) Terminate(ctx context.Context) error {
 	}
 
 	if err := r.adapter.terminate(ctx); err != nil {
-		if errdefs.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 
@@ -429,7 +440,7 @@ func (r *controller) Remove(ctx context.Context) error {
 
 	// It may be necessary to shut down the task before removing it.
 	if err := r.Shutdown(ctx); err != nil {
-		if errdefs.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 		// This may fail if the task was already shut down.
@@ -437,7 +448,7 @@ func (r *controller) Remove(ctx context.Context) error {
 	}
 
 	if err := r.adapter.remove(ctx); err != nil {
-		if errdefs.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 
@@ -460,13 +471,15 @@ func (r *controller) waitReady(pctx context.Context) error {
 
 	ctnr, err := r.adapter.inspect(ctx)
 	if err != nil {
-		if !errdefs.IsNotFound(err) {
+		if !cerrdefs.IsNotFound(err) {
 			return errors.Wrap(err, "inspect container failed")
 		}
 	} else {
 		switch ctnr.State.Status {
-		case "running", "exited", "dead":
+		case container.StateRunning, container.StateExited, container.StateDead:
 			return nil
+		case container.StateCreated, container.StatePaused, container.StateRestarting, container.StateRemoving:
+			// not yet ready
 		}
 	}
 
@@ -480,6 +493,8 @@ func (r *controller) waitReady(pctx context.Context) error {
 			switch event.Action {
 			case "start":
 				return nil
+			default:
+				// TODO(thaJeztah): make switch exhaustive
 			}
 		case <-ctx.Done():
 			return ctx.Err()
@@ -550,9 +565,10 @@ func (r *controller) Logs(ctx context.Context, publisher exec.LogPublisher, opti
 			return errors.Wrap(err, "failed to convert timestamp")
 		}
 		var stream api.LogStream
-		if msg.Source == "stdout" {
+		switch msg.Source {
+		case "stdout":
 			stream = api.LogStreamStdout
-		} else if msg.Source == "stderr" {
+		case "stderr":
 			stream = api.LogStreamStderr
 		}
 
@@ -634,30 +650,20 @@ func parsePortStatus(ctnr container.InspectResponse) (*api.PortStatus, error) {
 	return status, nil
 }
 
-func parsePortMap(portMap nat.PortMap) ([]*api.PortConfig, error) {
+func parsePortMap(portMap network.PortMap) ([]*api.PortConfig, error) {
 	exposedPorts := make([]*api.PortConfig, 0, len(portMap))
 
-	for portProtocol, mapping := range portMap {
-		p, proto, ok := strings.Cut(string(portProtocol), "/")
-		if !ok {
-			return nil, fmt.Errorf("invalid port mapping: %s", portProtocol)
-		}
-
-		port, err := strconv.ParseUint(p, 10, 16)
-		if err != nil {
-			return nil, err
-		}
-
+	for port, mapping := range portMap {
 		var protocol api.PortConfig_Protocol
-		switch strings.ToLower(proto) {
-		case "tcp":
+		switch port.Proto() {
+		case network.TCP:
 			protocol = api.ProtocolTCP
-		case "udp":
+		case network.UDP:
 			protocol = api.ProtocolUDP
-		case "sctp":
+		case network.SCTP:
 			protocol = api.ProtocolSCTP
 		default:
-			return nil, fmt.Errorf("invalid protocol: %s", proto)
+			return nil, fmt.Errorf("invalid protocol: %s", port.Proto())
 		}
 
 		for _, binding := range mapping {
@@ -671,7 +677,7 @@ func parsePortMap(portMap nat.PortMap) ([]*api.PortConfig, error) {
 			exposedPorts = append(exposedPorts, &api.PortConfig{
 				PublishMode:   api.PublishModeHost,
 				Protocol:      protocol,
-				TargetPort:    uint32(port),
+				TargetPort:    uint32(port.Num()),
 				PublishedPort: uint32(hostPort),
 			})
 		}
@@ -701,6 +707,10 @@ func (e *exitError) Cause() error {
 	return e.cause
 }
 
+func (e *exitError) Unwrap() error {
+	return e.cause
+}
+
 // checkHealth blocks until unhealthy container is detected or ctx exits
 func (r *controller) checkHealth(ctx context.Context) error {
 	eventq := r.adapter.events(ctx)
@@ -715,9 +725,7 @@ func (r *controller) checkHealth(ctx context.Context) error {
 			if !r.matchevent(event) {
 				continue
 			}
-
-			switch event.Action {
-			case events.ActionHealthStatusUnhealthy:
+			if event.Action == events.ActionHealthStatusUnhealthy {
 				return ErrContainerUnhealthy
 			}
 		}

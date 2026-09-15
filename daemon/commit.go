@@ -1,18 +1,20 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"fmt"
+	"maps"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/distribution/reference"
-	"github.com/docker/docker/api/types/backend"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/builder/dockerfile"
-	"github.com/docker/docker/errdefs"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon/builder/dockerfile"
+	"github.com/moby/moby/v2/daemon/internal/metrics"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/errdefs"
 	"github.com/pkg/errors"
 )
 
@@ -108,9 +110,7 @@ func merge(userConf, imageConf *containertypes.Config) error {
 	if len(userConf.Volumes) == 0 {
 		userConf.Volumes = imageConf.Volumes
 	} else {
-		for k, v := range imageConf.Volumes {
-			userConf.Volumes[k] = v
-		}
+		maps.Copy(userConf.Volumes, imageConf.Volumes)
 	}
 
 	if userConf.StopSignal == "" {
@@ -131,27 +131,29 @@ func (daemon *Daemon) CreateImageFromContainer(ctx context.Context, name string,
 	}
 
 	// It is not possible to commit a running container on Windows
-	if isWindows && container.IsRunning() {
+	if isWindows && container.State.IsRunning() {
 		return "", errors.Errorf("%+v does not support commit of a running container", runtime.GOOS)
 	}
 
-	if container.IsDead() {
+	if container.State.IsDead() {
 		return "", errdefs.Conflict(fmt.Errorf("You cannot commit container %s which is Dead", container.ID))
 	}
 
-	if container.IsRemovalInProgress() {
+	if container.State.IsRemovalInProgress() {
 		return "", errdefs.Conflict(fmt.Errorf("You cannot commit container %s which is being removed", container.ID))
 	}
 
-	if c.Pause && !container.IsPaused() {
-		daemon.containerPause(container)
-		defer daemon.containerUnpause(container)
+	if !c.NoPause && !container.State.IsPaused() {
+		_ = daemon.containerPause(container)
+		defer func() {
+			_ = daemon.containerUnpause(container)
+		}()
 	}
 
 	if c.Config == nil {
 		c.Config = container.Config
 	}
-	newConfig, err := dockerfile.BuildFromConfig(ctx, c.Config, c.Changes, container.OS)
+	newConfig, err := dockerfile.BuildFromConfig(ctx, c.Config, c.Changes, container.ImagePlatform.OS)
 	if err != nil {
 		return "", err
 	}
@@ -166,7 +168,7 @@ func (daemon *Daemon) CreateImageFromContainer(ctx context.Context, name string,
 		ContainerConfig:     container.Config,
 		ContainerID:         container.ID,
 		ContainerMountLabel: container.MountLabel,
-		ContainerOS:         container.OS,
+		ContainerOS:         container.ImagePlatform.OS,
 		ParentImageID:       string(container.ImageID),
 	})
 	if err != nil {
@@ -186,6 +188,6 @@ func (daemon *Daemon) CreateImageFromContainer(ctx context.Context, name string,
 		"imageID":  id.String(),
 		"imageRef": imageRef,
 	})
-	containerActions.WithValues("commit").UpdateSince(start)
+	metrics.ContainerActions.WithValues("commit").UpdateSince(start)
 	return id.String(), nil
 }

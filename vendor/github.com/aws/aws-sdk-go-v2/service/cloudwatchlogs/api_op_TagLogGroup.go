@@ -4,27 +4,29 @@ package cloudwatchlogs
 
 import (
 	"context"
-	"fmt"
-	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/smithy-go/middleware"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // The TagLogGroup operation is on the path to deprecation. We recommend that you
-// use TagResource (https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_TagResource.html)
-// instead. Adds or updates the specified tags for the specified log group. To list
-// the tags for a log group, use ListTagsForResource (https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_ListTagsForResource.html)
-// . To remove tags, use UntagResource (https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_UntagResource.html)
-// . For more information about tags, see Tag Log Groups in Amazon CloudWatch Logs (https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Working-with-log-groups-and-streams.html#log-group-tagging)
-// in the Amazon CloudWatch Logs User Guide. CloudWatch Logs doesn’t support IAM
-// policies that prevent users from assigning specified tags to log groups using
-// the aws:Resource/key-name  or aws:TagKeys condition keys. For more information
-// about using tags to control access, see Controlling access to Amazon Web
-// Services resources using tags (https://docs.aws.amazon.com/IAM/latest/UserGuide/access_tags.html)
-// .
+// use [TagResource]instead.
+//
+// Adds or updates the specified tags for the specified log group.
+//
+// To list the tags for a log group, use [ListTagsForResource]. To remove tags, use [UntagResource].
+//
+// For more information about tags, see [Tag Log Groups in Amazon CloudWatch Logs] in the Amazon CloudWatch Logs User Guide.
+//
+// CloudWatch Logs doesn't support IAM policies that prevent users from assigning
+// specified tags to log groups using the aws:Resource/key-name  or aws:TagKeys
+// condition keys. For more information about using tags to control access, see [Controlling access to Amazon Web Services resources using tags].
 //
 // Deprecated: Please use the generic tagging API TagResource
+//
+// [TagResource]: https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_TagResource.html
+// [UntagResource]: https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_UntagResource.html
+// [Tag Log Groups in Amazon CloudWatch Logs]: https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Working-with-log-groups-and-streams.html#log-group-tagging
+// [Controlling access to Amazon Web Services resources using tags]: https://docs.aws.amazon.com/IAM/latest/UserGuide/access_tags.html
+// [ListTagsForResource]: https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_ListTagsForResource.html
 func (c *Client) TagLogGroup(ctx context.Context, params *TagLogGroupInput, optFns ...func(*Options)) (*TagLogGroupOutput, error) {
 	if params == nil {
 		params = &TagLogGroupInput{}
@@ -63,9 +65,6 @@ type TagLogGroupOutput struct {
 }
 
 func (c *Client) addOperationTagLogGroupMiddlewares(stack *middleware.Stack, options Options) (err error) {
-	if err := stack.Serialize.Add(&setOperationInputMiddleware{}, middleware.After); err != nil {
-		return err
-	}
 	err = stack.Serialize.Add(&awsAwsjson11_serializeOpTagLogGroup{}, middleware.After)
 	if err != nil {
 		return err
@@ -74,56 +73,23 @@ func (c *Client) addOperationTagLogGroupMiddlewares(stack *middleware.Stack, opt
 	if err != nil {
 		return err
 	}
-	if err := addProtocolFinalizerMiddlewares(stack, options, "TagLogGroup"); err != nil {
-		return fmt.Errorf("add protocol finalizers: %v", err)
-	}
 
-	if err = addlegacyEndpointContextSetter(stack, options); err != nil {
-		return err
-	}
-	if err = addSetLoggerMiddleware(stack, options); err != nil {
-		return err
-	}
-	if err = awsmiddleware.AddClientRequestIDMiddleware(stack); err != nil {
-		return err
-	}
-	if err = smithyhttp.AddComputeContentLengthMiddleware(stack); err != nil {
+	if err = addComputeContentLength(stack); err != nil {
 		return err
 	}
 	if err = addResolveEndpointMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = v4.AddComputePayloadSHA256Middleware(stack); err != nil {
+	if err = addComputePayloadSHA256(stack); err != nil {
 		return err
 	}
-	if err = addRetryMiddlewares(stack, options); err != nil {
+	if err = addRecordResponseTiming(stack, options); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRawResponseToMetadata(stack); err != nil {
-		return err
-	}
-	if err = awsmiddleware.AddRecordResponseTiming(stack); err != nil {
-		return err
-	}
-	if err = addClientUserAgent(stack, options); err != nil {
-		return err
-	}
-	if err = smithyhttp.AddErrorCloseResponseBodyMiddleware(stack); err != nil {
-		return err
-	}
-	if err = smithyhttp.AddCloseResponseBodyMiddleware(stack); err != nil {
-		return err
-	}
-	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+	if err = addCredentialSource(stack, options); err != nil {
 		return err
 	}
 	if err = addOpTagLogGroupValidationMiddleware(stack); err != nil {
-		return err
-	}
-	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opTagLogGroup(options.Region), middleware.Before); err != nil {
-		return err
-	}
-	if err = awsmiddleware.AddRecursionDetection(stack); err != nil {
 		return err
 	}
 	if err = addRequestIDRetrieverMiddleware(stack); err != nil {
@@ -138,13 +104,8 @@ func (c *Client) addOperationTagLogGroupMiddlewares(stack *middleware.Stack, opt
 	if err = addDisableHTTPSMiddleware(stack, options); err != nil {
 		return err
 	}
-	return nil
-}
-
-func newServiceMetadataMiddleware_opTagLogGroup(region string) *awsmiddleware.RegisterServiceMetadata {
-	return &awsmiddleware.RegisterServiceMetadata{
-		Region:        region,
-		ServiceID:     ServiceID,
-		OperationName: "TagLogGroup",
+	if err = addInterceptors(stack, options); err != nil {
+		return err
 	}
+	return nil
 }

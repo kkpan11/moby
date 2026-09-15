@@ -12,14 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"go.opencensus.io/trace"
-
 	"github.com/Microsoft/hcsshim/internal/cow"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/log"
-	"github.com/Microsoft/hcsshim/internal/oc"
+	"github.com/Microsoft/hcsshim/internal/ot"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 	"github.com/Microsoft/hcsshim/internal/vmcompute"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type Process struct {
@@ -57,16 +56,22 @@ func (process *Process) Pid() int {
 	return process.processID
 }
 
+// MigrationState returns the zero value: HCS processes route stdio over
+// named pipes and don't use a GCS bridge.
+func (process *Process) MigrationState() cow.MigrationState {
+	return cow.MigrationState{}
+}
+
 // SystemID returns the ID of the process's compute system.
 func (process *Process) SystemID() string {
 	return process.system.ID()
 }
 
 func (process *Process) processSignalResult(ctx context.Context, err error) (bool, error) {
-	switch err { //nolint:errorlint
-	case nil:
+	if err == nil {
 		return true, nil
-	case ErrVmcomputeOperationInvalidState, ErrComputeSystemDoesNotExist, ErrElementNotFound:
+	}
+	if errors.Is(err, ErrVmcomputeOperationInvalidState) || errors.Is(err, ErrComputeSystemDoesNotExist) || errors.Is(err, ErrElementNotFound) {
 		if !process.stopped() {
 			// The process should be gone, but we have not received the notification.
 			// After a second, force unblock the process wait to work around a possible
@@ -82,9 +87,8 @@ func (process *Process) processSignalResult(ctx context.Context, err error) (boo
 			}()
 		}
 		return false, nil
-	default:
-		return false, err
 	}
+	return false, nil
 }
 
 // Signal signals the process with `options`.
@@ -212,11 +216,11 @@ func (process *Process) Kill(ctx context.Context) (bool, error) {
 // call multiple times.
 func (process *Process) waitBackground() {
 	operation := "hcs::Process::waitBackground"
-	ctx, span := oc.StartSpan(context.Background(), operation)
+	ctx, span := ot.StartSpan(context.Background(), operation)
 	defer span.End()
-	span.AddAttributes(
-		trace.StringAttribute("cid", process.SystemID()),
-		trace.Int64Attribute("pid", int64(process.processID)))
+	span.SetAttributes(
+		attribute.String("cid", process.SystemID()),
+		attribute.Int64("pid", int64(process.processID)))
 
 	var (
 		err            error
@@ -261,7 +265,7 @@ func (process *Process) waitBackground() {
 		process.waitError = err
 		close(process.waitBlock)
 	})
-	oc.SetSpanStatus(span, err)
+	ot.SetSpanStatus(span, err)
 }
 
 // Wait waits for the process to exit. If the process has already exited returns
@@ -330,12 +334,12 @@ func (process *Process) ExitCode() (int, error) {
 // are the responsibility of the caller to close.
 func (process *Process) StdioLegacy() (_ io.WriteCloser, _ io.ReadCloser, _ io.ReadCloser, err error) {
 	operation := "hcs::Process::StdioLegacy"
-	ctx, span := oc.StartSpan(context.Background(), operation)
+	ctx, span := ot.StartSpan(context.Background(), operation)
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(
-		trace.StringAttribute("cid", process.SystemID()),
-		trace.Int64Attribute("pid", int64(process.processID)))
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(
+		attribute.String("cid", process.SystemID()),
+		attribute.Int64("pid", int64(process.processID)))
 
 	process.handleLock.RLock()
 	defer process.handleLock.RUnlock()
@@ -379,12 +383,12 @@ func (process *Process) Stdio() (stdin io.Writer, stdout, stderr io.Reader) {
 // notified on the read side that there is no more data in stdin.
 func (process *Process) CloseStdin(ctx context.Context) (err error) {
 	operation := "hcs::Process::CloseStdin"
-	ctx, span := trace.StartSpan(ctx, operation)
+	ctx, span := ot.StartSpan(ctx, operation)
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(
-		trace.StringAttribute("cid", process.SystemID()),
-		trace.Int64Attribute("pid", int64(process.processID)))
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(
+		attribute.String("cid", process.SystemID()),
+		attribute.Int64("pid", int64(process.processID)))
 
 	process.handleLock.RLock()
 	defer process.handleLock.RUnlock()
@@ -425,12 +429,12 @@ func (process *Process) CloseStdin(ctx context.Context) (err error) {
 }
 
 func (process *Process) CloseStdout(ctx context.Context) (err error) {
-	ctx, span := oc.StartSpan(ctx, "hcs::Process::CloseStdout") //nolint:ineffassign,staticcheck
+	ctx, span := ot.StartSpan(ctx, "hcs::Process::CloseStdout") //nolint:ineffassign,staticcheck
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(
-		trace.StringAttribute("cid", process.SystemID()),
-		trace.Int64Attribute("pid", int64(process.processID)))
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(
+		attribute.String("cid", process.SystemID()),
+		attribute.Int64("pid", int64(process.processID)))
 
 	process.handleLock.Lock()
 	defer process.handleLock.Unlock()
@@ -449,12 +453,12 @@ func (process *Process) CloseStdout(ctx context.Context) (err error) {
 }
 
 func (process *Process) CloseStderr(ctx context.Context) (err error) {
-	ctx, span := oc.StartSpan(ctx, "hcs::Process::CloseStderr") //nolint:ineffassign,staticcheck
+	ctx, span := ot.StartSpan(ctx, "hcs::Process::CloseStderr") //nolint:ineffassign,staticcheck
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(
-		trace.StringAttribute("cid", process.SystemID()),
-		trace.Int64Attribute("pid", int64(process.processID)))
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(
+		attribute.String("cid", process.SystemID()),
+		attribute.Int64("pid", int64(process.processID)))
 
 	process.handleLock.Lock()
 	defer process.handleLock.Unlock()
@@ -476,12 +480,12 @@ func (process *Process) CloseStderr(ctx context.Context) (err error) {
 // or wait on it.
 func (process *Process) Close() (err error) {
 	operation := "hcs::Process::Close"
-	ctx, span := oc.StartSpan(context.Background(), operation)
+	ctx, span := ot.StartSpan(context.Background(), operation)
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(
-		trace.StringAttribute("cid", process.SystemID()),
-		trace.Int64Attribute("pid", int64(process.processID)))
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(
+		attribute.String("cid", process.SystemID()),
+		attribute.Int64("pid", int64(process.processID)))
 
 	process.handleLock.Lock()
 	defer process.handleLock.Unlock()

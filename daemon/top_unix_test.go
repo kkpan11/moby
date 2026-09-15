@@ -1,6 +1,6 @@
 //go:build !windows
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"testing"
@@ -85,7 +85,6 @@ func TestContainerTopParsePSOutput(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(string(tc.output), func(t *testing.T) {
 			_, err := parsePSOutput(tc.output, tc.pids)
 			if tc.errExpected && err == nil {

@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package runcexecutor
 
@@ -10,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -19,21 +19,22 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/containerd/containerd/mount"
-	containerdoci "github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/mount"
+	containerdoci "github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/continuity/fs"
 	runc "github.com/containerd/go-runc"
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/executor/oci"
 	"github.com/moby/buildkit/executor/resources"
 	resourcestypes "github.com/moby/buildkit/executor/resources/types"
 	gatewayapi "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/identity"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/network"
 	rootlessspecconv "github.com/moby/buildkit/util/rootless/specconv"
 	"github.com/moby/buildkit/util/stack"
+	"github.com/moby/sys/user"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 )
@@ -48,7 +49,7 @@ type Opt struct {
 	DefaultCgroupParent string
 	// ProcessMode
 	ProcessMode     oci.ProcessMode
-	IdentityMapping *idtools.IdentityMapping
+	IdentityMapping *user.IdentityMapping
 	// runc run --no-pivot (unrecommended)
 	NoPivot         bool
 	DNS             *oci.DNSConfig
@@ -57,6 +58,8 @@ type Opt struct {
 	SELinux         bool
 	TracingSocket   string
 	ResourceMonitor *resources.Monitor
+	CDIManager      *cdidevices.Manager
+	ProxyProvider   network.ProxyProvider
 }
 
 var defaultCommandCandidates = []string{"buildkit-runc", "runc"}
@@ -67,8 +70,9 @@ type runcExecutor struct {
 	cgroupParent     string
 	rootless         bool
 	networkProviders map[pb.NetMode]network.Provider
+	proxyProvider    network.ProxyProvider
 	processMode      oci.ProcessMode
-	idmap            *idtools.IdentityMapping
+	idmap            *user.IdentityMapping
 	noPivot          bool
 	dns              *oci.DNSConfig
 	oomScoreAdj      *int
@@ -78,6 +82,7 @@ type runcExecutor struct {
 	selinux          bool
 	tracingSocket    string
 	resmon           *resources.Monitor
+	cdiManager       *cdidevices.Manager
 }
 
 func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Executor, error) {
@@ -134,6 +139,7 @@ func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Ex
 		cgroupParent:     opt.DefaultCgroupParent,
 		rootless:         opt.Rootless,
 		networkProviders: networkProviders,
+		proxyProvider:    opt.ProxyProvider,
 		processMode:      opt.ProcessMode,
 		idmap:            opt.IdentityMapping,
 		noPivot:          opt.NoPivot,
@@ -144,11 +150,19 @@ func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Ex
 		selinux:          opt.SELinux,
 		tracingSocket:    opt.TracingSocket,
 		resmon:           opt.ResourceMonitor,
+		cdiManager:       opt.CDIManager,
 	}
 	return w, nil
 }
 
 func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, mounts []executor.Mount, process executor.ProcessInfo, started chan<- struct{}) (rec resourcestypes.Recorder, err error) {
+	if id == "" {
+		id = identity.NewID()
+	}
+	if err := executor.ValidContainerID(id); err != nil {
+		return nil, err
+	}
+
 	startedOnce := sync.Once{}
 	done := make(chan error, 1)
 	w.mu.Lock()
@@ -172,13 +186,34 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 		bklog.G(ctx).Info("enabling HostNetworking")
 	}
 
-	provider, ok := w.networkProviders[meta.NetMode]
-	if !ok {
-		return nil, errors.Errorf("unknown network mode %s", meta.NetMode)
+	proxyConfig := meta.Proxy
+	var provider network.Provider
+	if proxyConfig == nil {
+		var ok bool
+		provider, ok = w.networkProviders[meta.NetMode]
+		if !ok {
+			return nil, errors.Errorf("unknown network mode %s", meta.NetMode)
+		}
+	} else if w.proxyProvider == nil {
+		return nil, errors.New("proxy network provider is not available")
+	} else {
+		proxyConfig = &network.ProxyConfig{
+			Policy:     proxyConfig.Policy,
+			Capture:    proxyConfig.Capture,
+			EgressMode: meta.NetMode,
+		}
 	}
-	namespace, err := provider.New(ctx, meta.Hostname)
+	var namespace network.Namespace
+	if proxyConfig != nil {
+		namespace, err = w.proxyProvider.NewProxy(ctx, proxyConfig)
+	} else {
+		namespace, err = provider.New(ctx, meta.Hostname, network.NamespaceOptions{})
+	}
 	if err != nil {
 		return nil, err
+	}
+	if proxyNS, ok := namespace.(network.ProxyNamespace); ok {
+		meta.Env = executor.ReplaceEnv(meta.Env, proxyNS.ProxyEnv())
 	}
 	doReleaseNetwork := true
 	defer func() {
@@ -187,15 +222,23 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 		}
 	}()
 
-	resolvConf, err := oci.GetResolvConf(ctx, w.root, w.idmap, w.dns, meta.NetMode)
+	stateDirRoot, err := os.OpenRoot(w.root)
 	if err != nil {
 		return nil, err
 	}
+	defer stateDirRoot.Close()
 
-	hostsFile, clean, err := oci.GetHostsFile(ctx, w.root, meta.ExtraHosts, w.idmap, meta.Hostname)
+	resolvConfName, err := oci.GetResolvConf(ctx, stateDirRoot, w.idmap, w.dns, meta.NetMode)
 	if err != nil {
 		return nil, err
 	}
+	resolvConf := filepath.Join(w.root, resolvConfName)
+
+	hostsName, clean, err := oci.GetHostsFile(ctx, stateDirRoot, meta.ExtraHosts, w.idmap, meta.Hostname)
+	if err != nil {
+		return nil, err
+	}
+	hostsFile := filepath.Join(w.root, hostsName)
 	if clean != nil {
 		defer clean()
 	}
@@ -213,9 +256,6 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 		defer release()
 	}
 
-	if id == "" {
-		id = identity.NewID()
-	}
 	bundle := filepath.Join(w.root, id)
 
 	if err := os.Mkdir(bundle, 0o711); err != nil {
@@ -223,13 +263,13 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 	}
 	defer os.RemoveAll(bundle)
 
-	identity := idtools.Identity{}
+	var rootUID, rootGID int
 	if w.idmap != nil {
-		identity = w.idmap.RootPair()
+		rootUID, rootGID = w.idmap.RootPair()
 	}
 
 	rootFSPath := filepath.Join(bundle, "rootfs")
-	if err := idtools.MkdirAllAndChown(rootFSPath, 0o700, identity); err != nil {
+	if err := user.MkdirAllAndChown(rootFSPath, 0o700, rootUID, rootGID); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	if err := mount.All(rootMount, rootFSPath); err != nil {
@@ -238,6 +278,13 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 	defer mount.Unmount(rootFSPath, 0)
 
 	defer executor.MountStubsCleaner(context.WithoutCancel(ctx), rootFSPath, mounts, meta.RemoveMountStubsRecursive)()
+	if proxyNS, ok := namespace.(network.ProxyNamespace); ok {
+		cleanProxyCA, err := executor.InjectProxyCA(rootFSPath, proxyNS.ProxyCACert())
+		if err != nil {
+			return nil, err
+		}
+		defer cleanProxyCA()
+	}
 
 	uid, gid, sgids, err := oci.GetUser(rootFSPath, meta.User)
 	if err != nil {
@@ -256,18 +303,15 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 		opts = append(opts, containerdoci.WithRootFSReadonly())
 	}
 
-	identity = idtools.Identity{
-		UID: int(uid),
-		GID: int(gid),
-	}
+	rootUID, rootGID = int(uid), int(gid)
 	if w.idmap != nil {
-		identity, err = w.idmap.ToHost(identity)
+		rootUID, rootGID, err = w.idmap.ToHost(rootUID, rootGID)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.cgroupParent, w.processMode, w.idmap, w.apparmorProfile, w.selinux, w.tracingSocket, opts...)
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.cgroupParent, w.processMode, w.idmap, w.apparmorProfile, w.selinux, w.tracingSocket, w.cdiManager, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +327,7 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 		return nil, errors.Wrapf(err, "working dir %s points to invalid target", newp)
 	}
 	if _, err := os.Stat(newp); err != nil {
-		if err := idtools.MkdirAllAndChown(newp, 0o755, identity); err != nil {
+		if err := user.MkdirAllAndChown(newp, 0o755, rootUID, rootGID); err != nil {
 			return nil, errors.Wrapf(err, "failed to create working directory %s", newp)
 		}
 	}
@@ -291,9 +335,24 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 	spec.Process.Terminal = meta.Tty
 	spec.Process.OOMScoreAdj = w.oomScoreAdj
 	if w.rootless {
-		if err := rootlessspecconv.ToRootless(spec); err != nil {
+		var removedMounts []string
+		removedMounts, err = rootlessspecconv.ToRootless(spec)
+		if err != nil {
 			return nil, err
 		}
+		// The runtime no longer sets these mounts up, but a rootful build still gets
+		// their mount points left in the rootfs. Recreate them once the container is
+		// gone: creating them up front would turn a mount point that the image does
+		// not ship into a directory the build can write to. moby/buildkit#6686
+		var stubUID, stubGID int
+		if w.idmap != nil {
+			stubUID, stubGID = w.idmap.RootPair()
+		}
+		defer func() {
+			if err == nil {
+				err = executor.CreateMountStubs(rootFSPath, removedMounts, stubUID, stubGID)
+			}
+		}()
 	}
 
 	if err := json.NewEncoder(f).Encode(spec); err != nil {
@@ -335,7 +394,7 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 	}
 	doReleaseNetwork = false
 
-	err = exitError(ctx, cgroupPath, err)
+	err = exitError(ctx, cgroupPath, err, process.Meta.ValidExitCodes)
 	if err != nil {
 		if rec != nil {
 			rec.Close()
@@ -351,44 +410,48 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 	return rec, rec.CloseAsync(releaseContainer)
 }
 
-func exitError(ctx context.Context, cgroupPath string, err error) error {
-	if err != nil {
-		exitErr := &gatewayapi.ExitError{
-			ExitCode: gatewayapi.UnknownExitStatus,
-			Err:      err,
-		}
+func exitError(ctx context.Context, cgroupPath string, err error, validExitCodes []int) error {
+	exitErr := &gatewayapi.ExitError{ExitCode: uint32(gatewayapi.UnknownExitStatus), Err: err}
+
+	if err == nil {
+		exitErr.ExitCode = 0
+	} else {
 		var runcExitError *runc.ExitError
-		if errors.As(err, &runcExitError) && runcExitError.Status >= 0 {
-			exitErr = &gatewayapi.ExitError{
-				ExitCode: uint32(runcExitError.Status),
-			}
+		if errors.As(err, &runcExitError) {
+			exitErr = &gatewayapi.ExitError{ExitCode: uint32(runcExitError.Status)}
 		}
 
 		detectOOM(ctx, cgroupPath, exitErr)
-
-		trace.SpanFromContext(ctx).AddEvent(
-			"Container exited",
-			trace.WithAttributes(
-				attribute.Int("exit.code", int(exitErr.ExitCode)),
-			),
-		)
-		select {
-		case <-ctx.Done():
-			exitErr.Err = errors.Wrap(context.Cause(ctx), exitErr.Error())
-			return exitErr
-		default:
-			return stack.Enable(exitErr)
-		}
 	}
 
 	trace.SpanFromContext(ctx).AddEvent(
 		"Container exited",
-		trace.WithAttributes(attribute.Int("exit.code", 0)),
+		trace.WithAttributes(attribute.Int("exit.code", int(exitErr.ExitCode))),
 	)
-	return nil
+
+	if validExitCodes == nil {
+		// no exit codes specified, so only 0 is allowed
+		if exitErr.ExitCode == 0 {
+			return nil
+		}
+	} else {
+		// exit code in allowed list, so exit cleanly
+		if slices.Contains(validExitCodes, int(exitErr.ExitCode)) {
+			return nil
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		exitErr.Err = errors.Wrap(context.Cause(ctx), exitErr.Error())
+		return exitErr
+	default:
+		return stack.Enable(exitErr)
+	}
 }
 
 func (w *runcExecutor) Exec(ctx context.Context, id string, process executor.ProcessInfo) (err error) {
+	meta := process.Meta
 	// first verify the container is running, if we get an error assume the container
 	// is in the process of being created and check again every 100ms or until
 	// context is canceled.
@@ -430,11 +493,15 @@ func (w *runcExecutor) Exec(ctx context.Context, id string, process executor.Pro
 		return err
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return errors.Errorf("unexpected data after JSON spec object")
+		return errors.New("unexpected data after JSON spec object")
+	}
+	if meta.Proxy != nil && len(meta.Env) > 0 {
+		meta.Env = executor.ReplaceEnv(meta.Env, network.FilterProxyEnv(spec.Process.Env))
+		process.Meta = meta
 	}
 
-	if process.Meta.User != "" {
-		uid, gid, sgids, err := oci.GetUser(state.Rootfs, process.Meta.User)
+	if meta.User != "" {
+		uid, gid, sgids, err := oci.GetUser(state.Rootfs, meta.User)
 		if err != nil {
 			return err
 		}
@@ -445,18 +512,18 @@ func (w *runcExecutor) Exec(ctx context.Context, id string, process executor.Pro
 		}
 	}
 
-	spec.Process.Terminal = process.Meta.Tty
-	spec.Process.Args = process.Meta.Args
-	if process.Meta.Cwd != "" {
-		spec.Process.Cwd = process.Meta.Cwd
+	spec.Process.Terminal = meta.Tty
+	spec.Process.Args = meta.Args
+	if meta.Cwd != "" {
+		spec.Process.Cwd = meta.Cwd
 	}
 
-	if len(process.Meta.Env) > 0 {
-		spec.Process.Env = process.Meta.Env
+	if len(meta.Env) > 0 {
+		spec.Process.Env = meta.Env
 	}
 
 	err = w.exec(ctx, id, spec.Process, process, nil)
-	return exitError(ctx, "", err)
+	return exitError(ctx, "", err, process.Meta.ValidExitCodes)
 }
 
 type forwardIO struct {
@@ -542,8 +609,8 @@ func (k procKiller) Kill(ctx context.Context) (err error) {
 	// this timeout is generally a no-op, the Kill ctx should already have a
 	// shorter timeout but here as a fail-safe for future refactoring.
 	ctx, cancel := context.WithCancelCause(ctx)
-	ctx, _ = context.WithTimeoutCause(ctx, 10*time.Second, errors.WithStack(context.DeadlineExceeded))
-	defer cancel(errors.WithStack(context.Canceled))
+	ctx, _ = context.WithTimeoutCause(ctx, 10*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 	if k.pidfile == "" {
 		// for `runc run` process we use `runc kill` to terminate the process
@@ -591,7 +658,7 @@ type procHandle struct {
 	ready          chan struct{}
 	ended          chan struct{}
 	shutdown       func(error)
-	// this this only used when the request context is canceled and we need
+	// this only used when the request context is canceled and we need
 	// to kill the in-container process.
 	killer procKiller
 }
@@ -627,28 +694,12 @@ func runcProcessHandle(ctx context.Context, killer procKiller) (*procHandle, con
 			}
 		}
 
-		for {
-			select {
-			case <-ctx.Done():
-				killCtx, timeout := context.WithCancelCause(context.Background())
-				killCtx, _ = context.WithTimeoutCause(killCtx, 7*time.Second, errors.WithStack(context.DeadlineExceeded))
-				if err := p.killer.Kill(killCtx); err != nil {
-					select {
-					case <-killCtx.Done():
-						cancel(errors.WithStack(context.Cause(ctx)))
-						return
-					default:
-					}
-				}
-				timeout(errors.WithStack(context.Canceled))
-				select {
-				case <-time.After(50 * time.Millisecond):
-				case <-p.ended:
-					return
-				}
-			case <-p.ended:
-				return
+		select {
+		case <-ctx.Done():
+			if err := doKillProc(ctx, p); err != nil {
+				cancel(err)
 			}
+		case <-p.ended:
 		}
 	}()
 
@@ -689,8 +740,8 @@ func (p *procHandle) WaitForReady(ctx context.Context) error {
 // callback is non-nil it will be called after receiving the pid.
 func (p *procHandle) WaitForStart(ctx context.Context, startedCh <-chan int, started func()) error {
 	ctx, cancel := context.WithCancelCause(ctx)
-	ctx, _ = context.WithTimeoutCause(ctx, 10*time.Second, errors.WithStack(context.DeadlineExceeded))
-	defer cancel(errors.WithStack(context.Canceled))
+	ctx, _ = context.WithTimeoutCause(ctx, 10*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 	select {
 	case <-ctx.Done():
 		return errors.New("go-runc started message never received")
@@ -742,4 +793,50 @@ func handleSignals(ctx context.Context, runcProcess *procHandle, signals <-chan 
 			}
 		}
 	}
+}
+
+const killWaitDelay = 50 * time.Millisecond
+
+func doKillProc(ctx context.Context, p *procHandle) error {
+	// Attempt to kill the process normally.
+	for {
+		didSucceed := true
+
+		killCtx, timeout := context.WithTimeoutCause(context.WithoutCancel(ctx), 7*time.Second, errors.WithStack(context.DeadlineExceeded))
+		if err := p.killer.Kill(killCtx); err != nil {
+			if contextErr := context.Cause(ctx); contextErr != nil {
+				timeout()
+				return contextErr
+			}
+			didSucceed = false
+		}
+		timeout()
+
+		if didSucceed {
+			// The kill was successful so exit this for loop.
+			break
+		}
+
+		// The kill did not succeed and the context wasn't canceled.
+		// Either wait for the ended signal or try again in 50 milliseconds.
+		select {
+		case <-p.ended:
+			return nil
+		case <-time.After(killWaitDelay):
+		}
+	}
+
+	// Wait for the process to end. Track how long it takes.
+	start := time.Now()
+	select {
+	case <-p.ended:
+		return nil
+	case <-time.After(killWaitDelay):
+		bklog.G(ctx).Warnf("container id %s is taking a long time to exit after kill", p.killer.id)
+	}
+
+	// We have warned about the slow exit. Just wait for it to exit instead of spamming the logs.
+	<-p.ended
+	bklog.G(ctx).Warnf("container id %s took %s to exit", p.killer.id, time.Since(start))
+	return nil
 }

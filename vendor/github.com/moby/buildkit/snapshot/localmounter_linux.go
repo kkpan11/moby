@@ -3,9 +3,10 @@ package snapshot
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/mount"
 	rootlessmountopts "github.com/moby/buildkit/util/rootless/mountopts"
 	"github.com/moby/sys/userns"
 	"github.com/pkg/errors"
@@ -14,6 +15,10 @@ import (
 func (lm *localMounter) Mount() (string, error) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
+
+	if lm.target != "" {
+		return lm.target, nil
+	}
 
 	if lm.mounts == nil && lm.mountable != nil {
 		mounts, release, err := lm.mountable.Mount()
@@ -35,13 +40,7 @@ func (lm *localMounter) Mount() (string, error) {
 	var isFile bool
 	if len(lm.mounts) == 1 && (lm.mounts[0].Type == "bind" || lm.mounts[0].Type == "rbind") {
 		if !lm.forceRemount {
-			ro := false
-			for _, opt := range lm.mounts[0].Options {
-				if opt == "ro" {
-					ro = true
-					break
-				}
-			}
+			ro := slices.Contains(lm.mounts[0].Options, "ro")
 			if !ro {
 				return lm.mounts[0].Source, nil
 			}

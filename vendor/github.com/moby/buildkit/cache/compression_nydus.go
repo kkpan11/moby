@@ -1,5 +1,4 @@
 //go:build nydus
-// +build nydus
 
 package cache
 
@@ -8,8 +7,8 @@ import (
 	"context"
 	"io"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/labels"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/labels"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/compression"
@@ -38,7 +37,7 @@ func MergeNydus(ctx context.Context, ref ImmutableRef, comp compression.Config, 
 	}
 	refs := iref.layerChain()
 	if len(refs) == 0 {
-		return nil, errors.Errorf("refs can't be empty")
+		return nil, errors.New("refs can't be empty")
 	}
 
 	// Extracts nydus bootstrap from nydus format for each layer.

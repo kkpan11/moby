@@ -1,19 +1,22 @@
 //go:build !windows
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
 	statsV1 "github.com/containerd/cgroups/v3/cgroup1/stats"
 	statsV2 "github.com/containerd/cgroups/v3/cgroup2/stats"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
+	cerrdefs "github.com/containerd/errdefs"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/container"
 	"github.com/pkg/errors"
 )
 
@@ -39,15 +42,18 @@ func (daemon *Daemon) stats(c *container.Container) (*containertypes.StatsRespon
 	}
 	cs, err := task.Stats(context.Background())
 	if err != nil {
-		if strings.Contains(err.Error(), "container not found") {
+		if cerrdefs.IsNotFound(err) || strings.Contains(err.Error(), "container not found") {
 			return nil, containerNotFound(c.ID)
 		}
 		return nil, err
 	}
-	s := &containertypes.StatsResponse{}
-	s.Read = cs.Read
-	stats := cs.Metrics
-	switch t := stats.(type) {
+	s := &containertypes.StatsResponse{
+		ID:     c.ID,
+		Name:   c.Name,
+		OSType: runtime.GOOS,
+		Read:   cs.Read,
+	}
+	switch t := cs.Metrics.(type) {
 	case *statsV1.Metrics:
 		return daemon.statsV1(s, t)
 	case *statsV2.Metrics:
@@ -253,20 +259,6 @@ func (daemon *Daemon) statsV2(s *containertypes.StatsResponse, stats *statsV2.Me
 	return s, nil
 }
 
-// Resolve Network SandboxID in case the container reuse another container's network stack
-func (daemon *Daemon) getNetworkSandboxID(c *container.Container) (string, error) {
-	curr := c
-	for curr.HostConfig.NetworkMode.IsContainer() {
-		containerID := curr.HostConfig.NetworkMode.ConnectedContainer()
-		connected, err := daemon.GetContainer(containerID)
-		if err != nil {
-			return "", errors.Wrapf(err, "Could not get container for %s", containerID)
-		}
-		curr = connected
-	}
-	return curr.NetworkSettings.SandboxID, nil
-}
-
 func (daemon *Daemon) getNetworkStats(c *container.Container) (map[string]containertypes.NetworkStats, error) {
 	sandboxID, err := daemon.getNetworkSandboxID(c)
 	if err != nil {
@@ -310,50 +302,56 @@ const (
 	nanoSecondsPerSecond = 1e9
 )
 
-// getSystemCPUUsage returns the host system's cpu usage in
-// nanoseconds and number of online CPUs. An error is returned
-// if the format of the underlying file does not match.
-//
-// Uses /proc/stat defined by POSIX. Looks for the cpu
-// statistics line and then sums up the first seven fields
-// provided. See `man 5 proc` for details on specific field
-// information.
-func getSystemCPUUsage() (cpuUsage uint64, cpuNum uint32, err error) {
+// getSystemCPUUsage reads the system's CPU usage from /proc/stat and returns
+// the total CPU usage in nanoseconds and the number of CPUs.
+func getSystemCPUUsage() (cpuUsage uint64, cpuNum uint32, _ error) {
 	f, err := os.Open("/proc/stat")
 	if err != nil {
 		return 0, 0, err
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if len(line) < 4 || line[:3] != "cpu" {
-			break // Assume all cpu* records are at the front, like glibc https://github.com/bminor/glibc/blob/5d00c201b9a2da768a79ea8d5311f257871c0b43/sysdeps/unix/sysv/linux/getsysstats.c#L108-L135
+	return readSystemCPUUsage(f)
+}
+
+// readSystemCPUUsage parses CPU usage information from a reader providing
+// /proc/stat format data. It returns the total CPU usage in nanoseconds
+// and the number of CPUs.
+func readSystemCPUUsage(r io.Reader) (cpuUsage uint64, cpuNum uint32, _ error) {
+	rdr := bufio.NewReaderSize(r, 1024)
+
+	for {
+		data, isPartial, err := rdr.ReadLine()
+		if err != nil {
+			return 0, 0, fmt.Errorf("error scanning /proc/stat file: %w", err)
+		}
+		// Assume all cpu* records are at the start of the file, like glibc:
+		// https://github.com/bminor/glibc/blob/5d00c201b9a2da768a79ea8d5311f257871c0b43/sysdeps/unix/sysv/linux/getsysstats.c#L108-L135
+		if isPartial || len(data) < 4 {
+			break
+		}
+		line := string(data)
+		if line[:3] != "cpu" {
+			break
 		}
 		if line[3] == ' ' {
 			parts := strings.Fields(line)
 			if len(parts) < 8 {
-				return 0, 0, fmt.Errorf("invalid number of cpu fields")
+				return 0, 0, errors.New("invalid number of cpu fields")
 			}
 			var totalClockTicks uint64
 			for _, i := range parts[1:8] {
 				v, err := strconv.ParseUint(i, 10, 64)
 				if err != nil {
-					return 0, 0, fmt.Errorf("Unable to convert value %s to int: %w", i, err)
+					return 0, 0, fmt.Errorf("unable to convert value %s to int: %w", i, err)
 				}
 				totalClockTicks += v
 			}
-			cpuUsage = (totalClockTicks * nanoSecondsPerSecond) /
-				clockTicksPerSecond
+			cpuUsage = (totalClockTicks * nanoSecondsPerSecond) / clockTicksPerSecond
 		}
 		if '0' <= line[3] && line[3] <= '9' {
 			cpuNum++
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		return 0, 0, fmt.Errorf("error scanning '/proc/stat' file: %w", err)
-	}
-	return
+	return cpuUsage, cpuNum, nil
 }

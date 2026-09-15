@@ -4,12 +4,12 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/containerd/platforms"
 	"github.com/docker/go-units"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/cpuset"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/go-csvvalue"
@@ -17,7 +17,7 @@ import (
 
 func parsePlatforms(v string) ([]ocispecs.Platform, error) {
 	var pp []ocispecs.Platform
-	for _, v := range strings.Split(v, ",") {
+	for v := range strings.SplitSeq(v, ",") {
 		p, err := platforms.Parse(v)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to parse target platform %s", v)
@@ -74,11 +74,11 @@ func parseShmSize(v string) (int64, error) {
 	return kb, nil
 }
 
-func parseUlimits(v string) ([]pb.Ulimit, error) {
+func parseUlimits(v string) ([]*pb.Ulimit, error) {
 	if v == "" {
 		return nil, nil
 	}
-	out := make([]pb.Ulimit, 0)
+	out := make([]*pb.Ulimit, 0)
 	fields, err := csvvalue.Fields(v, nil)
 	if err != nil {
 		return nil, err
@@ -88,13 +88,86 @@ func parseUlimits(v string) ([]pb.Ulimit, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, pb.Ulimit{
+		out = append(out, &pb.Ulimit{
 			Name: ulimit.Name,
 			Soft: ulimit.Soft,
 			Hard: ulimit.Hard,
 		})
 	}
 	return out, nil
+}
+
+func parseLinuxResources(opts map[string]string) (*pb.LinuxResources, error) {
+	var res pb.LinuxResources
+
+	if v, ok := opts[keyMemory]; ok && v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid %s value: %s", keyMemory, v)
+		}
+		if n <= 0 {
+			return nil, errors.Errorf("invalid %s value: %s: must be > 0", keyMemory, v)
+		}
+		res.Memory = n
+	}
+	if v, ok := opts[keyMemorySwap]; ok && v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid %s value: %s", keyMemorySwap, v)
+		}
+		if n < -1 || n == 0 {
+			return nil, errors.Errorf("invalid %s value: %s: must be -1 (unlimited) or > 0", keyMemorySwap, v)
+		}
+		res.MemorySwap = n
+	}
+	if v, ok := opts[keyCPUShares]; ok && v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid %s value: %s", keyCPUShares, v)
+		}
+		if n == 0 {
+			return nil, errors.Errorf("invalid %s value: %s: must be > 0", keyCPUShares, v)
+		}
+		res.CpuShares = n
+	}
+	if v, ok := opts[keyCPUPeriod]; ok && v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid %s value: %s", keyCPUPeriod, v)
+		}
+		if n == 0 {
+			return nil, errors.Errorf("invalid %s value: %s: must be > 0", keyCPUPeriod, v)
+		}
+		res.CpuPeriod = n
+	}
+	if v, ok := opts[keyCPUQuota]; ok && v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid %s value: %s", keyCPUQuota, v)
+		}
+		if n <= 0 {
+			return nil, errors.Errorf("invalid %s value: %s: must be > 0", keyCPUQuota, v)
+		}
+		res.CpuQuota = n
+	}
+	if v, ok := opts[keyCpusetCpus]; ok && v != "" {
+		if err := cpuset.Validate(v); err != nil {
+			return nil, errors.Wrapf(err, "invalid %s value: %s", keyCpusetCpus, v)
+		}
+		res.CpusetCpus = v
+	}
+	if v, ok := opts[keyCpusetMems]; ok && v != "" {
+		if err := cpuset.Validate(v); err != nil {
+			return nil, errors.Wrapf(err, "invalid %s value: %s", keyCpusetMems, v)
+		}
+		res.CpusetMems = v
+	}
+
+	if res.Memory == 0 && res.MemorySwap == 0 && res.CpuShares == 0 &&
+		res.CpuPeriod == 0 && res.CpuQuota == 0 && res.CpusetCpus == "" && res.CpusetMems == "" {
+		return nil, nil
+	}
+	return &res, nil
 }
 
 func parseNetMode(v string) (pb.NetMode, error) {
@@ -113,23 +186,11 @@ func parseNetMode(v string) (pb.NetMode, error) {
 	}
 }
 
-func parseSourceDateEpoch(v string) (*time.Time, error) {
-	if v == "" {
-		return nil, nil
-	}
-	sde, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return nil, errors.Wrapf(err, "invalid SOURCE_DATE_EPOCH: %s", v)
-	}
-	tm := time.Unix(sde, 0).UTC()
-	return &tm, nil
-}
-
 func parseLocalSessionIDs(opt map[string]string) map[string]string {
 	m := map[string]string{}
 	for k, v := range opt {
-		if strings.HasPrefix(k, localSessionIDPrefix) {
-			m[strings.TrimPrefix(k, localSessionIDPrefix)] = v
+		if after, ok := strings.CutPrefix(k, localSessionIDPrefix); ok {
+			m[after] = v
 		}
 	}
 	return m
@@ -138,8 +199,8 @@ func parseLocalSessionIDs(opt map[string]string) map[string]string {
 func filter(opt map[string]string, key string) map[string]string {
 	m := map[string]string{}
 	for k, v := range opt {
-		if strings.HasPrefix(k, key) {
-			m[strings.TrimPrefix(k, key)] = v
+		if after, ok := strings.CutPrefix(k, key); ok {
+			m[after] = v
 		}
 	}
 	return m

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"go/format"
@@ -49,10 +50,10 @@ func errorOut(msg string, err error) {
 
 func checkFlags() error {
 	if *outputFile == "" {
-		return fmt.Errorf("missing required flag `-o`")
+		return errors.New("missing required flag `-o`")
 	}
 	if *inputFile == "" {
-		return fmt.Errorf("missing required flag `-i`")
+		return errors.New("missing required flag `-i`")
 	}
 	return nil
 }
@@ -66,7 +67,7 @@ func main() {
 	errorOut("error", checkFlags())
 
 	pkg, err := Parse(*inputFile, *typeName)
-	errorOut(fmt.Sprintf("error parsing requested type %s", *typeName), err)
+	errorOut("error parsing requested type "+*typeName, err)
 
 	analysis := struct {
 		InterfaceType string

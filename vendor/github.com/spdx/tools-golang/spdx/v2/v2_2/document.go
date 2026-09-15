@@ -21,7 +21,7 @@ type ExternalDocumentRef struct {
 	// DocumentRefID is the ID string defined in the start of the
 	// reference. It should _not_ contain the "DocumentRef-" part
 	// of the mandatory ID string.
-	DocumentRefID string `json:"externalDocumentId"`
+	DocumentRefID common.DocumentID `json:"externalDocumentId"`
 
 	// URI is the URI defined for the external document
 	URI string `json:"spdxDocument"`
@@ -118,6 +118,14 @@ func (d *Document) UnmarshalJSON(b []byte) error {
 			refB = r.RefA
 		}
 		return fmt.Sprintf("%v-%v->%v", common.RenderDocElementID(refA), rel, common.RenderDocElementID(refB))
+	}
+
+	// remove null relationships
+	for i := 0; i < len(d.Relationships); i++ {
+		if d.Relationships[i] == nil {
+			d.Relationships = append(d.Relationships[0:i], d.Relationships[i+1:]...)
+			i--
+		}
 	}
 
 	// index current list of relationships to ensure no duplication

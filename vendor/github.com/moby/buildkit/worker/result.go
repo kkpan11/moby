@@ -59,14 +59,18 @@ func (r *workerRefResult) Release(ctx context.Context) error {
 	return r.ImmutableRef.Release(ctx)
 }
 
-func (r *workerRefResult) Sys() interface{} {
+func (r *workerRefResult) Sys() any {
 	return r.WorkerRef
 }
 
 func (r *workerRefResult) Clone() solver.Result {
 	r2 := *r
-	if r.ImmutableRef != nil {
-		r.ImmutableRef = r.ImmutableRef.Clone()
+	if r.WorkerRef != nil {
+		wr := *r.WorkerRef
+		if wr.ImmutableRef != nil {
+			wr.ImmutableRef = wr.ImmutableRef.Clone()
+		}
+		r2.WorkerRef = &wr
 	}
 	return &r2
 }

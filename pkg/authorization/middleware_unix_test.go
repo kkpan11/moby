@@ -1,6 +1,6 @@
 //go:build !windows
 
-package authorization // import "github.com/docker/docker/pkg/authorization"
+package authorization
 
 import (
 	"context"
@@ -8,9 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/docker/docker/pkg/plugingetter"
+	"github.com/moby/moby/v2/pkg/plugingetter"
 	"gotest.tools/v3/assert"
-	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestMiddlewareWrapHandler(t *testing.T) {
@@ -34,7 +33,7 @@ func TestMiddlewareWrapHandler(t *testing.T) {
 	assert.Assert(t, mdHandler != nil)
 
 	addr := "www.example.com/auth"
-	req, _ := http.NewRequest(http.MethodGet, addr, nil)
+	req, _ := http.NewRequest(http.MethodGet, addr, http.NoBody)
 	req.RequestURI = addr
 	req.Header.Add("header", "value")
 
@@ -47,7 +46,7 @@ func TestMiddlewareWrapHandler(t *testing.T) {
 			Msg:   "Server Auth Not Allowed",
 		}
 		if err := mdHandler(ctx, resp, req, map[string]string{}); err == nil {
-			assert.Assert(t, is.ErrorContains(err, ""))
+			assert.ErrorContains(t, err, "")
 		}
 	})
 

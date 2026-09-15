@@ -1,9 +1,8 @@
 //go:build !windows
 
-package plugins // import "github.com/docker/docker/pkg/plugins"
+package plugins
 
 import (
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -45,7 +44,7 @@ func TestLocalSocket(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(p, pp) {
+		if !reflect.DeepEqual(p, pp) { //nolint:govet // ignore 'deepequalerrors: avoid using reflect.DeepEqual with errors', which is triggered by Plugin having a activateErr field.
 			t.Fatalf("Expected %v, was %v\n", p, pp)
 		}
 
@@ -53,7 +52,7 @@ func TestLocalSocket(t *testing.T) {
 			t.Fatalf("Expected plugin `echo`, got %s\n", p.name)
 		}
 
-		addr := fmt.Sprintf("unix://%s", c)
+		addr := "unix://" + c
 		if p.Addr != addr {
 			t.Fatalf("Expected plugin addr `%s`, got %s\n", addr, p.Addr)
 		}

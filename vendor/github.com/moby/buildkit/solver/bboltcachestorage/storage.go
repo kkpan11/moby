@@ -4,11 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"os"
 
-	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/solver"
-	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/db"
 	"github.com/moby/buildkit/util/db/boltutil"
 	digest "github.com/opencontainers/go-digest"
@@ -28,8 +25,9 @@ type Store struct {
 }
 
 func NewStore(dbPath string) (*Store, error) {
-	db, err := safeOpenDB(dbPath, &bolt.Options{
-		NoSync: true,
+	db, err := boltutil.SafeOpen(dbPath, 0600, &bolt.Options{
+		NoSync:       true,
+		FreelistType: bolt.FreelistMapType,
 	})
 	if err != nil {
 		return nil, err
@@ -267,17 +265,26 @@ func (s *Store) emptyBranchWithParents(tx *bolt.Tx, id []byte) error {
 	if backlinks := tx.Bucket([]byte(backlinksBucket)).Bucket(id); backlinks != nil {
 		if err := backlinks.ForEach(func(k, v []byte) error {
 			if subLinks := tx.Bucket([]byte(linksBucket)).Bucket(k); subLinks != nil {
+				// Perform deletion outside of the iteration.
+				// https://github.com/etcd-io/bbolt/pull/611
+				var toDelete []string
 				if err := subLinks.ForEach(func(k, v []byte) error {
 					parts := bytes.Split(k, []byte("@"))
 					if len(parts) != 2 {
 						return errors.Errorf("invalid key %s", k)
 					}
 					if bytes.Equal(id, parts[1]) {
-						return subLinks.Delete(k)
+						toDelete = append(toDelete, string(k))
 					}
 					return nil
 				}); err != nil {
 					return err
+				}
+
+				for _, k := range toDelete {
+					if err := subLinks.Delete([]byte(k)); err != nil {
+						return err
+					}
 				}
 
 				if isEmptyBucket(subLinks) {
@@ -298,8 +305,8 @@ func (s *Store) emptyBranchWithParents(tx *bolt.Tx, id []byte) error {
 	}
 
 	// intentionally ignoring errors
-	tx.Bucket([]byte(linksBucket)).DeleteBucket([]byte(id))
-	tx.Bucket([]byte(resultBucket)).DeleteBucket([]byte(id))
+	tx.Bucket([]byte(linksBucket)).DeleteBucket(id)
+	tx.Bucket([]byte(resultBucket)).DeleteBucket(id)
 
 	return nil
 }
@@ -333,6 +340,49 @@ func (s *Store) AddLink(id string, link solver.CacheInfoLink, target string) err
 	})
 }
 
+func (s *Store) WalkLinksAll(id string, fn func(id string, link solver.CacheInfoLink) error) error {
+	type linkEntry struct {
+		id   string
+		link solver.CacheInfoLink
+	}
+	var links []linkEntry
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(linksBucket))
+		if b == nil {
+			return nil
+		}
+		b = b.Bucket([]byte(id))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			parts := bytes.Split(k, []byte("@"))
+			if len(parts) != 2 {
+				return errors.Errorf("invalid key %s", k)
+			}
+			var link solver.CacheInfoLink
+			if err := json.Unmarshal(parts[0], &link); err != nil {
+				return err
+			}
+			// make digest relative to output as not all backends store output separately
+			link.Digest = digest.FromBytes(fmt.Appendf(nil, "%s@%d", link.Digest, link.Output))
+			links = append(links, linkEntry{
+				id:   string(parts[1]),
+				link: link,
+			})
+			return nil
+		})
+	}); err != nil {
+		return err
+	}
+	for _, l := range links {
+		if err := fn(l.id, l.link); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) WalkLinks(id string, link solver.CacheInfoLink, fn func(id string) error) error {
 	var links []string
 	if err := s.db.View(func(tx *bolt.Tx) error {
@@ -351,7 +401,7 @@ func (s *Store) WalkLinks(id string, link solver.CacheInfoLink, fn func(id strin
 		}
 		index := bytes.Join([][]byte{dt, {}}, []byte("@"))
 		c := b.Cursor()
-		k, _ := c.Seek([]byte(index))
+		k, _ := c.Seek(index)
 		for {
 			if k != nil && bytes.HasPrefix(k, index) {
 				target := bytes.TrimPrefix(k, index)
@@ -431,7 +481,7 @@ func (s *Store) WalkBacklinks(id string, fn func(id string, link solver.CacheInf
 					if err := json.Unmarshal(parts[0], &l); err != nil {
 						return err
 					}
-					l.Digest = digest.FromBytes([]byte(fmt.Sprintf("%s@%d", l.Digest, l.Output)))
+					l.Digest = digest.FromBytes(fmt.Appendf(nil, "%s@%d", l.Digest, l.Output))
 					l.Output = 0
 					outIDs = append(outIDs, string(bid))
 					outLinks = append(outLinks, l)
@@ -464,52 +514,4 @@ func isEmptyBucket(b *bolt.Bucket) bool {
 	}
 	k, _ := b.Cursor().First()
 	return k == nil
-}
-
-// safeOpenDB opens a bolt database and recovers from panic that
-// can be caused by a corrupted database file.
-func safeOpenDB(dbPath string, opts *bolt.Options) (db db.DB, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = errors.Errorf("%v", r)
-		}
-
-		// If we get an error when opening the database, but we have
-		// access to the file and the file looks like it has content,
-		// then fallback to resetting the database since the database
-		// may be corrupt.
-		if err != nil && fileHasContent(dbPath) {
-			db, err = fallbackOpenDB(dbPath, opts, err)
-		}
-	}()
-	return openDB(dbPath, opts)
-}
-
-// fallbackOpenDB performs database recovery and opens the new database
-// file when the database fails to open. Called after the first database
-// open fails.
-func fallbackOpenDB(dbPath string, opts *bolt.Options, openErr error) (db.DB, error) {
-	backupPath := dbPath + "." + identity.NewID() + ".bak"
-	bklog.L.Errorf("failed to open database file %s, resetting to empty. Old database is backed up to %s. "+
-		"This error signifies that buildkitd likely crashed or was sigkilled abrubtly, leaving the database corrupted. "+
-		"If you see logs from a previous panic then please report in the issue tracker at https://github.com/moby/buildkit . %+v", dbPath, backupPath, openErr)
-	if err := os.Rename(dbPath, backupPath); err != nil {
-		return nil, errors.Wrapf(err, "failed to rename database file %s to %s", dbPath, backupPath)
-	}
-
-	// Attempt to open the database again. This should be a new database.
-	// If this fails, it is a permanent error.
-	return openDB(dbPath, opts)
-}
-
-// openDB opens a bolt database in user-only read/write mode.
-func openDB(dbPath string, opts *bolt.Options) (db.DB, error) {
-	return boltutil.Open(dbPath, 0600, opts)
-}
-
-// fileHasContent checks if we have access to the file with appropriate
-// permissions and the file has a non-zero size.
-func fileHasContent(dbPath string) bool {
-	st, err := os.Stat(dbPath)
-	return err == nil && st.Size() > 0
 }

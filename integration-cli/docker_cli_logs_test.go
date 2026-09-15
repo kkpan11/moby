@@ -11,11 +11,12 @@ import (
 	"time"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/daemon"
-	"github.com/docker/docker/testutil"
-	testdaemon "github.com/docker/docker/testutil/daemon"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/daemon"
+	"github.com/moby/moby/v2/internal/testutil"
+	testdaemon "github.com/moby/moby/v2/internal/testutil/daemon"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
 )
 
@@ -23,12 +24,12 @@ type DockerCLILogsSuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerCLILogsSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLILogsSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLILogsSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLILogsSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 // This used to work, it test a log of PageSize-1 (gh#4851)
@@ -46,12 +47,12 @@ func (s *DockerCLILogsSuite) TestLogsContainerMuchBiggerThanPage(c *testing.T) {
 	testLogsContainerPagination(c, 33000)
 }
 
-func testLogsContainerPagination(c *testing.T, testLen int) {
-	id := cli.DockerCmd(c, "run", "-d", "busybox", "sh", "-c", fmt.Sprintf("for i in $(seq 1 %d); do echo -n = >> a.a; done; echo >> a.a; cat a.a", testLen)).Stdout()
+func testLogsContainerPagination(t *testing.T, testLen int) {
+	id := cli.DockerCmd(t, "run", "-d", "busybox", "sh", "-c", fmt.Sprintf("for i in $(seq 1 %d); do echo -n = >> a.a; done; echo >> a.a; cat a.a", testLen)).Stdout()
 	id = strings.TrimSpace(id)
-	cli.DockerCmd(c, "wait", id)
-	out := cli.DockerCmd(c, "logs", id).Combined()
-	assert.Equal(c, len(out), testLen+1)
+	cli.DockerCmd(t, "wait", id)
+	out := cli.DockerCmd(t, "logs", id).Combined()
+	assert.Equal(t, len(out), testLen+1)
 }
 
 func (s *DockerCLILogsSuite) TestLogsTimestamps(c *testing.T) {
@@ -186,7 +187,7 @@ func (s *DockerCLILogsSuite) TestLogsSince(c *testing.T) {
 		result := icmd.RunCommand(dockerBinary, cmd...)
 		result.Assert(c, icmd.Success)
 		for _, v := range expected {
-			assert.Check(c, strings.Contains(result.Combined(), v))
+			assert.Check(c, is.Contains(result.Combined(), v))
 		}
 	}
 }
@@ -215,9 +216,9 @@ func (s *DockerCLILogsSuite) TestLogsSinceFutureFollow(c *testing.T) {
 
 	since := t.Unix() + 2
 	out := cli.DockerCmd(c, "logs", "-t", "-f", fmt.Sprintf("--since=%v", since), name).Combined()
-	assert.Assert(c, len(out) != 0, "cannot read from empty log")
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	for _, v := range lines {
+	assert.Assert(c, out != "", "cannot read from empty log")
+	lines := strings.SplitSeq(strings.TrimSpace(out), "\n")
+	for v := range lines {
 		ts, err := time.Parse(time.RFC3339Nano, strings.Split(v, " ")[0])
 		assert.NilError(c, err, "cannot parse timestamp output from log: '%v'", v)
 		assert.Assert(c, ts.Unix() >= since, "earlier log found. since=%v logdate=%v", since, ts)
@@ -262,21 +263,20 @@ func (s *DockerCLILogsSuite) TestLogsFollowSlowStdoutConsumer(c *testing.T) {
 // ConsumeWithSpeed reads chunkSize bytes from reader before sleeping
 // for interval duration. Returns total read bytes. Send true to the
 // stop channel to return before reading to EOF on the reader.
-func ConsumeWithSpeed(reader io.Reader, chunkSize int, interval time.Duration, stop chan bool) (n int, err error) {
+func ConsumeWithSpeed(reader io.Reader, chunkSize int, interval time.Duration, stop chan bool) (n int, _ error) {
 	buffer := make([]byte, chunkSize)
 	for {
-		var readBytes int
-		readBytes, err = reader.Read(buffer)
+		readBytes, err := reader.Read(buffer)
 		n += readBytes
 		if err != nil {
-			if err == io.EOF {
-				err = nil
+			if err != io.EOF {
+				return n, err
 			}
-			return
+			return n, nil
 		}
 		select {
 		case <-stop:
-			return
+			return n, err
 		case <-time.After(interval):
 		}
 	}
@@ -301,7 +301,7 @@ func (s *DockerCLILogsSuite) TestLogsFollowGoroutinesWithStdout(c *testing.T) {
 	assert.NilError(c, d.WaitRun(id))
 
 	client := d.NewClientT(c)
-	nroutines := waitForStableGourtineCount(ctx, c, client)
+	nroutines := waitForStableGoroutineCount(ctx, c, client)
 
 	cmd := d.Command("logs", "-f", id)
 	r, w := io.Pipe()
@@ -357,7 +357,7 @@ func (s *DockerCLILogsSuite) TestLogsFollowGoroutinesNoOutput(c *testing.T) {
 	assert.NilError(c, d.WaitRun(id))
 
 	client := d.NewClientT(c)
-	nroutines := waitForStableGourtineCount(ctx, c, client)
+	nroutines := waitForStableGoroutineCount(ctx, c, client)
 	assert.NilError(c, err)
 
 	cmd := d.Command("logs", "-f", id)
@@ -382,7 +382,7 @@ func (s *DockerCLILogsSuite) TestLogsCLIContainerNotFound(c *testing.T) {
 	name := "testlogsnocontainer"
 	out, _, _ := dockerCmdWithError("logs", name)
 	message := fmt.Sprintf("No such container: %s\n", name)
-	assert.Assert(c, strings.Contains(out, message))
+	assert.Assert(c, is.Contains(out, message))
 }
 
 func (s *DockerCLILogsSuite) TestLogsWithDetails(c *testing.T) {

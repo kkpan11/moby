@@ -1,4 +1,4 @@
-package syslog // import "github.com/docker/docker/daemon/logger/syslog"
+package syslog
 
 import (
 	"log"
@@ -11,9 +11,10 @@ import (
 	"testing"
 
 	syslog "github.com/RackSec/srslog"
+	"github.com/moby/moby/v2/daemon/logger"
 )
 
-func functionMatches(expectedFun interface{}, actualFun interface{}) bool {
+func functionMatches(expectedFun any, actualFun any) bool {
 	return reflect.ValueOf(expectedFun).Pointer() == reflect.ValueOf(actualFun).Pointer()
 }
 
@@ -110,7 +111,6 @@ func TestValidateSyslogAddress(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		if tc.skipOn == runtime.GOOS {
 			continue
 		}
@@ -163,18 +163,19 @@ func TestValidateLogOptSyslogFormat(t *testing.T) {
 
 func TestValidateLogOpt(t *testing.T) {
 	err := ValidateLogOpt(map[string]string{
-		"env":                    "http://127.0.0.1",
-		"env-regex":              "abc",
-		"labels":                 "labelA",
-		"labels-regex":           "def",
 		"syslog-address":         "udp://1.2.3.4:1111",
 		"syslog-facility":        "daemon",
 		"syslog-tls-ca-cert":     "/etc/ca-certificates/custom/ca.pem",
 		"syslog-tls-cert":        "/etc/ca-certificates/custom/cert.pem",
 		"syslog-tls-key":         "/etc/ca-certificates/custom/key.pem",
 		"syslog-tls-skip-verify": "true",
-		"tag":                    "true",
 		"syslog-format":          "rfc3164",
+
+		logger.AttrEnv:         "http://127.0.0.1",
+		logger.AttrEnvRegex:    "abc",
+		logger.AttrLabels:      "labelA",
+		logger.AttrLabelsRegex: "def",
+		logger.AttrLogTag:      "true",
 	})
 	if err != nil {
 		t.Fatal(err)

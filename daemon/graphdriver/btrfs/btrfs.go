@@ -1,6 +1,6 @@
 //go:build linux
 
-package btrfs // import "github.com/docker/docker/daemon/graphdriver/btrfs"
+package btrfs
 
 /*
 #include <stdlib.h>
@@ -35,13 +35,12 @@ import (
 	"unsafe"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/daemon/graphdriver"
-	"github.com/docker/docker/daemon/internal/fstype"
-	"github.com/docker/docker/internal/containerfs"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/parsers"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
+	"github.com/moby/moby/v2/daemon/graphdriver"
+	"github.com/moby/moby/v2/daemon/internal/containerfs"
+	"github.com/moby/moby/v2/daemon/internal/fstype"
 	"github.com/moby/sys/mount"
+	"github.com/moby/sys/user"
 	"github.com/moby/sys/userns"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
@@ -59,7 +58,7 @@ type btrfsOptions struct {
 
 // Init returns a new BTRFS driver.
 // An error is returned if BTRFS is not supported.
-func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdriver.Driver, error) {
+func Init(home string, options []string, idMap user.IdentityMapping) (graphdriver.Driver, error) {
 	// Perform feature detection on /var/lib/docker/btrfs if it's an existing directory.
 	// This covers situations where /var/lib/docker/btrfs is a mount, and on a different
 	// filesystem than /var/lib/docker.
@@ -78,13 +77,8 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		return nil, graphdriver.ErrPrerequisites
 	}
 
-	currentID := idtools.CurrentIdentity()
-	dirID := idtools.Identity{
-		UID: currentID.UID,
-		GID: idMap.RootPair().GID,
-	}
-
-	if err := idtools.MkdirAllAndChown(home, 0o710, dirID); err != nil {
+	_, gid := idMap.RootPair()
+	if err := user.MkdirAndChown(home, 0o710, os.Getuid(), gid); err != nil {
 		return nil, err
 	}
 
@@ -121,7 +115,7 @@ func parseOptions(opt []string) (btrfsOptions, bool, error) {
 	var options btrfsOptions
 	userDiskQuota := false
 	for _, option := range opt {
-		key, val, err := parsers.ParseKeyValueOpt(option)
+		key, val, err := graphdriver.ParseStorageOptKeyValue(option)
 		if err != nil {
 			return options, userDiskQuota, err
 		}
@@ -135,7 +129,7 @@ func parseOptions(opt []string) (btrfsOptions, bool, error) {
 			userDiskQuota = true
 			options.minSpace = uint64(minSpace)
 		default:
-			return options, userDiskQuota, fmt.Errorf("Unknown option %s", key)
+			return options, userDiskQuota, errors.New("unknown option " + key)
 		}
 	}
 	return options, userDiskQuota, nil
@@ -145,7 +139,7 @@ func parseOptions(opt []string) (btrfsOptions, bool, error) {
 type Driver struct {
 	// root of the file system
 	home         string
-	idMap        idtools.IdentityMapping
+	idMap        user.IdentityMapping
 	options      btrfsOptions
 	quotaEnabled bool
 	once         sync.Once
@@ -187,7 +181,7 @@ func openDir(path string) (*C.DIR, error) {
 
 	dir := C.opendir(Cpath)
 	if dir == nil {
-		return nil, fmt.Errorf("Can't open dir")
+		return nil, errors.New("Can't open dir")
 	}
 	return dir, nil
 }
@@ -488,15 +482,9 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 	quotas := path.Join(d.home, "quotas")
 	subvolumes := path.Join(d.home, "subvolumes")
-	root := d.idMap.RootPair()
 
-	currentID := idtools.CurrentIdentity()
-	dirID := idtools.Identity{
-		UID: currentID.UID,
-		GID: root.GID,
-	}
-
-	if err := idtools.MkdirAllAndChown(subvolumes, 0o710, dirID); err != nil {
+	uid, gid := d.idMap.RootPair()
+	if err := user.MkdirAllAndChown(subvolumes, 0o710, os.Getuid(), gid); err != nil {
 		return err
 	}
 	if parent == "" {
@@ -510,11 +498,28 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 			return err
 		}
 		if !st.IsDir() {
-			return fmt.Errorf("%s: not a directory", parentDir)
+			return errors.New(parentDir + ": not a directory")
 		}
 		if err := subvolSnapshot(parentDir, subvolumes, id); err != nil {
 			return err
 		}
+	}
+
+	subvolPath := path.Join(subvolumes, id)
+
+	// if we have a remapped root (user namespaces enabled), change the created snapshot
+	// dir ownership to match
+	if uid != 0 || gid != 0 {
+		if err := os.Chown(subvolPath, uid, gid); err != nil {
+			return err
+		}
+	}
+
+	// Btrfs creates the subvolume's root inode with 0777&^umask, and the daemon
+	// runs with umask 0000, so set the mode explicitly, like the other
+	// graphdrivers do for the directories they create.
+	if err := os.Chmod(subvolPath, 0o755); err != nil {
+		return err
 	}
 
 	var storageOpt map[string]string
@@ -531,18 +536,10 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 		if err := d.setStorageSize(path.Join(subvolumes, id), driver); err != nil {
 			return err
 		}
-		if err := idtools.MkdirAllAndChown(quotas, 0o700, idtools.CurrentIdentity()); err != nil {
+		if err := user.MkdirAllAndChown(quotas, 0o700, os.Getuid(), os.Getegid()); err != nil {
 			return err
 		}
-		if err := os.WriteFile(path.Join(quotas, id), []byte(fmt.Sprint(driver.options.size)), 0o644); err != nil {
-			return err
-		}
-	}
-
-	// if we have a remapped root (user namespaces enabled), change the created snapshot
-	// dir ownership to match
-	if root.UID != 0 || root.GID != 0 {
-		if err := root.Chown(path.Join(subvolumes, id)); err != nil {
+		if err := os.WriteFile(path.Join(quotas, id), []byte(strconv.FormatUint(driver.options.size, 10)), 0o644); err != nil {
 			return err
 		}
 	}
@@ -559,7 +556,7 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 func (d *Driver) parseStorageOpt(storageOpt map[string]string, driver *Driver) error {
 	// Read size to change the subvolume disk quota per container
 	for key, val := range storageOpt {
-		key := strings.ToLower(key)
+		key = strings.ToLower(key)
 		switch key {
 		case "size":
 			size, err := units.RAMInBytes(val)
@@ -568,7 +565,7 @@ func (d *Driver) parseStorageOpt(storageOpt map[string]string, driver *Driver) e
 			}
 			driver.options.size = uint64(size)
 		default:
-			return fmt.Errorf("Unknown option %s", key)
+			return errors.New("unknown option " + key)
 		}
 	}
 
@@ -636,7 +633,7 @@ func (d *Driver) Get(id, mountLabel string) (string, error) {
 	}
 
 	if !st.IsDir() {
-		return "", fmt.Errorf("%s: not a directory", dir)
+		return "", errors.New(dir + ": not a directory")
 	}
 
 	if quota, err := os.ReadFile(d.quotasDirID(id)); err == nil {

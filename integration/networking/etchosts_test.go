@@ -5,12 +5,14 @@ import (
 	"testing"
 	"time"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/daemon"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/container"
+	"github.com/moby/moby/v2/integration/internal/network"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/golden"
 	"gotest.tools/v3/skip"
 )
 
@@ -45,8 +47,8 @@ func TestEtcHostsIpv6(t *testing.T) {
 			expIPv6Enabled: true,
 			expEtcHosts: `127.0.0.1	localhost
 ::1	localhost ip6-localhost ip6-loopback
-fe00::0	ip6-localnet
-ff00::0	ip6-mcastprefix
+fe00::	ip6-localnet
+ff00::	ip6-mcastprefix
 ff02::1	ip6-allnodes
 ff02::2	ip6-allrouters
 `,
@@ -71,7 +73,7 @@ ff02::2	ip6-allrouters
 				container.WithSysctls(tc.sysctls),
 			)
 			defer func() {
-				c.ContainerRemove(ctx, ctrId, containertypes.RemoveOptions{Force: true})
+				c.ContainerRemove(ctx, ctrId, client.ContainerRemoveOptions{Force: true})
 			}()
 
 			runCmd := func(ctrId string, cmd []string, expExitCode int) string {
@@ -95,11 +97,91 @@ ff02::2	ip6-allrouters
 			stdout := runCmd(ctrId, []string{"cat", "/etc/hosts"}, 0)
 			// Append the container's own addresses/name to the expected hosts file content.
 			inspect := container.Inspect(ctx, t, c, ctrId)
-			exp := tc.expEtcHosts + inspect.NetworkSettings.IPAddress + "\t" + inspect.Config.Hostname + "\n"
+			bridgeEp := inspect.NetworkSettings.Networks["bridge"]
+			exp := tc.expEtcHosts + bridgeEp.IPAddress.String() + "\t" + inspect.Config.Hostname + "\n"
 			if tc.expIPv6Enabled {
-				exp += inspect.NetworkSettings.GlobalIPv6Address + "\t" + inspect.Config.Hostname + "\n"
+				exp += bridgeEp.GlobalIPv6Address.String() + "\t" + inspect.Config.Hostname + "\n"
 			}
 			assert.Check(t, is.Equal(stdout, exp))
 		})
 	}
+}
+
+// TestEtcHostsDisconnect checks that, when a container is disconnected from a
+// network, the /etc/hosts entries for that network are removed (and no others).
+func TestEtcHostsDisconnect(t *testing.T) {
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "/etc/hosts isn't set up on Windows")
+
+	ctx := setupTest(t)
+	d := daemon.New(t)
+	d.StartWithBusybox(ctx, t)
+	defer d.Stop(t)
+	c := d.NewClientT(t)
+	defer c.Close()
+
+	const netName1 = "test-etchdbr"
+	network.CreateNoError(ctx, t, c, netName1,
+		network.WithDriver("bridge"),
+		network.WithIPv6(),
+		network.WithIPAM("192.168.123.0/24", "192.168.123.1"),
+		network.WithIPAM("fde6:be58:aedf::/64", "fde6:be58:aedf::1"),
+	)
+	defer network.RemoveNoError(ctx, t, c, netName1)
+
+	const netName2 = "test-etchdipv"
+	network.CreateNoError(ctx, t, c, netName2,
+		network.WithDriver("ipvlan"),
+		network.WithIPv6(),
+		network.WithIPAM("192.168.124.0/24", "192.168.124.1"),
+		network.WithIPAM("fdd2:c4e3:c4d5::/64", "fdd2:c4e3:c4d5::1"),
+	)
+	defer network.RemoveNoError(ctx, t, c, netName2)
+
+	const ctrName = "c1"
+	const ctrHostname = "c1.invalid"
+	ctrId := container.Run(ctx, t, c,
+		container.WithName(ctrName),
+		container.WithHostname(ctrHostname),
+		container.WithNetworkMode(netName1),
+		container.WithExtraHost("otherhost.invalid:192.0.2.3"),
+		container.WithExtraHost("otherhost.invalid:2001:db8::1234"),
+	)
+	defer c.ContainerRemove(ctx, ctrId, client.ContainerRemoveOptions{Force: true})
+
+	getEtcHosts := func() string {
+		er := container.ExecT(ctx, t, c, ctrId, []string{"cat", "/etc/hosts"})
+		return er.Stdout()
+	}
+
+	var err error
+
+	// Connect a second network (don't do this in the Run, because then the /etc/hosts
+	// entries for the two networks can end up in either order).
+	_, err = c.NetworkConnect(ctx, netName2, client.NetworkConnectOptions{
+		Container: ctrName,
+	})
+	assert.Check(t, err)
+	golden.Assert(t, getEtcHosts(), "TestEtcHostsDisconnect1.golden")
+
+	// Disconnect net1, its hosts entries are currently before net2's.
+	_, err = c.NetworkDisconnect(ctx, netName1, client.NetworkDisconnectOptions{Container: ctrName, Force: false})
+	assert.Check(t, err)
+	golden.Assert(t, getEtcHosts(), "TestEtcHostsDisconnect2.golden")
+
+	// Reconnect net1, so that its entries will follow net2's.
+	_, err = c.NetworkConnect(ctx, netName1, client.NetworkConnectOptions{
+		Container: ctrName,
+	})
+	assert.Check(t, err)
+	golden.Assert(t, getEtcHosts(), "TestEtcHostsDisconnect3.golden")
+
+	// Disconnect net1 again, removing its entries from the end of the file.
+	_, err = c.NetworkDisconnect(ctx, netName1, client.NetworkDisconnectOptions{Container: ctrName, Force: false})
+	assert.Check(t, err)
+	golden.Assert(t, getEtcHosts(), "TestEtcHostsDisconnect4.golden")
+
+	// Disconnect net2, the only network.
+	_, err = c.NetworkDisconnect(ctx, netName2, client.NetworkDisconnectOptions{Container: ctrName, Force: false})
+	assert.Check(t, err)
+	golden.Assert(t, getEtcHosts(), "TestEtcHostsDisconnect5.golden")
 }

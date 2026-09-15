@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli"
 	"gotest.tools/v3/assert"
 )
 
@@ -18,12 +18,12 @@ type DockerBenchmarkSuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerBenchmarkSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerBenchmarkSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerBenchmarkSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerBenchmarkSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 func (s *DockerBenchmarkSuite) BenchmarkConcurrentContainerActions(c *testing.B) {
@@ -33,7 +33,7 @@ func (s *DockerBenchmarkSuite) BenchmarkConcurrentContainerActions(c *testing.B)
 	outerGroup.Add(maxConcurrency)
 	chErr := make(chan error, numIterations*2*maxConcurrency)
 
-	for i := 0; i < maxConcurrency; i++ {
+	for range maxConcurrency {
 		go func() {
 			defer outerGroup.Done()
 			innerGroup := &sync.WaitGroup{}
@@ -41,7 +41,7 @@ func (s *DockerBenchmarkSuite) BenchmarkConcurrentContainerActions(c *testing.B)
 
 			go func() {
 				defer innerGroup.Done()
-				for i := 0; i < numIterations; i++ {
+				for range numIterations {
 					args := []string{"run", "-d", "busybox"}
 					args = append(args, sleepCommandForDaemonPlatform()...)
 					out, _, err := dockerCmdWithError(args...)
@@ -88,7 +88,7 @@ func (s *DockerBenchmarkSuite) BenchmarkConcurrentContainerActions(c *testing.B)
 
 			go func() {
 				defer innerGroup.Done()
-				for i := 0; i < numIterations; i++ {
+				for range numIterations {
 					out, _, err := dockerCmdWithError("ps")
 					if err != nil {
 						chErr <- errors.New(out)

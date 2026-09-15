@@ -5,10 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/containerd/platforms"
@@ -23,6 +24,8 @@ import (
 	"github.com/moby/buildkit/solver/llbsolver/mounts"
 	"github.com/moby/buildkit/solver/llbsolver/ops/opsutils"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/cachedigest"
+	"github.com/moby/buildkit/util/network"
 	"github.com/moby/buildkit/util/progress/logs"
 	utilsystem "github.com/moby/buildkit/util/system"
 	"github.com/moby/buildkit/worker"
@@ -36,37 +39,42 @@ import (
 const execCacheType = "buildkit.exec.v0"
 
 type ExecOp struct {
-	op          *pb.ExecOp
-	cm          cache.Manager
-	mm          *mounts.MountManager
-	sm          *session.Manager
-	exec        executor.Executor
-	w           worker.Worker
-	platform    *pb.Platform
-	numInputs   int
-	parallelism *semaphore.Weighted
-	rec         resourcestypes.Recorder
-	digest      digest.Digest
+	op             *pb.ExecOp
+	cm             cache.Manager
+	mm             *mounts.MountManager
+	sm             *session.Manager
+	exec           executor.Executor
+	w              worker.Worker
+	platform       *pb.Platform
+	numInputs      int
+	parallelism    *semaphore.Weighted
+	rec            resourcestypes.Recorder
+	digest         digest.Digest
+	linuxResources *pb.LinuxResources
+	proxyNetwork   bool
+	proxyCap       *network.ProxyCapture
 }
 
 var _ solver.Op = &ExecOp{}
 
-func NewExecOp(v solver.Vertex, op *pb.Op_Exec, platform *pb.Platform, cm cache.Manager, parallelism *semaphore.Weighted, sm *session.Manager, exec executor.Executor, w worker.Worker) (*ExecOp, error) {
+func NewExecOp(v solver.Vertex, op *pb.Op_Exec, platform *pb.Platform, cm cache.Manager, parallelism *semaphore.Weighted, sm *session.Manager, exec executor.Executor, w worker.Worker, linuxResources *pb.LinuxResources, proxyNetwork bool) (*ExecOp, error) {
 	if err := opsutils.Validate(&pb.Op{Op: op}); err != nil {
 		return nil, err
 	}
 	name := fmt.Sprintf("exec %s", strings.Join(op.Exec.Meta.Args, " "))
 	return &ExecOp{
-		op:          op.Exec,
-		mm:          mounts.NewMountManager(name, cm, sm),
-		cm:          cm,
-		sm:          sm,
-		exec:        exec,
-		numInputs:   len(v.Inputs()),
-		w:           w,
-		platform:    platform,
-		parallelism: parallelism,
-		digest:      v.Digest(),
+		op:             op.Exec,
+		mm:             mounts.NewMountManager(name, cm, sm),
+		cm:             cm,
+		sm:             sm,
+		exec:           exec,
+		numInputs:      len(v.Inputs()),
+		w:              w,
+		platform:       platform,
+		parallelism:    parallelism,
+		digest:         v.Digest(),
+		linuxResources: linuxResources,
+		proxyNetwork:   proxyNetwork,
 	}, nil
 }
 
@@ -78,27 +86,8 @@ func (e *ExecOp) Proto() *pb.ExecOp {
 	return e.op
 }
 
-func cloneExecOp(old *pb.ExecOp) pb.ExecOp {
-	n := *old
-	meta := *n.Meta
-	meta.ExtraHosts = nil
-	for i := range n.Meta.ExtraHosts {
-		h := *n.Meta.ExtraHosts[i]
-		meta.ExtraHosts = append(meta.ExtraHosts, &h)
-	}
-	n.Meta = &meta
-	n.Mounts = nil
-	for i := range old.Mounts {
-		m := *old.Mounts[i]
-
-		if m.CacheOpt != nil {
-			co := *m.CacheOpt
-			m.CacheOpt = &co
-		}
-
-		n.Mounts = append(n.Mounts, &m)
-	}
-	return n
+func cloneExecOp(old *pb.ExecOp) *pb.ExecOp {
+	return old.CloneVT()
 }
 
 func checkShouldClearCacheOpts(m *pb.Mount) bool {
@@ -122,7 +111,7 @@ func checkShouldClearCacheOpts(m *pb.Mount) bool {
 	return true
 }
 
-func (e *ExecOp) CacheMap(ctx context.Context, g session.Group, index int) (*solver.CacheMap, bool, error) {
+func (e *ExecOp) CacheMap(ctx context.Context, jobCtx solver.JobContext, index int) (*solver.CacheMap, bool, error) {
 	op := cloneExecOp(e.op)
 
 	for i := range op.Meta.ExtraHosts {
@@ -142,7 +131,7 @@ func (e *ExecOp) CacheMap(ctx context.Context, g session.Group, index int) (*sol
 	}
 	op.Meta.ProxyEnv = nil
 
-	p := platforms.DefaultSpec()
+	var p ocispecs.Platform
 	if e.platform != nil {
 		p = ocispecs.Platform{
 			OS:           e.platform.OS,
@@ -151,6 +140,8 @@ func (e *ExecOp) CacheMap(ctx context.Context, g session.Group, index int) (*sol
 			OSVersion:    e.platform.OSVersion,
 			OSFeatures:   e.platform.OSFeatures,
 		}
+	} else {
+		p = platforms.DefaultSpec()
 	}
 
 	// Special case for cache compatibility with buggy versions that wrongly
@@ -179,7 +170,7 @@ func (e *ExecOp) CacheMap(ctx context.Context, g session.Group, index int) (*sol
 		OSFeatures []string `json:",omitempty"`
 	}{
 		Type:       execCacheType,
-		Exec:       &op,
+		Exec:       op,
 		OS:         p.OS,
 		Arch:       p.Architecture,
 		Variant:    p.Variant,
@@ -190,8 +181,12 @@ func (e *ExecOp) CacheMap(ctx context.Context, g session.Group, index int) (*sol
 		return nil, false, err
 	}
 
+	dgst, err := cachedigest.FromBytes(dt, cachedigest.TypeJSON)
+	if err != nil {
+		return nil, false, err
+	}
 	cm := &solver.CacheMap{
-		Digest: digest.FromBytes(dt),
+		Digest: dgst,
 		Deps: make([]struct {
 			Selector          digest.Digest
 			ComputeDigestFunc solver.ResultBasedCacheFunc
@@ -216,6 +211,22 @@ func (e *ExecOp) CacheMap(ctx context.Context, g session.Group, index int) (*sol
 			cm.Deps[i].ComputeDigestFunc = opsutils.NewContentHashFunc(toSelectors(dedupePaths(dep.Selectors)))
 		}
 		cm.Deps[i].PreprocessFunc = unlazyResultFunc
+	}
+
+	if e.w != nil && e.w.CDIManager() != nil {
+		for _, d := range e.op.CdiDevices {
+			setup, ok := e.w.CDIManager().OnDemandInstaller(d.Name)
+			if ok {
+				prev := cm.Deps[0].PreprocessFunc
+				cm.Deps[0].PreprocessFunc = func(ctx context.Context, r solver.Result, g session.Group) error {
+					if err := prev(ctx, r, g); err != nil {
+						return err
+					}
+					// we could pass glibc/musl type in here based on rootfs to get correct dynamic libs
+					return setup(ctx)
+				}
+			}
+		}
 	}
 
 	return cm, true, nil
@@ -248,9 +259,7 @@ func dedupePaths(inp []string) []string {
 			paths = append(paths, p1)
 		}
 	}
-	sort.Slice(paths, func(i, j int) bool {
-		return paths[i] < paths[j]
-	})
+	slices.Sort(paths)
 	return paths
 }
 
@@ -290,10 +299,10 @@ func (e *ExecOp) getMountDeps() ([]dep, error) {
 			continue
 		}
 
-		if m.Input == pb.Empty {
+		if m.Input == int64(pb.Empty) {
 			continue
 		}
-		if int(m.Input) >= len(deps) {
+		if m.Input < 0 || int(m.Input) >= len(deps) {
 			return nil, errors.Errorf("invalid mountinput %v", m)
 		}
 
@@ -314,7 +323,7 @@ func (e *ExecOp) getMountDeps() ([]dep, error) {
 		//   run, since we only select "bar"
 		// - But this cached result is incorrect - "foo/sneaky.txt" isn't in
 		//   our cached result, but it is in our input.
-		if m.Output == pb.SkipOutput {
+		if m.Output == int64(pb.SkipOutput) {
 			// if the mount has no outputs, it's safe to enable content-based
 			// caching, since it's guaranteed to not be used as an input for
 			// any future steps
@@ -360,7 +369,7 @@ func addDefaultEnvvar(env []string, k, v string) []string {
 	return append(env, k+"="+v)
 }
 
-func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Result) (results []solver.Result, err error) {
+func (e *ExecOp) Exec(ctx context.Context, jobCtx solver.JobContext, inputs []solver.Result) (results []solver.Result, err error) {
 	trace.SpanFromContext(ctx).AddEvent("ExecOp started")
 
 	refs := make([]*worker.WorkerRef, len(inputs))
@@ -376,6 +385,7 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 	if e.platform != nil {
 		platformOS = e.platform.OS
 	}
+	g := jobCtx.Session()
 	p, err := container.PrepareMounts(ctx, e.mm, e.cm, g, e.op.Meta.Cwd, e.op.Mounts, refs, func(m *pb.Mount, ref cache.ImmutableRef) (cache.MutableRef, error) {
 		desc := fmt.Sprintf("mount %s from exec %s", m.Dest, strings.Join(e.op.Meta.Args, " "))
 		return e.cm.New(ctx, ref, g, cache.WithDescription(desc))
@@ -384,7 +394,7 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		if err != nil {
 			execInputs := make([]solver.Result, len(e.op.Mounts))
 			for i, m := range e.op.Mounts {
-				if m.Input == -1 {
+				if m.Input < 0 || int(m.Input) >= len(inputs) {
 					continue
 				}
 				execInputs[i] = inputs[m.Input].Clone()
@@ -392,7 +402,16 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 			execMounts := make([]solver.Result, len(e.op.Mounts))
 			copy(execMounts, execInputs)
 			for i, res := range results {
-				execMounts[p.OutputRefs[i].MountIndex] = res
+				// res.Clone() (not res) is required: results[i] is owned by
+				// the caller (and ultimately released via the gateway / job
+				// path), while execMounts[i] is embedded in the ExecError
+				// returned below and released independently by the error
+				// owner. Sharing the same *workerRefResult here would mean
+				// two independent owners holding the same *WorkerRef, so a
+				// Release on one would also free the cache ref held by the
+				// other. See worker/result_test.go for the underlying
+				// ownership invariant.
+				execMounts[p.OutputRefs[i].MountIndex] = res.Clone()
 			}
 			for _, active := range p.Actives {
 				if active.NoCommit {
@@ -401,6 +420,7 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 					ref, cerr := active.Ref.Commit(ctx)
 					if cerr != nil {
 						err = errors.Wrapf(err, "error committing %s: %s", active.Ref.ID(), cerr)
+						active.Ref.Release(context.TODO())
 						continue
 					}
 					execMounts[active.MountIndex] = worker.NewWorkerRefResult(ref, e.w)
@@ -409,8 +429,8 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 			err = errdefs.WithExecError(err, execInputs, execMounts)
 		} else {
 			// Only release actives if err is nil.
-			for i := len(p.Actives) - 1; i >= 0; i-- { // call in LIFO order
-				p.Actives[i].Ref.Release(context.TODO())
+			for _, active := range slices.Backward(p.Actives) { // call in LIFO order
+				active.Ref.Release(context.TODO())
 			}
 		}
 		for _, o := range p.OutputRefs {
@@ -432,8 +452,9 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 	if err != nil {
 		return nil, err
 	}
+	args := e.op.Meta.Args
 	if emu != nil {
-		e.op.Meta.Args = append([]string{qemuMountName}, e.op.Meta.Args...)
+		args = append([]string{qemuMountName}, args...)
 
 		p.Mounts = append(p.Mounts, executor.Mount{
 			Readonly: true,
@@ -443,7 +464,7 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 	}
 
 	meta := executor.Meta{
-		Args:                      e.op.Meta.Args,
+		Args:                      args,
 		Env:                       e.op.Meta.Env,
 		Cwd:                       e.op.Meta.Cwd,
 		User:                      e.op.Meta.User,
@@ -451,10 +472,15 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		ReadonlyRootFS:            p.ReadonlyRootFS,
 		ExtraHosts:                extraHosts,
 		Ulimit:                    e.op.Meta.Ulimit,
+		CDIDevices:                e.op.CdiDevices,
 		CgroupParent:              e.op.Meta.CgroupParent,
+		LinuxResources:            e.linuxResources,
 		NetMode:                   e.op.Network,
 		SecurityMode:              e.op.Security,
 		RemoveMountStubsRecursive: e.op.Meta.RemoveMountStubsRecursive,
+	}
+	if e.proxyNetwork {
+		meta.Proxy = &network.ProxyConfig{}
 	}
 
 	if e.op.Meta.ProxyEnv != nil {
@@ -464,13 +490,23 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 	if e.platform != nil {
 		currentOS = e.platform.OS
 	}
-	meta.Env = addDefaultEnvvar(meta.Env, "PATH", utilsystem.DefaultPathEnv(currentOS))
+	// don't set PATH for Windows. #5445
+	if currentOS != "windows" {
+		meta.Env = addDefaultEnvvar(meta.Env, "PATH", utilsystem.DefaultPathEnv(currentOS))
+	}
 
 	secretEnv, err := e.loadSecretEnv(ctx, g)
 	if err != nil {
 		return nil, err
 	}
 	meta.Env = append(meta.Env, secretEnv...)
+
+	if e.op.Meta.ValidExitCodes != nil {
+		meta.ValidExitCodes = make([]int, len(e.op.Meta.ValidExitCodes))
+		for i, code := range e.op.Meta.ValidExitCodes {
+			meta.ValidExitCodes[i] = int(code)
+		}
+	}
 
 	stdout, stderr, flush := logs.NewLogStreams(ctx, os.Getenv("BUILDKIT_DEBUG_EXEC_OUTPUT") == "1")
 	defer stdout.Close()
@@ -481,17 +517,32 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		}
 	}()
 
+	if e.proxyNetwork {
+		e.proxyCap = network.NewProxyCapture()
+		meta.Proxy.Capture = e.proxyCap
+	}
+
 	rec, execErr := e.exec.Run(ctx, "", p.Root, p.Mounts, executor.ProcessInfo{
 		Meta:   meta,
 		Stdin:  nil,
 		Stdout: stdout,
 		Stderr: stderr,
 	}, nil)
+	if e.proxyCap != nil {
+		logProxyRequests(stderr, e.proxyCap.Requests())
+	}
 
 	for i, out := range p.OutputRefs {
 		if mutable, ok := out.Ref.(cache.MutableRef); ok {
 			ref, err := mutable.Commit(ctx)
 			if err != nil {
+				// Release the outputs already committed in earlier
+				// iterations; an internal commit failure is not a
+				// user-facing exec error so they don't belong in
+				// ExecError.Mounts.
+				for _, r := range results {
+					r.Release(context.TODO())
+				}
 				return nil, errors.Wrapf(err, "error committing %s", mutable.ID())
 			}
 			results = append(results, worker.NewWorkerRefResult(ref, e.w))
@@ -502,7 +553,21 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		p.OutputRefs[i].Ref = nil
 	}
 	e.rec = rec
-	return results, errors.Wrapf(execErr, "process %q did not complete successfully", strings.Join(e.op.Meta.Args, " "))
+	return results, errors.Wrapf(execErr, "process %q did not complete successfully", strings.Join(meta.Args, " "))
+}
+
+func logProxyRequests(w io.Writer, requests []network.ProxyRequest) {
+	if len(requests) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintln(w, "proxy network requests:")
+	for _, req := range requests {
+		if req.StatusCode != 0 {
+			_, _ = fmt.Fprintf(w, "- %s %s -> %d\n", req.Method, req.URL, req.StatusCode)
+		} else {
+			_, _ = fmt.Fprintf(w, "- %s %s\n", req.Method, req.URL)
+		}
+	}
 }
 
 func proxyEnvList(p *pb.ProxyEnv) []string {
@@ -554,14 +619,11 @@ func (e *ExecOp) loadSecretEnv(ctx context.Context, g session.Group) ([]string, 
 		err = e.sm.Any(ctx, g, func(ctx context.Context, _ string, caller session.Caller) error {
 			dt, err = secrets.GetSecret(ctx, caller, id)
 			if err != nil {
-				if errors.Is(err, secrets.ErrNotFound) && sopt.Optional {
-					return nil
-				}
 				return err
 			}
 			return nil
 		})
-		if err != nil {
+		if err != nil && (!errors.Is(err, secrets.ErrNotFound) || !sopt.Optional) {
 			return nil, err
 		}
 		out = append(out, fmt.Sprintf("%s=%s", sopt.Name, string(dt)))
@@ -577,4 +639,12 @@ func (e *ExecOp) Samples() (*resourcestypes.Samples, error) {
 		return nil, nil
 	}
 	return e.rec.Samples()
+}
+
+func (e *ExecOp) ProxyCapture() *network.ProxyCapture {
+	return e.proxyCap
+}
+
+func (e *ExecOp) ProxyNetwork() bool {
+	return e.proxyNetwork
 }

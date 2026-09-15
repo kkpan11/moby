@@ -1,9 +1,10 @@
-package tailfile // import "github.com/docker/docker/pkg/tailfile"
+package tailfile
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -130,10 +131,10 @@ truncated line`)
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := TailFile(f, -1); err != ErrNonPositiveLinesNumber {
+	if _, err := TailFile(f, -1); !errors.Is(err, ErrNonPositiveLinesNumber) {
 		t.Fatalf("Expected ErrNonPositiveLinesNumber, got %v", err)
 	}
-	if _, err := TailFile(f, 0); err != ErrNonPositiveLinesNumber {
+	if _, err := TailFile(f, 0); !errors.Is(err, ErrNonPositiveLinesNumber) {
 		t.Fatalf("Expected ErrNonPositiveLinesNumber, got %s", err)
 	}
 }
@@ -145,13 +146,13 @@ func BenchmarkTail(b *testing.B) {
 	}
 	defer f.Close()
 	defer os.RemoveAll(f.Name())
-	for i := 0; i < 10000; i++ {
-		if _, err := f.Write([]byte("tailfile pretty interesting line\n")); err != nil {
+	for range 10000 {
+		if _, err := f.WriteString("tailfile pretty interesting line\n"); err != nil {
 			b.Fatal(err)
 		}
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		if _, err := TailFile(f, 1000); err != nil {
 			b.Fatal(err)
 		}
@@ -184,7 +185,7 @@ func TestNewTailReader(t *testing.T) {
 
 			s8 := `{"log":"Don't panic!\n","stream":"stdout","time":"2018-04-04T20:28:44.7207062Z"}`
 			jsonTest := make([]string, 0, 20)
-			for i := 0; i < 20; i++ {
+			for range 20 {
 				jsonTest = append(jsonTest, s8)
 			}
 
@@ -209,10 +210,7 @@ func TestNewTailReader(t *testing.T) {
 					test := test
 					t.Parallel()
 
-					maxLen := len(test.data)
-					if maxLen > 10 {
-						maxLen = 10
-					}
+					maxLen := min(len(test.data), 10)
 
 					s := strings.Join(test.data, string(delim))
 					if len(test.data) > 0 {
@@ -255,7 +253,7 @@ func TestNewTailReader(t *testing.T) {
 							return
 						}
 						if len(test.data) == 0 {
-							assert.Assert(t, err == ErrNonPositiveLinesNumber, err)
+							assert.Assert(t, errors.Is(err, ErrNonPositiveLinesNumber), err)
 							return
 						}
 
@@ -285,7 +283,7 @@ func TestNewTailReader(t *testing.T) {
 			assert.Check(t, string(data) == "b", string(data))
 
 			_, _, err = rdr.ReadLine()
-			assert.Assert(t, err == io.EOF, err)
+			assert.Assert(t, errors.Is(err, io.EOF), err)
 		})
 	})
 	t.Run("truncated last line", func(t *testing.T) {
@@ -304,7 +302,7 @@ func TestNewTailReader(t *testing.T) {
 			assert.Check(t, string(data) == "b", string(data))
 
 			_, _, err = rdr.ReadLine()
-			assert.Assert(t, err == io.EOF, err)
+			assert.Assert(t, errors.Is(err, io.EOF), err)
 		})
 	})
 
@@ -320,7 +318,7 @@ func TestNewTailReader(t *testing.T) {
 			assert.Check(t, string(data) == "b", string(data))
 
 			_, _, err = rdr.ReadLine()
-			assert.Assert(t, err == io.EOF, err)
+			assert.Assert(t, errors.Is(err, io.EOF), err)
 		})
 	})
 }

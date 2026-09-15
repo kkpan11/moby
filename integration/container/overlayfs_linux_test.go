@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/pkg/archive"
+	"github.com/moby/go-archive"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/container"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/skip"
@@ -19,44 +19,44 @@ func TestNoOverlayfsWarningsAboutUndefinedBehaviors(t *testing.T) {
 	skip.If(t, testEnv.IsRootless(), "root is needed for reading kernel log")
 
 	ctx := setupTest(t)
-	client := testEnv.APIClient()
+	apiClient := testEnv.APIClient()
 
-	cID := container.Run(ctx, t, client, container.WithCmd("sh", "-c", `while true; do echo $RANDOM >>/file; sleep 0.1; done`))
+	cID := container.Run(ctx, t, apiClient, container.WithCmd("sh", "-c", `while true; do echo $RANDOM >>/file; sleep 0.1; done`))
 
-	testCases := []struct {
+	tests := []struct {
 		name      string
 		operation func(t *testing.T) error
 	}{
 		{name: "diff", operation: func(*testing.T) error {
-			_, err := client.ContainerDiff(ctx, cID)
+			_, err := apiClient.ContainerDiff(ctx, cID, client.ContainerDiffOptions{})
 			return err
 		}},
 		{name: "export", operation: func(*testing.T) error {
-			rc, err := client.ContainerExport(ctx, cID)
+			res, err := apiClient.ContainerExport(ctx, cID, client.ContainerExportOptions{})
 			if err == nil {
-				defer rc.Close()
-				_, err = io.Copy(io.Discard, rc)
+				_, err = io.Copy(io.Discard, res)
+				_ = res.Close()
 			}
 			return err
 		}},
 		{name: "cp to container", operation: func(t *testing.T) error {
-			archive, err := archive.Generate("new-file", "hello-world")
+			archiveReader, err := archive.Generate("new-file", "hello-world")
 			assert.NilError(t, err, "failed to create a temporary archive")
-			return client.CopyToContainer(ctx, cID, "/", archive, containertypes.CopyToContainerOptions{})
+			_, err = apiClient.CopyToContainer(ctx, cID, client.CopyToContainerOptions{DestinationPath: "/", Content: archiveReader})
+			return err
 		}},
 		{name: "cp from container", operation: func(*testing.T) error {
-			rc, _, err := client.CopyFromContainer(ctx, cID, "/file")
+			res, err := apiClient.CopyFromContainer(ctx, cID, client.CopyFromContainerOptions{SourcePath: "/file"})
 			if err == nil {
-				defer rc.Close()
-				_, err = io.Copy(io.Discard, rc)
+				_, err = io.Copy(io.Discard, res.Content)
+				_ = res.Content.Close()
 			}
 
 			return err
 		}},
 	}
 
-	for _, tc := range testCases {
-		tc := tc
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			prev := dmesgLines(256)
 

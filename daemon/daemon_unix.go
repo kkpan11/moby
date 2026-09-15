@@ -1,16 +1,18 @@
 //go:build linux || freebsd
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"bufio"
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,36 +20,34 @@ import (
 	"time"
 
 	"github.com/containerd/cgroups/v3"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
-	"github.com/docker/docker/api/types/blkiodev"
-	pblkiodev "github.com/docker/docker/api/types/blkiodev"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/daemon/initlayer"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/internal/nlwrap"
-	"github.com/docker/docker/libcontainerd/remote"
-	"github.com/docker/docker/libnetwork"
-	nwconfig "github.com/docker/docker/libnetwork/config"
-	"github.com/docker/docker/libnetwork/drivers/bridge"
-	"github.com/docker/docker/libnetwork/netlabel"
-	"github.com/docker/docker/libnetwork/options"
-	lntypes "github.com/docker/docker/libnetwork/types"
-	"github.com/docker/docker/opts"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/parsers"
-	"github.com/docker/docker/pkg/parsers/kernel"
-	"github.com/docker/docker/pkg/sysinfo"
-	"github.com/docker/docker/runconfig"
-	volumemounts "github.com/docker/docker/volume/mounts"
+	"github.com/moby/moby/api/types/blkiodev"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/initlayer"
+	"github.com/moby/moby/v2/daemon/internal/otelutil"
+	"github.com/moby/moby/v2/daemon/internal/usergroup"
+	"github.com/moby/moby/v2/daemon/libnetwork"
+	nwconfig "github.com/moby/moby/v2/daemon/libnetwork/config"
+	"github.com/moby/moby/v2/daemon/libnetwork/drivers/bridge"
+	"github.com/moby/moby/v2/daemon/libnetwork/netlabel"
+	"github.com/moby/moby/v2/daemon/libnetwork/nlwrap"
+	lntypes "github.com/moby/moby/v2/daemon/libnetwork/types"
+	"github.com/moby/moby/v2/daemon/pkg/opts"
+	volumemounts "github.com/moby/moby/v2/daemon/volume/mounts"
+	"github.com/moby/moby/v2/errdefs"
+	"github.com/moby/moby/v2/pkg/sysinfo"
 	"github.com/moby/sys/mount"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/moby/sys/user"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/vishvananda/netlink"
+	"go.opentelemetry.io/otel/baggage"
 	"golang.org/x/sys/unix"
 )
 
@@ -104,14 +104,6 @@ func getMemoryResources(config containertypes.Resources) *specs.LinuxMemory {
 		memory.DisableOOMKiller = config.OomKillDisable
 	}
 
-	if config.KernelMemory != 0 { //nolint:staticcheck // ignore SA1019: memory.Kernel is deprecated: kernel-memory limits are not supported in cgroups v2, and were obsoleted in [kernel v5.4]. This field should no longer be used, as it may be ignored by runtimes.
-		memory.Kernel = &config.KernelMemory //nolint:staticcheck // ignore SA1019: memory.Kernel is deprecated: kernel-memory limits are not supported in cgroups v2, and were obsoleted in [kernel v5.4]. This field should no longer be used, as it may be ignored by runtimes.
-	}
-
-	if config.KernelMemoryTCP != 0 {
-		memory.KernelTCP = &config.KernelMemoryTCP
-	}
-
 	if memory != (specs.LinuxMemory{}) {
 		return &memory
 	}
@@ -126,18 +118,19 @@ func getPidsLimit(config containertypes.Resources) *specs.LinuxPids {
 		// docker API allows 0 and negative values to unset this to be consistent
 		// with default values. When updating values, runc requires -1 to unset
 		// the previous limit.
-		return &specs.LinuxPids{Limit: -1}
+		val := int64(-1)
+		return &specs.LinuxPids{Limit: &val}
 	}
-	return &specs.LinuxPids{Limit: *config.PidsLimit}
+	return &specs.LinuxPids{Limit: config.PidsLimit}
 }
 
 func getCPUResources(config containertypes.Resources) (*specs.LinuxCPU, error) {
 	cpu := specs.LinuxCPU{}
 
-	if config.CPUShares < 0 {
-		return nil, fmt.Errorf("shares: invalid argument")
-	}
-	if config.CPUShares > 0 {
+	if config.CPUShares != 0 {
+		if config.CPUShares < 0 {
+			return nil, fmt.Errorf("invalid CPU shares (%d): value must be a positive integer", config.CPUShares)
+		}
 		shares := uint64(config.CPUShares)
 		cpu.Shares = &shares
 	}
@@ -219,6 +212,11 @@ func parseSecurityOpt(securityOptions *container.SecurityOptions, config *contai
 			securityOptions.NoNewPrivileges = true
 			continue
 		}
+		if opt == "writable-cgroups" {
+			trueVal := true
+			securityOptions.WritableCgroups = &trueVal
+			continue
+		}
 		if opt == "disable" {
 			labelOpts = append(labelOpts, "disable")
 			continue
@@ -244,11 +242,17 @@ func parseSecurityOpt(securityOptions *container.SecurityOptions, config *contai
 		case "seccomp":
 			securityOptions.SeccompProfile = v
 		case "no-new-privileges":
-			noNewPrivileges, err := strconv.ParseBool(v)
+			nnp, err := strconv.ParseBool(v)
 			if err != nil {
 				return fmt.Errorf("invalid --security-opt 2: %q", opt)
 			}
-			securityOptions.NoNewPrivileges = noNewPrivileges
+			securityOptions.NoNewPrivileges = nnp
+		case "writable-cgroups":
+			writableCgroups, err := strconv.ParseBool(v)
+			if err != nil {
+				return fmt.Errorf("invalid --security-opt 2: %q", opt)
+			}
+			securityOptions.WritableCgroups = &writableCgroups
 		default:
 			return fmt.Errorf("invalid --security-opt 2: %q", opt)
 		}
@@ -398,12 +402,12 @@ func adaptSharedNamespaceContainer(daemon containerGetter, hostConfig *container
 }
 
 // verifyPlatformContainerResources performs platform-specific validation of the container's resource-configuration
-func verifyPlatformContainerResources(resources *containertypes.Resources, sysInfo *sysinfo.SysInfo, update bool) (warnings []string, err error) {
+func verifyPlatformContainerResources(resources *containertypes.Resources, sysInfo *sysinfo.SysInfo, update bool) (warnings []string, _ error) {
 	fixMemorySwappiness(resources)
 
 	// memory subsystem checks and adjustments
 	if resources.Memory != 0 && resources.Memory < linuxMinMemory {
-		return warnings, fmt.Errorf("Minimum memory limit allowed is 6MB")
+		return warnings, errors.New("Minimum memory limit allowed is 6MB")
 	}
 	if resources.Memory > 0 && !sysInfo.MemoryLimit {
 		warnings = append(warnings, "Your kernel does not support memory limit capabilities or the cgroup is not mounted. Limitation discarded.")
@@ -415,10 +419,10 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, sysIn
 		resources.MemorySwap = -1
 	}
 	if resources.Memory > 0 && resources.MemorySwap > 0 && resources.MemorySwap < resources.Memory {
-		return warnings, fmt.Errorf("Minimum memoryswap limit should be larger than memory limit, see usage")
+		return warnings, errors.New("Minimum memoryswap limit should be larger than memory limit, see usage")
 	}
 	if resources.Memory == 0 && resources.MemorySwap > 0 && !update {
-		return warnings, fmt.Errorf("You should always set the Memory limit when using Memoryswap limit, see usage")
+		return warnings, errors.New("You should always set the Memory limit when using Memoryswap limit, see usage")
 	}
 	if resources.MemorySwappiness != nil && !sysInfo.MemorySwappiness {
 		warnings = append(warnings, "Your kernel does not support memory swappiness capabilities or the cgroup is not mounted. Memory swappiness discarded.")
@@ -435,25 +439,10 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, sysIn
 		resources.MemoryReservation = 0
 	}
 	if resources.MemoryReservation > 0 && resources.MemoryReservation < linuxMinMemory {
-		return warnings, fmt.Errorf("Minimum memory reservation allowed is 6MB")
+		return warnings, errors.New("Minimum memory reservation allowed is 6MB")
 	}
 	if resources.Memory > 0 && resources.MemoryReservation > 0 && resources.Memory < resources.MemoryReservation {
-		return warnings, fmt.Errorf("Minimum memory limit can not be less than memory reservation limit, see usage")
-	}
-	if resources.KernelMemory > 0 {
-		// Kernel memory limit is not supported on cgroup v2.
-		// Even on cgroup v1, kernel memory limit (`kmem.limit_in_bytes`) has been deprecated since kernel 5.4.
-		// https://github.com/torvalds/linux/commit/0158115f702b0ba208ab0b5adf44cae99b3ebcc7
-		if !sysInfo.KernelMemory {
-			warnings = append(warnings, "Your kernel does not support kernel memory limit capabilities or the cgroup is not mounted. Limitation discarded.")
-			resources.KernelMemory = 0
-		}
-		if resources.KernelMemory > 0 && resources.KernelMemory < linuxMinMemory {
-			return warnings, fmt.Errorf("Minimum kernel memory limit allowed is 6MB")
-		}
-		if !kernel.CheckKernelVersion(4, 0, 0) {
-			warnings = append(warnings, "You specified a kernel memory limit on a kernel older than 4.0. Kernel memory limits are experimental on older kernels, it won't work as expected and can cause your system to be unstable.")
-		}
+		return warnings, errors.New("Minimum memory limit can not be less than memory reservation limit, see usage")
 	}
 	if resources.OomKillDisable != nil && !sysInfo.OomKillDisable {
 		// only produce warnings if the setting wasn't to *disable* the OOM Kill; no point
@@ -475,13 +464,13 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, sysIn
 
 	// cpu subsystem checks and adjustments
 	if resources.NanoCPUs > 0 && resources.CPUPeriod > 0 {
-		return warnings, fmt.Errorf("Conflicting options: Nano CPUs and CPU Period cannot both be set")
+		return warnings, errors.New("Conflicting options: Nano CPUs and CPU Period cannot both be set")
 	}
 	if resources.NanoCPUs > 0 && resources.CPUQuota > 0 {
-		return warnings, fmt.Errorf("Conflicting options: Nano CPUs and CPU Quota cannot both be set")
+		return warnings, errors.New("Conflicting options: Nano CPUs and CPU Quota cannot both be set")
 	}
 	if resources.NanoCPUs > 0 && !sysInfo.CPUCfs {
-		return warnings, fmt.Errorf("NanoCPUs can not be set, as your kernel does not support CPU CFS scheduler or the cgroup is not mounted")
+		return warnings, errors.New("NanoCPUs can not be set, as your kernel does not support CPU CFS scheduler or the cgroup is not mounted")
 	}
 	// The highest precision we could get on Linux is 0.001, by setting
 	//   cpu.cfs_period_us=1000ms
@@ -490,8 +479,11 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, sysIn
 	// https://www.kernel.org/doc/Documentation/scheduler/sched-bwc.txt
 	// Here we don't set the lower limit and it is up to the underlying platform (e.g., Linux) to return an error.
 	// The error message is 0.01 so that this is consistent with Windows
-	if resources.NanoCPUs < 0 || resources.NanoCPUs > int64(sysinfo.NumCPU())*1e9 {
-		return warnings, fmt.Errorf("Range of CPUs is from 0.01 to %d.00, as there are only %d CPUs available", sysinfo.NumCPU(), sysinfo.NumCPU())
+	if resources.NanoCPUs != 0 {
+		nc := runtime.NumCPU()
+		if resources.NanoCPUs < 0 || resources.NanoCPUs > int64(nc)*1e9 {
+			return warnings, fmt.Errorf("range of CPUs is from 0.01 to %[1]d.00, as there are only %[1]d CPUs available", nc)
+		}
 	}
 
 	if resources.CPUShares > 0 && !sysInfo.CPUShares {
@@ -504,13 +496,13 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, sysIn
 		resources.CPUQuota = 0
 	}
 	if resources.CPUPeriod != 0 && (resources.CPUPeriod < 1000 || resources.CPUPeriod > 1000000) {
-		return warnings, fmt.Errorf("CPU cfs period can not be less than 1ms (i.e. 1000) or larger than 1s (i.e. 1000000)")
+		return warnings, errors.New("CPU cfs period can not be less than 1ms (i.e. 1000) or larger than 1s (i.e. 1000000)")
 	}
 	if resources.CPUQuota > 0 && resources.CPUQuota < 1000 {
-		return warnings, fmt.Errorf("CPU cfs quota can not be less than 1ms (i.e. 1000)")
+		return warnings, errors.New("CPU cfs quota can not be less than 1ms (i.e. 1000)")
 	}
 	if resources.CPUPercent > 0 {
-		warnings = append(warnings, fmt.Sprintf("%s does not support CPU percent. Percent discarded.", runtime.GOOS))
+		warnings = append(warnings, runtime.GOOS+" does not support CPU percent. Percent discarded.")
 		resources.CPUPercent = 0
 	}
 
@@ -541,30 +533,30 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, sysIn
 		resources.BlkioWeight = 0
 	}
 	if resources.BlkioWeight > 0 && (resources.BlkioWeight < 10 || resources.BlkioWeight > 1000) {
-		return warnings, fmt.Errorf("Range of blkio weight is from 10 to 1000")
+		return warnings, errors.New("Range of blkio weight is from 10 to 1000")
 	}
 	if resources.IOMaximumBandwidth != 0 || resources.IOMaximumIOps != 0 {
 		return warnings, fmt.Errorf("Invalid QoS settings: %s does not support Maximum IO Bandwidth or Maximum IO IOps", runtime.GOOS)
 	}
 	if len(resources.BlkioWeightDevice) > 0 && !sysInfo.BlkioWeightDevice {
 		warnings = append(warnings, "Your kernel does not support Block I/O weight_device or the cgroup is not mounted. Weight-device discarded.")
-		resources.BlkioWeightDevice = []*pblkiodev.WeightDevice{}
+		resources.BlkioWeightDevice = []*blkiodev.WeightDevice{}
 	}
 	if len(resources.BlkioDeviceReadBps) > 0 && !sysInfo.BlkioReadBpsDevice {
 		warnings = append(warnings, "Your kernel does not support BPS Block I/O read limit or the cgroup is not mounted. Block I/O BPS read limit discarded.")
-		resources.BlkioDeviceReadBps = []*pblkiodev.ThrottleDevice{}
+		resources.BlkioDeviceReadBps = []*blkiodev.ThrottleDevice{}
 	}
 	if len(resources.BlkioDeviceWriteBps) > 0 && !sysInfo.BlkioWriteBpsDevice {
 		warnings = append(warnings, "Your kernel does not support BPS Block I/O write limit or the cgroup is not mounted. Block I/O BPS write limit discarded.")
-		resources.BlkioDeviceWriteBps = []*pblkiodev.ThrottleDevice{}
+		resources.BlkioDeviceWriteBps = []*blkiodev.ThrottleDevice{}
 	}
 	if len(resources.BlkioDeviceReadIOps) > 0 && !sysInfo.BlkioReadIOpsDevice {
 		warnings = append(warnings, "Your kernel does not support IOPS Block read limit or the cgroup is not mounted. Block I/O IOPS read limit discarded.")
-		resources.BlkioDeviceReadIOps = []*pblkiodev.ThrottleDevice{}
+		resources.BlkioDeviceReadIOps = []*blkiodev.ThrottleDevice{}
 	}
 	if len(resources.BlkioDeviceWriteIOps) > 0 && !sysInfo.BlkioWriteIOpsDevice {
 		warnings = append(warnings, "Your kernel does not support IOPS Block write limit or the cgroup is not mounted. Block I/O IOPS write limit discarded.")
-		resources.BlkioDeviceWriteIOps = []*pblkiodev.ThrottleDevice{}
+		resources.BlkioDeviceWriteIOps = []*blkiodev.ThrottleDevice{}
 	}
 
 	return warnings, nil
@@ -580,33 +572,25 @@ func cgroupDriver(cfg *config.Config) string {
 	return cgroupFsDriver
 }
 
-// getCD gets the raw value of the native.cgroupdriver option, if set.
-func getCD(config *config.Config) string {
-	for _, option := range config.ExecOptions {
-		key, val, err := parsers.ParseKeyValueOpt(option)
-		if err != nil || !strings.EqualFold(key, "native.cgroupdriver") {
-			continue
-		}
-		return val
-	}
-	return ""
-}
-
 // verifyCgroupDriver validates native.cgroupdriver
 func verifyCgroupDriver(config *config.Config) error {
-	cd := getCD(config)
-	if cd == "" || cd == cgroupFsDriver || cd == cgroupSystemdDriver {
+	cd, _, err := config.GetExecOpt("native.cgroupdriver")
+	if err != nil {
+		return err
+	}
+	switch cd {
+	case "", cgroupFsDriver, cgroupSystemdDriver:
 		return nil
-	}
-	if cd == cgroupNoneDriver {
+	case cgroupNoneDriver:
 		return fmt.Errorf("native.cgroupdriver option %s is internally used and cannot be specified manually", cd)
+	default:
+		return fmt.Errorf("native.cgroupdriver option %s not supported", cd)
 	}
-	return fmt.Errorf("native.cgroupdriver option %s not supported", cd)
 }
 
 // UsingSystemd returns true if cli option includes native.cgroupdriver=systemd
 func UsingSystemd(config *config.Config) bool {
-	cd := getCD(config)
+	cd, _, _ := config.GetExecOpt("native.cgroupdriver")
 
 	if cd == cgroupSystemdDriver {
 		return true
@@ -641,13 +625,24 @@ func isRunningSystemd() bool {
 	return runningSystemd
 }
 
+// maxHostnameLen is the maximum length (in bytes) of a container hostname on
+// Linux, as defined by HOST_NAME_MAX (include/uapi/linux/limits.h).
+const maxHostnameLen = 64
+
 // verifyPlatformContainerSettings performs platform-specific validation of the
 // hostconfig and config structures.
-func verifyPlatformContainerSettings(daemon *Daemon, daemonCfg *configStore, hostConfig *containertypes.HostConfig, update bool) (warnings []string, err error) {
+func verifyPlatformContainerSettings(daemon *Daemon, daemonCfg *configStore, hostConfig *containertypes.HostConfig, config *containertypes.Config, update bool) (warnings []string, _ error) {
+	if runtime.GOOS == "linux" && config != nil && len(config.Hostname) > maxHostnameLen {
+		return warnings, errors.Errorf("hostname %q is too long (maximum %d bytes)", config.Hostname, maxHostnameLen)
+	}
+
 	if hostConfig == nil {
 		return nil, nil
 	}
-	sysInfo := daemon.RawSysInfo()
+	sysInfo, err := daemon.RawSysInfo()
+	if err != nil {
+		return nil, err
+	}
 
 	w, err := verifyPlatformContainerResources(&hostConfig.Resources, sysInfo, update)
 
@@ -665,7 +660,7 @@ func verifyPlatformContainerSettings(daemon *Daemon, daemonCfg *configStore, hos
 		return warnings, errors.Errorf("invalid PID mode: %v", hostConfig.PidMode)
 	}
 	if hostConfig.ShmSize < 0 {
-		return warnings, fmt.Errorf("SHM size can not be less than 0")
+		return warnings, errors.New("SHM size can not be less than 0")
 	}
 	if !hostConfig.UTSMode.Valid() {
 		return warnings, errors.Errorf("invalid UTS mode: %v", hostConfig.UTSMode)
@@ -676,7 +671,7 @@ func verifyPlatformContainerSettings(daemon *Daemon, daemonCfg *configStore, hos
 	}
 
 	// ip-forwarding does not affect container with '--net=host' (or '--net=none')
-	if sysInfo.IPv4ForwardingDisabled && !(hostConfig.NetworkMode.IsHost() || hostConfig.NetworkMode.IsNone()) {
+	if sysInfo.IPv4ForwardingDisabled && (!hostConfig.NetworkMode.IsHost() && !hostConfig.NetworkMode.IsNone()) {
 		warnings = append(warnings, "IPv4 forwarding is disabled. Networking will not work.")
 	}
 	if hostConfig.NetworkMode.IsHost() && len(hostConfig.PortBindings) > 0 {
@@ -686,19 +681,19 @@ func verifyPlatformContainerSettings(daemon *Daemon, daemonCfg *configStore, hos
 	// check for various conflicting options with user namespaces
 	if daemonCfg.RemappedRoot != "" && hostConfig.UsernsMode.IsPrivate() {
 		if hostConfig.Privileged {
-			return warnings, fmt.Errorf("privileged mode is incompatible with user namespaces.  You must run the container in the host namespace when running privileged mode")
+			return warnings, errors.New("privileged mode is incompatible with user namespaces.  You must run the container in the host namespace when running privileged mode")
 		}
 		if hostConfig.NetworkMode.IsHost() && !hostConfig.UsernsMode.IsHost() {
-			return warnings, fmt.Errorf("cannot share the host's network namespace when user namespaces are enabled")
+			return warnings, errors.New("cannot share the host's network namespace when user namespaces are enabled")
 		}
 		if hostConfig.PidMode.IsHost() && !hostConfig.UsernsMode.IsHost() {
-			return warnings, fmt.Errorf("cannot share the host PID namespace when user namespaces are enabled")
+			return warnings, errors.New("cannot share the host PID namespace when user namespaces are enabled")
 		}
 	}
 	if hostConfig.CgroupParent != "" && UsingSystemd(&daemonCfg.Config) {
 		// CgroupParent for systemd cgroup should be named as "xxx.slice"
 		if len(hostConfig.CgroupParent) <= 6 || !strings.HasSuffix(hostConfig.CgroupParent, ".slice") {
-			return warnings, fmt.Errorf(`cgroup-parent for systemd cgroup should be a valid slice named as "xxx.slice"`)
+			return warnings, errors.New(`cgroup-parent for systemd cgroup should be a valid slice named as "xxx.slice"`)
 		}
 	}
 	if hostConfig.Runtime == "" {
@@ -735,14 +730,17 @@ func verifyDaemonSettings(conf *config.Config) error {
 	}
 	// Check for mutually incompatible config options
 	if conf.BridgeConfig.Iface != "" && conf.BridgeConfig.IP != "" {
-		return fmt.Errorf("You specified -b & --bip, mutually exclusive options. Please specify only one")
+		return errors.New("You specified -b & --bip, mutually exclusive options. Please specify only one")
+	}
+	if conf.BridgeConfig.Iface != "" && conf.BridgeConfig.IP6 != "" {
+		return errors.New("You specified -b & --bip6, mutually exclusive options. Please specify only one")
 	}
 	if !conf.BridgeConfig.InterContainerCommunication {
 		if !conf.BridgeConfig.EnableIPTables {
-			return fmt.Errorf("You specified --iptables=false with --icc=false. ICC=false uses iptables to function. Please set --icc or --iptables to true")
+			return errors.New("You specified --iptables=false with --icc=false. ICC=false uses iptables to function. Please set --icc or --iptables to true")
 		}
 		if conf.BridgeConfig.EnableIPv6 && !conf.BridgeConfig.EnableIP6Tables {
-			return fmt.Errorf("You specified --ip6tables=false with --icc=false. ICC=false uses ip6tables to function. Please set --icc or --ip6tables to true")
+			return errors.New("You specified --ip6tables=false with --icc=false. ICC=false uses ip6tables to function. Please set --icc or --ip6tables to true")
 		}
 	}
 	if !conf.BridgeConfig.EnableIPTables && conf.BridgeConfig.EnableIPMasq {
@@ -753,12 +751,12 @@ func verifyDaemonSettings(conf *config.Config) error {
 	}
 	if conf.CgroupParent != "" && UsingSystemd(conf) {
 		if len(conf.CgroupParent) <= 6 || !strings.HasSuffix(conf.CgroupParent, ".slice") {
-			return fmt.Errorf(`cgroup-parent for systemd cgroup should be a valid slice named as "xxx.slice"`)
+			return errors.New(`cgroup-parent for systemd cgroup should be a valid slice named as "xxx.slice"`)
 		}
 	}
 
 	if conf.Rootless && UsingSystemd(conf) && cgroups.Mode() != cgroups.Unified {
-		return fmt.Errorf("exec-opt native.cgroupdriver=systemd requires cgroup v2 for rootless mode")
+		return errors.New("exec-opt native.cgroupdriver=systemd requires cgroup v2 for rootless mode")
 	}
 	return nil
 }
@@ -770,7 +768,7 @@ func checkSystem() error {
 
 // configureMaxThreads sets the Go runtime max threads threshold
 // which is 90% of the kernel setting from /proc/sys/kernel/threads-max
-func configureMaxThreads(config *config.Config) error {
+func configureMaxThreads(ctx context.Context) error {
 	mt, err := os.ReadFile("/proc/sys/kernel/threads-max")
 	if err != nil {
 		return err
@@ -781,7 +779,7 @@ func configureMaxThreads(config *config.Config) error {
 	}
 	maxThreads := (mtint / 100) * 90
 	debug.SetMaxThreads(maxThreads)
-	log.G(context.TODO()).Debugf("Golang's threads limit set to %d", maxThreads)
+	log.G(ctx).Debugf("Golang's threads limit set to %d", maxThreads)
 	return nil
 }
 
@@ -834,20 +832,25 @@ func configureKernelSecuritySupport(config *config.Config, driverName string) er
 // initNetworkController initializes the libnetwork controller and configures
 // network settings. If there's active sandboxes, configuration changes will not
 // take effect.
-func (daemon *Daemon) initNetworkController(cfg *config.Config, activeSandboxes map[string]interface{}) error {
+func (daemon *Daemon) initNetworkController(cfg *config.Config, activeSandboxes map[string]any) error {
 	netOptions, err := daemon.networkOptions(cfg, daemon.PluginStore, daemon.id, activeSandboxes)
 	if err != nil {
 		return err
 	}
 
-	daemon.netController, err = libnetwork.New(netOptions...)
+	ctx := baggage.ContextWithBaggage(context.TODO(), otelutil.MustNewBaggage(
+		otelutil.MustNewMemberRaw(otelutil.TriggerKey, "daemon.initNetworkController"),
+	))
+	daemon.netController, err = libnetwork.New(ctx, netOptions...)
 	if err != nil {
 		return fmt.Errorf("error obtaining controller instance: %v", err)
 	}
 
 	if len(activeSandboxes) > 0 {
-		log.G(context.TODO()).Info("there are running containers, updated network configuration will not take affect")
-	} else if err := configureNetworking(daemon.netController, cfg); err != nil {
+		log.G(ctx).Info("there are running containers, updated network configuration will not take affect")
+	} else if err := daemon.runInNetNS(func() error {
+		return configureNetworking(ctx, daemon.netController, cfg)
+	}); err != nil {
 		return err
 	}
 
@@ -856,17 +859,17 @@ func (daemon *Daemon) initNetworkController(cfg *config.Config, activeSandboxes 
 	return nil
 }
 
-func configureNetworking(controller *libnetwork.Controller, conf *config.Config) error {
+func configureNetworking(ctx context.Context, controller *libnetwork.Controller, conf *config.Config) error {
 	// Create predefined network "none"
 	if n, _ := controller.NetworkByName(network.NetworkNone); n == nil {
-		if _, err := controller.NewNetwork("null", network.NetworkNone, "", libnetwork.NetworkOptionPersist(true)); err != nil {
+		if _, err := controller.NewNetwork(ctx, "null", network.NetworkNone, "", libnetwork.NetworkOptionPersist(true)); err != nil {
 			return errors.Wrapf(err, `error creating default %q network`, network.NetworkNone)
 		}
 	}
 
 	// Create predefined network "host"
 	if n, _ := controller.NetworkByName(network.NetworkHost); n == nil {
-		if _, err := controller.NewNetwork("host", network.NetworkHost, "", libnetwork.NetworkOptionPersist(true)); err != nil {
+		if _, err := controller.NewNetwork(ctx, "host", network.NetworkHost, "", libnetwork.NetworkOptionPersist(true)); err != nil {
 			return errors.Wrapf(err, `error creating default %q network`, network.NetworkHost)
 		}
 	}
@@ -883,7 +886,7 @@ func configureNetworking(controller *libnetwork.Controller, conf *config.Config)
 
 	if !conf.DisableBridge {
 		// Initialize default driver "bridge"
-		if err := initBridgeDriver(controller, conf.BridgeConfig); err != nil {
+		if err := initBridgeDriver(ctx, controller, conf.BridgeConfig); err != nil {
 			return err
 		}
 	} else {
@@ -895,37 +898,90 @@ func configureNetworking(controller *libnetwork.Controller, conf *config.Config)
 
 // setHostGatewayIP sets cfg.HostGatewayIP to the default bridge's IP if it is empty.
 func setHostGatewayIP(controller *libnetwork.Controller, config *config.Config) {
-	if config.HostGatewayIP != nil {
+	if len(config.HostGatewayIPs) > 0 {
 		return
 	}
 	if n, err := controller.NetworkByName(network.NetworkBridge); err == nil {
 		v4Info, v6Info := n.IpamInfo()
 		if len(v4Info) > 0 {
-			config.HostGatewayIP = v4Info[0].Gateway.IP
-		} else if len(v6Info) > 0 {
-			config.HostGatewayIP = v6Info[0].Gateway.IP
+			addr, _ := netip.AddrFromSlice(v4Info[0].Gateway.IP)
+			config.HostGatewayIPs = append(config.HostGatewayIPs, addr.Unmap())
+		}
+		if len(v6Info) > 0 {
+			addr, _ := netip.AddrFromSlice(v6Info[0].Gateway.IP)
+			config.HostGatewayIPs = append(config.HostGatewayIPs, addr)
 		}
 	}
 }
 
-func driverOptions(config *config.Config) nwconfig.Option {
-	return nwconfig.OptionDriverConfig("bridge", options.Generic{
-		netlabel.GenericData: options.Generic{
-			"EnableIPForwarding":  config.BridgeConfig.EnableIPForward,
-			"EnableIPTables":      config.BridgeConfig.EnableIPTables,
-			"EnableIP6Tables":     config.BridgeConfig.EnableIP6Tables,
-			"EnableUserlandProxy": config.BridgeConfig.EnableUserlandProxy,
-			"UserlandProxyPath":   config.BridgeConfig.UserlandProxyPath,
-			"Rootless":            config.Rootless,
-		},
-	})
+// networkPlatformOptions returns a slice of platform-specific libnetwork
+// options.
+func networkPlatformOptions(conf *config.Config) []nwconfig.Option {
+	return []nwconfig.Option{
+		nwconfig.OptionRootless(conf.Rootless),
+		nwconfig.OptionUserlandProxy(conf.EnableUserlandProxy, conf.UserlandProxyPath),
+		nwconfig.OptionBridgeConfig(bridge.Configuration{
+			EnableIPForwarding:       conf.BridgeConfig.EnableIPForward,
+			DisableFilterForwardDrop: conf.BridgeConfig.DisableFilterForwardDrop,
+			EnableIPTables:           conf.BridgeConfig.EnableIPTables,
+			EnableIP6Tables:          conf.BridgeConfig.EnableIP6Tables,
+			EnableProxy:              conf.EnableUserlandProxy && conf.UserlandProxyPath != "",
+			ProxyPath:                conf.UserlandProxyPath,
+			AllowDirectRouting:       conf.BridgeConfig.AllowDirectRouting,
+			AcceptFwMark:             conf.BridgeConfig.BridgeAcceptFwMark,
+		}),
+	}
 }
 
-func initBridgeDriver(controller *libnetwork.Controller, cfg config.BridgeConfig) error {
-	bridgeName := bridge.DefaultBridgeName
-	if cfg.Iface != "" {
-		bridgeName = cfg.Iface
-	}
+type defBrOptsV4 struct {
+	cfg config.BridgeConfig
+}
+
+func (o defBrOptsV4) nlFamily() int {
+	return netlink.FAMILY_V4
+}
+
+func (o defBrOptsV4) fixedCIDR() (fCIDR, optName string) {
+	return o.cfg.FixedCIDR, "fixed-cidr"
+}
+
+func (o defBrOptsV4) bip() (bip, optName string) {
+	return o.cfg.IP, "bip"
+}
+
+func (o defBrOptsV4) defGw() (gw net.IP, optName, auxAddrLabel string) {
+	return o.cfg.DefaultGatewayIPv4, "default-gateway", bridge.DefaultGatewayV4AuxKey
+}
+
+type defBrOptsV6 struct {
+	cfg config.BridgeConfig
+}
+
+func (o defBrOptsV6) nlFamily() int {
+	return netlink.FAMILY_V6
+}
+
+func (o defBrOptsV6) fixedCIDR() (fCIDR, optName string) {
+	return o.cfg.FixedCIDRv6, "fixed-cidr-v6"
+}
+
+func (o defBrOptsV6) bip() (bip, optName string) {
+	return o.cfg.IP6, "bip6"
+}
+
+func (o defBrOptsV6) defGw() (gw net.IP, optName, auxAddrLabel string) {
+	return o.cfg.DefaultGatewayIPv6, "default-gateway-v6", bridge.DefaultGatewayV6AuxKey
+}
+
+type defBrOpts interface {
+	nlFamily() int
+	fixedCIDR() (fCIDR, optName string)
+	bip() (bip, optName string)
+	defGw() (gw net.IP, optName, auxAddrLabel string)
+}
+
+func initBridgeDriver(ctx context.Context, controller *libnetwork.Controller, cfg config.BridgeConfig) error {
+	bridgeName, userManagedBridge := getDefaultBridgeName(cfg)
 	netOption := map[string]string{
 		bridge.BridgeName:         bridgeName,
 		bridge.DefaultBridge:      strconv.FormatBool(true),
@@ -933,135 +989,256 @@ func initBridgeDriver(controller *libnetwork.Controller, cfg config.BridgeConfig
 		bridge.EnableIPMasquerade: strconv.FormatBool(cfg.EnableIPMasq),
 		bridge.EnableICC:          strconv.FormatBool(cfg.InterContainerCommunication),
 	}
-
 	// --ip processing
 	if cfg.DefaultIP != nil {
 		netOption[bridge.DefaultBindingIP] = cfg.DefaultIP.String()
 	}
 
-	ipamV4Conf := &libnetwork.IpamConf{AuxAddresses: make(map[string]string)}
-
-	// By default, libnetwork will request an arbitrary available address
-	// pool for the network from the configured IPAM allocator.
-	// Configure it to use the IPv4 network ranges of the existing bridge
-	// interface if one exists with IPv4 addresses assigned to it.
-
-	nwList, nw6List, err := ifaceAddrs(bridgeName)
+	ipamV4Conf, err := getDefaultBridgeIPAMConf(bridgeName, userManagedBridge, defBrOptsV4{cfg})
 	if err != nil {
-		return errors.Wrap(err, "list bridge addresses failed")
+		return err
 	}
 
-	if len(nwList) > 0 {
-		nw := nwList[0]
-		if len(nwList) > 1 && cfg.FixedCIDR != "" {
-			_, fCIDR, err := net.ParseCIDR(cfg.FixedCIDR)
-			if err != nil {
-				return errors.Wrap(err, "parse CIDR failed")
-			}
-			// Iterate through in case there are multiple addresses for the bridge
-			for _, entry := range nwList {
-				if fCIDR.Contains(entry.IP) {
-					nw = entry
-					break
-				}
-			}
-		}
-
-		ipamV4Conf.PreferredPool = lntypes.GetIPNetCanonical(nw).String()
-		hip, _ := lntypes.GetHostPartIP(nw.IP, nw.Mask)
-		if hip.IsGlobalUnicast() {
-			ipamV4Conf.Gateway = nw.IP.String()
-		}
-	}
-
-	if cfg.IP != "" {
-		ip, ipNet, err := net.ParseCIDR(cfg.IP)
+	var ipamV6Conf []*libnetwork.IpamConf
+	if cfg.EnableIPv6 {
+		ipamV6Conf, err = getDefaultBridgeIPAMConf(bridgeName, userManagedBridge, defBrOptsV6{cfg})
 		if err != nil {
 			return err
 		}
-		ipamV4Conf.PreferredPool = ipNet.String()
-		ipamV4Conf.Gateway = ip.String()
-	} else if bridgeName == bridge.DefaultBridgeName && ipamV4Conf.PreferredPool != "" {
-		log.G(context.TODO()).Infof("Default bridge (%s) is assigned with an IP address %s. Daemon option --bip can be used to set a preferred IP address", bridgeName, ipamV4Conf.PreferredPool)
 	}
 
-	if cfg.FixedCIDR != "" {
-		_, fCIDR, err := net.ParseCIDR(cfg.FixedCIDR)
-		if err != nil {
-			return err
-		}
-
-		ipamV4Conf.SubPool = fCIDR.String()
-		if ipamV4Conf.PreferredPool == "" {
-			ipamV4Conf.PreferredPool = fCIDR.String()
-		}
-	}
-
-	if cfg.DefaultGatewayIPv4 != nil {
-		ipamV4Conf.AuxAddresses["DefaultGatewayIPv4"] = cfg.DefaultGatewayIPv4.String()
-	}
-
-	var (
-		deferIPv6Alloc bool
-		ipamV6Conf     *libnetwork.IpamConf
-	)
-
-	if cfg.EnableIPv6 && cfg.FixedCIDRv6 == "" {
-		return errdefs.InvalidParameter(errors.New("IPv6 is enabled for the default bridge, but no subnet is configured. Specify an IPv6 subnet using --fixed-cidr-v6"))
-	} else if cfg.FixedCIDRv6 != "" {
-		_, fCIDRv6, err := net.ParseCIDR(cfg.FixedCIDRv6)
-		if err != nil {
-			return err
-		}
-
-		// In case user has specified the daemon flag --fixed-cidr-v6 and the passed network has
-		// at least 48 host bits, we need to guarantee the current behavior where the containers'
-		// IPv6 addresses will be constructed based on the containers' interface MAC address.
-		// We do so by telling libnetwork to defer the IPv6 address allocation for the endpoints
-		// on this network until after the driver has created the endpoint and returned the
-		// constructed address. Libnetwork will then reserve this address with the ipam driver.
-		ones, _ := fCIDRv6.Mask.Size()
-		deferIPv6Alloc = ones <= 80
-
-		ipamV6Conf = &libnetwork.IpamConf{
-			AuxAddresses:  make(map[string]string),
-			PreferredPool: fCIDRv6.String(),
-		}
-
-		// In case the --fixed-cidr-v6 is specified and the current docker0 bridge IPv6
-		// address belongs to the same network, we need to inform libnetwork about it, so
-		// that it can be reserved with IPAM and it will not be given away to somebody else
-		for _, nw6 := range nw6List {
-			if fCIDRv6.Contains(nw6.IP) {
-				ipamV6Conf.Gateway = nw6.IP.String()
-				break
-			}
-		}
-	}
-
-	if cfg.DefaultGatewayIPv6 != nil {
-		if ipamV6Conf == nil {
-			ipamV6Conf = &libnetwork.IpamConf{AuxAddresses: make(map[string]string)}
-		}
-		ipamV6Conf.AuxAddresses["DefaultGatewayIPv6"] = cfg.DefaultGatewayIPv6.String()
-	}
-
-	v4Conf := []*libnetwork.IpamConf{ipamV4Conf}
-	v6Conf := []*libnetwork.IpamConf{}
-	if ipamV6Conf != nil {
-		v6Conf = append(v6Conf, ipamV6Conf)
-	}
 	// Initialize default network on "bridge" with the same name
-	_, err = controller.NewNetwork("bridge", network.NetworkBridge, "",
+	_, err = controller.NewNetwork(ctx, "bridge", network.NetworkBridge, "",
 		libnetwork.NetworkOptionEnableIPv4(true),
 		libnetwork.NetworkOptionEnableIPv6(cfg.EnableIPv6),
 		libnetwork.NetworkOptionDriverOpts(netOption),
-		libnetwork.NetworkOptionIpam("default", "", v4Conf, v6Conf, nil),
-		libnetwork.NetworkOptionDeferIPv6Alloc(deferIPv6Alloc))
+		libnetwork.NetworkOptionIpam("default", "", ipamV4Conf, ipamV6Conf, nil),
+	)
 	if err != nil {
 		return fmt.Errorf(`error creating default %q network: %v`, network.NetworkBridge, err)
 	}
 	return nil
+}
+
+func getDefaultBridgeName(cfg config.BridgeConfig) (bridgeName string, userManagedBridge bool) {
+	// cfg.Iface is --bridge, the option to supply a user-managed bridge.
+	if cfg.Iface != "" {
+		// The default network will use a user-managed bridge, the daemon will not
+		// create it, and it is not possible to supply an address using --bip.
+		return cfg.Iface, true
+	}
+	return bridge.DefaultBridgeName, false
+}
+
+// getDefaultBridgeIPAMConf works out IPAM configuration for the
+// default bridge, for the given address family (netlink.FAMILY_V4 or
+// netlink.FAMILY_V6).
+//
+// Inputs are:
+// - bip
+//   - CIDR, not a plain IP address.
+//   - docker-managed bridge only (docker0), not allowed with a user-managed
+//     bridge (--bridge) where the user is responsible for creating the bridge
+//     and configuring its addresses.
+//   - determines the network subnet (ipamConf.PreferredPool) and becomes the
+//     bridge/gateway address (ipamConf.Gateway).
+//
+// - existing bridge addresses
+//   - for a user-managed bridge
+//   - an address is selected from the bridge to perform the same role as
+//     bip for a daemon-managed bridge.
+//   - for docker0
+//   - if there's an address on the bridge that's compatible with the other
+//     options, it's used as the gateway address and - because it's always
+//     worked this way, to determine the subnet if it's bigger than the
+//     sub-pool configured through fixed-cidr[-v6]. For example, if the
+//     bridge has address 10.11.12.13/16 and fixed-cidr=10.11.22.0/24, the
+//     default bridge network's subnet is 10.11.0.0/16, sub-pool for
+//     automatic address allocation 10.11.22.0/24, gateway 10.11.12.13.
+//
+// - fixed-cidr/fixed-cidr-v6
+//   - ipamConf.SubPool, the pool for automatic address allocation (somewhat
+//     equivalent to --ip-range for a user-defined network), must be contained
+//     within the subnet. Used as ipamConf.PreferredPool if it's not given a
+//     value by other rules.
+//
+// So, for example, with this config (taken from docs):
+//
+//	"bip": "192.168.1.1/24",
+//	"fixed-cidr": "192.168.1.0/25",
+//
+// - the bridge's address is "192.168.1.1/24"
+// - the subnet is "192.168.1.0/24"
+// - the bridge driver can allocate addresses from "192.168.1.0/25"
+//
+// The result is the same if "bip" is unset (including for a user-managed
+// bridge), when the bridge already has address "192.168.1.1/24".
+//
+// Note that this function logs-then-ignores invalid configuration, because it
+// has to tolerate existing configuration - raising an error prevents daemon
+// startup. Earlier versions of the daemon didn't spot bad config, but generally
+// did something unsurprising with it.
+func getDefaultBridgeIPAMConf(
+	bridgeName string,
+	userManagedBridge bool,
+	opts defBrOpts,
+) ([]*libnetwork.IpamConf, error) {
+	var (
+		fCidrIP, bIP       net.IP
+		fCidrIPNet, bIPNet *net.IPNet
+		err                error
+	)
+
+	if fixedCIDR, fixedCIDROpt := opts.fixedCIDR(); fixedCIDR != "" {
+		if fCidrIP, fCidrIPNet, err = net.ParseCIDR(fixedCIDR); err != nil {
+			return nil, errors.Wrap(err, "parse "+fixedCIDROpt+" failed")
+		}
+	}
+
+	if cfgBIP, cfgBIPOpt := opts.bip(); cfgBIP != "" {
+		if bIP, bIPNet, err = net.ParseCIDR(cfgBIP); err != nil {
+			return nil, errors.Wrap(err, "parse "+cfgBIPOpt+" failed")
+		}
+	} else {
+		if bIP, bIPNet, err = selectBIP(userManagedBridge, bridgeName, opts.nlFamily(), fCidrIP, fCidrIPNet); err != nil {
+			return nil, err
+		}
+	}
+
+	ipamConf := &libnetwork.IpamConf{AuxAddresses: make(map[string]string)}
+	if bIP != nil {
+		ipamConf.PreferredPool = bIPNet.String()
+		ipamConf.Gateway = bIP.String()
+	} else if !userManagedBridge && ipamConf.PreferredPool != "" {
+		_, bipOptName := opts.bip()
+		log.G(context.TODO()).Infof("Default bridge (%s) is assigned with an IP address %s. Daemon option --"+bipOptName+" can be used to set a preferred IP address", bridgeName, ipamConf.PreferredPool)
+	}
+
+	if fCidrIP != nil && fCidrIPNet != nil {
+		ipamConf.SubPool = fCidrIPNet.String()
+		if ipamConf.PreferredPool == "" {
+			ipamConf.PreferredPool = fCidrIPNet.String()
+		} else if userManagedBridge && bIPNet != nil {
+			fCidrOnes, _ := fCidrIPNet.Mask.Size()
+			bIPOnes, _ := bIPNet.Mask.Size()
+			if !bIPNet.Contains(fCidrIP) || (fCidrOnes < bIPOnes) {
+				// Don't allow SubPool (the range of allocatable addresses) to be outside, or
+				// bigger than, the network itself. This is a configuration error, either the
+				// user-managed bridge is missing an address to match fixed-cidr, or fixed-cidr
+				// is wrong.
+				fixedCIDR, fixedCIDROpt := opts.fixedCIDR()
+				if opts.nlFamily() == netlink.FAMILY_V6 {
+					return nil, fmt.Errorf("%s=%s is outside any subnet implied by addresses on the user-managed default bridge",
+						fixedCIDROpt, fixedCIDR)
+				}
+				// For IPv4, just log rather than raise an error that would cause daemon
+				// startup to fail, because this has been allowed by earlier versions. Remove
+				// the SubPool, so that addresses are allocated from the whole of PreferredPool.
+				log.G(context.TODO()).WithFields(log.Fields{
+					"bridge":         bridgeName,
+					fixedCIDROpt:     fixedCIDR,
+					"bridge-network": bIPNet.String(),
+				}).Warn(fixedCIDROpt + " is outside any subnet implied by addresses on the user-managed default bridge, this may be treated as an error in a future release")
+				ipamConf.SubPool = ""
+			}
+		}
+	}
+
+	if defGw, _, auxAddrLabel := opts.defGw(); defGw != nil {
+		ipamConf.AuxAddresses[auxAddrLabel] = defGw.String()
+	}
+
+	return []*libnetwork.IpamConf{ipamConf}, nil
+}
+
+// selectBIP searches the addresses from family on bridge bridgeName for:
+// - An address that encompasses fCidrNet if there is one.
+// - Else, an address that is within fCidrNet if there is one.
+// - Else, any address, if there is one.
+//
+// If an address is found, the bridge is docker managed (docker0), and the
+// bridge address is not compatible with current fixed-cidr/bip configuration,
+// the address is ignored or modified accordingly, so that the current config
+// can take effect.
+//
+// If there is an address, it's returned as bIP with its subnet in canonical
+// form in bIPNet.
+func selectBIP(
+	userManagedBridge bool,
+	bridgeName string,
+	family int,
+	fCidrIP net.IP,
+	fCidrNet *net.IPNet,
+) (bIP net.IP, bIPNet *net.IPNet, err error) {
+	bridgeNws, err := ifaceAddrs(bridgeName, family)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "list bridge addresses failed")
+	}
+	// For IPv6, ignore the kernel-assigned link-local address. Remove all
+	// link-local addresses, unless fixed-cidr-v6 has the standard link-local
+	// prefix. (If fixed-cidr-v6 is the standard LL prefix, the kernel-assigned
+	// address is likely to be used instead of an IPAM assigned address.)
+	if family == netlink.FAMILY_V6 && (fCidrIP == nil || !isStandardLL(fCidrIP)) {
+		bridgeNws = slices.DeleteFunc(bridgeNws, func(nlAddr netlink.Addr) bool {
+			return isStandardLL(nlAddr.IP)
+		})
+	}
+	if len(bridgeNws) > 0 {
+		// Pick any address from the bridge as a starting point.
+		nw := bridgeNws[0].IPNet
+		if len(bridgeNws) > 1 && fCidrNet != nil {
+			// If there's an address with a subnet that contains fixed-cidr, use it.
+			for _, entry := range bridgeNws {
+				if entry.Contains(fCidrIP) {
+					nw = entry.IPNet
+					break
+				}
+				// For backwards compatibility - prefer the first bridge address within
+				// fixed-cidr. If fixed-cidr has a bigger subnet than nw.IP, this doesn't really
+				// make sense - the allocatable range (fixed-cidr) will be bigger than the subnet
+				// (entry.IPNet).
+				if fCidrNet.Contains(entry.IP) && !fCidrNet.Contains(nw.IP) {
+					nw = entry.IPNet
+				}
+			}
+		}
+
+		bIP = nw.IP
+		bIPNet = lntypes.GetIPNetCanonical(nw)
+	}
+
+	if !userManagedBridge && fCidrIP != nil && bIPNet != nil {
+		if !bIPNet.Contains(fCidrIP) {
+			// The bridge is docker-managed (docker0) and fixed-cidr is not
+			// inside a subnet belonging to any existing bridge IP. (fixed-cidr
+			// has changed.) So, ignore the existing bridge IP.
+			bIP = nil
+			bIPNet = nil
+		} else {
+			fCidrOnes, _ := fCidrNet.Mask.Size()
+			bIPOnes, _ := bIPNet.Mask.Size()
+			if fCidrOnes < bIPOnes {
+				// The bridge is docker-managed (docker0) and fixed-cidr (the
+				// allocatable address range) is bigger than the subnet implied
+				// by the bridge's current address. (fixed-cidr has changed.)
+				// The bridge's address is ok, but its subnet needs to be updated.
+				bIPNet.IP = bIPNet.IP.Mask(fCidrNet.Mask)
+				bIPNet.Mask = fCidrNet.Mask
+			}
+		}
+	}
+
+	return bIP, bIPNet, nil
+}
+
+// isStandardLL returns true if ip is in fe80::/64 (the link local prefix is fe80::/10,
+// but only fe80::/64 is normally used - however, it's possible to ask IPAM for a
+// link-local subnet that's outside that range).
+func isStandardLL(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).Equal(net.ParseIP("fe80::"))
 }
 
 // Remove default bridge interface if present (--bridge=none use case)
@@ -1073,9 +1250,9 @@ func removeDefaultBridgeInterface() {
 	}
 }
 
-func setupInitLayer(idMapping idtools.IdentityMapping) func(string) error {
+func setupInitLayer(uid int, gid int) func(string) error {
 	return func(initPath string) error {
-		return initlayer.Setup(initPath, idMapping.RootPair())
+		return initlayer.Setup(initPath, uid, gid)
 	}
 }
 
@@ -1104,7 +1281,7 @@ func parseRemappedRoot(usergrp string) (string, string, error) {
 	if uid, err := strconv.ParseInt(idparts[0], 10, 32); err == nil {
 		// must be a uid; take it as valid
 		userID = int(uid)
-		luser, err := idtools.LookupUID(userID)
+		luser, err := usergroup.LookupUID(userID)
 		if err != nil {
 			return "", "", fmt.Errorf("Uid %d has no entry in /etc/passwd: %v", userID, err)
 		}
@@ -1112,7 +1289,7 @@ func parseRemappedRoot(usergrp string) (string, string, error) {
 		if len(idparts) == 1 {
 			// if the uid was numeric and no gid was specified, take the uid as the gid
 			groupID = userID
-			lgrp, err := idtools.LookupGID(groupID)
+			lgrp, err := usergroup.LookupGID(groupID)
 			if err != nil {
 				return "", "", fmt.Errorf("Gid %d has no entry in /etc/group: %v", groupID, err)
 			}
@@ -1125,7 +1302,7 @@ func parseRemappedRoot(usergrp string) (string, string, error) {
 		if lookupName == defaultIDSpecifier {
 			lookupName = defaultRemappedID
 		}
-		luser, err := idtools.LookupUser(lookupName)
+		luser, err := usergroup.LookupUser(lookupName)
 		if err != nil && idparts[0] != defaultIDSpecifier {
 			// error if the name requested isn't the special "dockremap" ID
 			return "", "", fmt.Errorf("Error during uid lookup for %q: %v", lookupName, err)
@@ -1133,7 +1310,7 @@ func parseRemappedRoot(usergrp string) (string, string, error) {
 			// special case-- if the username == "default", then we have been asked
 			// to create a new entry pair in /etc/{passwd,group} for which the /etc/sub{uid,gid}
 			// ranges will be used for the user and group mappings in user namespaced containers
-			_, _, err := idtools.AddNamespaceRangesUser(defaultRemappedID)
+			_, _, err := usergroup.AddNamespaceRangesUser(defaultRemappedID)
 			if err == nil {
 				return defaultRemappedID, defaultRemappedID, nil
 			}
@@ -1142,7 +1319,7 @@ func parseRemappedRoot(usergrp string) (string, string, error) {
 		username = luser.Name
 		if len(idparts) == 1 {
 			// we only have a string username, and no group specified; look up gid from username as group
-			group, err := idtools.LookupGroup(lookupName)
+			group, err := usergroup.LookupGroup(lookupName)
 			if err != nil {
 				return "", "", fmt.Errorf("Error during gid lookup for %q: %v", lookupName, err)
 			}
@@ -1156,14 +1333,14 @@ func parseRemappedRoot(usergrp string) (string, string, error) {
 		if gid, err := strconv.ParseInt(idparts[1], 10, 32); err == nil {
 			// must be a gid, take it as valid
 			groupID = int(gid)
-			lgrp, err := idtools.LookupGID(groupID)
+			lgrp, err := usergroup.LookupGID(groupID)
 			if err != nil {
 				return "", "", fmt.Errorf("Gid %d has no entry in /etc/passwd: %v", groupID, err)
 			}
 			groupname = lgrp.Name
 		} else {
 			// not a number; attempt a lookup
-			if _, err := idtools.LookupGroup(idparts[1]); err != nil {
+			if _, err := usergroup.LookupGroup(idparts[1]); err != nil {
 				return "", "", fmt.Errorf("Error during groupname lookup for %q: %v", idparts[1], err)
 			}
 			groupname = idparts[1]
@@ -1172,38 +1349,33 @@ func parseRemappedRoot(usergrp string) (string, string, error) {
 	return username, groupname, nil
 }
 
-func setupRemappedRoot(config *config.Config) (idtools.IdentityMapping, error) {
-	if runtime.GOOS != "linux" && config.RemappedRoot != "" {
-		return idtools.IdentityMapping{}, fmt.Errorf("User namespaces are only supported on Linux")
+func setupRemappedRoot(cfg *config.Config) (user.IdentityMapping, error) {
+	if cfg.RemappedRoot == "" {
+		return user.IdentityMapping{}, nil
 	}
 
-	// if the daemon was started with remapped root option, parse
-	// the config option to the int uid,gid values
-	if config.RemappedRoot != "" {
-		username, groupname, err := parseRemappedRoot(config.RemappedRoot)
-		if err != nil {
-			return idtools.IdentityMapping{}, err
-		}
-		if username == "root" {
-			// Cannot setup user namespaces with a 1-to-1 mapping; "--root=0:0" is a no-op
-			// effectively
-			log.G(context.TODO()).Warn("User namespaces: root cannot be remapped with itself; user namespaces are OFF")
-			return idtools.IdentityMapping{}, nil
-		}
-		log.G(context.TODO()).Infof("User namespaces: ID ranges will be mapped to subuid/subgid ranges of: %s", username)
-		// update remapped root setting now that we have resolved them to actual names
-		config.RemappedRoot = fmt.Sprintf("%s:%s", username, groupname)
-
-		mappings, err := idtools.LoadIdentityMapping(username)
-		if err != nil {
-			return idtools.IdentityMapping{}, errors.Wrap(err, "Can't create ID mappings")
-		}
-		return mappings, nil
+	// parse the config option to the int uid,gid values
+	username, groupname, err := parseRemappedRoot(cfg.RemappedRoot)
+	if err != nil {
+		return user.IdentityMapping{}, err
 	}
-	return idtools.IdentityMapping{}, nil
+	if username == "root" {
+		// Cannot set up user namespaces with a 1-to-1 mapping; "--root=0:0" is a no-op effectively
+		log.G(context.TODO()).Warn("User namespaces: root cannot be remapped with itself; user namespaces are OFF")
+		return user.IdentityMapping{}, nil
+	}
+	log.G(context.TODO()).Infof("User namespaces: ID ranges will be mapped to subuid/subgid ranges of: %s", username)
+	// update remapped root setting now that we have resolved them to actual names
+	cfg.RemappedRoot = fmt.Sprintf("%s:%s", username, groupname)
+
+	mappings, err := usergroup.LoadIdentityMapping(username)
+	if err != nil {
+		return user.IdentityMapping{}, fmt.Errorf("error creating ID mappings: %w", err)
+	}
+	return mappings, nil
 }
 
-func setupDaemonRoot(config *config.Config, rootDir string, remappedRoot idtools.Identity) error {
+func setupDaemonRoot(config *config.Config, rootDir string, uid, gid int) error {
 	config.Root = rootDir
 	// the docker root metadata directory needs to have execute permissions for all users (g+x,o+x)
 	// so that syscalls executing as non-root, operating on subdirectories of the graph root
@@ -1223,9 +1395,9 @@ func setupDaemonRoot(config *config.Config, rootDir string, remappedRoot idtools
 		}
 	}
 
-	id := idtools.Identity{UID: idtools.CurrentIdentity().UID, GID: remappedRoot.GID}
+	curuid := os.Getuid()
 	// First make sure the current root dir has the correct perms.
-	if err := idtools.MkdirAllAndChown(config.Root, 0o710, id); err != nil {
+	if err := user.MkdirAllAndChown(config.Root, 0o710, curuid, gid); err != nil {
 		return errors.Wrapf(err, "could not create or set daemon root permissions: %s", config.Root)
 	}
 
@@ -1234,10 +1406,10 @@ func setupDaemonRoot(config *config.Config, rootDir string, remappedRoot idtools
 	// a new subdirectory with ownership set to the remapped uid/gid (so as to allow
 	// `chdir()` to work for containers namespaced to that uid/gid)
 	if config.RemappedRoot != "" {
-		config.Root = filepath.Join(rootDir, fmt.Sprintf("%d.%d", remappedRoot.UID, remappedRoot.GID))
+		config.Root = filepath.Join(rootDir, fmt.Sprintf("%d.%d", uid, gid))
 		log.G(context.TODO()).Debugf("Creating user namespaced daemon root: %s", config.Root)
 		// Create the root directory if it doesn't exist
-		if err := idtools.MkdirAllAndChown(config.Root, 0o710, id); err != nil {
+		if err := user.MkdirAllAndChown(config.Root, 0o710, curuid, gid); err != nil {
 			return fmt.Errorf("Cannot create daemon root: %s: %v", config.Root, err)
 		}
 		// we also need to verify that any pre-existing directories in the path to
@@ -1250,7 +1422,7 @@ func setupDaemonRoot(config *config.Config, rootDir string, remappedRoot idtools
 			if dirPath == "/" {
 				break
 			}
-			if !canAccess(dirPath, remappedRoot) {
+			if !canAccess(dirPath, uid, gid) {
 				return fmt.Errorf("a subdirectory in your graphroot path (%s) restricts access to the remapped root uid/gid; please fix by allowing 'o+x' permissions on existing directories", config.Root)
 			}
 		}
@@ -1268,7 +1440,7 @@ func setupDaemonRoot(config *config.Config, rootDir string, remappedRoot idtools
 // Note: this is a very rudimentary check, and may not produce accurate results,
 // so should not be used for anything other than the current use, see:
 // https://github.com/moby/moby/issues/43724
-func canAccess(path string, pair idtools.Identity) bool {
+func canAccess(path string, uid, gid int) bool {
 	statInfo, err := os.Stat(path)
 	if err != nil {
 		return false
@@ -1279,11 +1451,11 @@ func canAccess(path string, pair idtools.Identity) bool {
 		return true
 	}
 	ssi := statInfo.Sys().(*syscall.Stat_t)
-	if ssi.Uid == uint32(pair.UID) && (perms&0o100 == 0o100) {
+	if ssi.Uid == uint32(uid) && (perms&0o100 == 0o100) {
 		// owner access.
 		return true
 	}
-	if ssi.Gid == uint32(pair.GID) && (perms&0o010 == 0o010) {
+	if ssi.Gid == uint32(gid) && (perms&0o010 == 0o010) {
 		// group access.
 		return true
 	}
@@ -1341,19 +1513,19 @@ func getUnmountOnShutdownPath(config *config.Config) string {
 
 // registerLinks registers network links between container and other containers
 // with the daemon using the specification in hostConfig.
-func (daemon *Daemon) registerLinks(container *container.Container, hostConfig *containertypes.HostConfig) error {
-	if hostConfig == nil || hostConfig.NetworkMode.IsUserDefined() {
+func (daemon *Daemon) registerLinks(ctr *container.Container) error {
+	if ctr.HostConfig == nil || ctr.HostConfig.NetworkMode.IsUserDefined() {
 		return nil
 	}
 
-	for _, l := range hostConfig.Links {
+	for _, l := range ctr.HostConfig.Links {
 		name, alias, err := opts.ParseLink(l)
 		if err != nil {
 			return err
 		}
 		child, err := daemon.GetContainer(name)
 		if err != nil {
-			if errdefs.IsNotFound(err) {
+			if cerrdefs.IsNotFound(err) {
 				// Trying to link to a non-existing container is not valid, and
 				// should return an "invalid parameter" error. Returning a "not
 				// found" error here would make the client report the container's
@@ -1366,7 +1538,7 @@ func (daemon *Daemon) registerLinks(container *container.Container, hostConfig *
 			cid := child.HostConfig.NetworkMode.ConnectedContainer()
 			child, err = daemon.GetContainer(cid)
 			if err != nil {
-				if errdefs.IsNotFound(err) {
+				if cerrdefs.IsNotFound(err) {
 					// Trying to link to a non-existing container is not valid, and
 					// should return an "invalid parameter" error. Returning a "not
 					// found" error here would make the client report the container's
@@ -1377,9 +1549,9 @@ func (daemon *Daemon) registerLinks(container *container.Container, hostConfig *
 			}
 		}
 		if child.HostConfig.NetworkMode.IsHost() {
-			return runconfig.ErrConflictHostNetworkAndLinks
+			return cerrdefs.ErrInvalidArgument.WithMessage("conflicting options: host type networking can't be used with links. This would result in undefined behavior")
 		}
-		if err := daemon.registerLink(container, child, alias); err != nil {
+		if err := daemon.registerLink(ctr, child, alias); err != nil {
 			return err
 		}
 	}
@@ -1457,19 +1629,20 @@ func getSysInfo(cfg *config.Config) *sysinfo.SysInfo {
 			siOpts = append(siOpts, sysinfo.WithCgroup2GroupPath("/user.slice/user-"+euid+".slice"))
 		}
 	}
-	return sysinfo.New(siOpts...)
-}
+	si := sysinfo.New(siOpts...)
 
-func (daemon *Daemon) initLibcontainerd(ctx context.Context, cfg *config.Config) error {
-	var err error
-	daemon.containerd, err = remote.NewClient(
-		ctx,
-		daemon.containerdClient,
-		filepath.Join(cfg.ExecRoot, "containerd"),
-		cfg.ContainerdNamespace,
-		daemon,
-	)
-	return err
+	// The "time-namespaces" feature-flag is a (temporary) escape-hatch to disable
+	// the use of time-namespaces for containers. This allows users to return to the
+	// previous default, which unconditionally used the host's time-namespace.
+	//
+	// We can consider removing this flag if there's no regressions; see https://github.com/moby/moby/pull/52326#issuecomment-4401495854
+	if enabled, ok := cfg.Features["time-namespaces"]; ok && !enabled {
+		if si.TimeNamespaces {
+			si.TimeNamespaces = false
+			log.G(context.TODO()).Info("time-namespaces disabled through feature-override")
+		}
+	}
+	return si
 }
 
 func recursiveUnmount(target string) error {

@@ -1,15 +1,19 @@
-package container // import "github.com/docker/docker/integration/container"
+package container
 
 import (
+	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	systemutil "github.com/docker/docker/integration/internal/system"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/daemon"
+	"github.com/moby/moby/api/types"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	systemutil "github.com/moby/moby/v2/integration/internal/system"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
@@ -36,24 +40,21 @@ func TestAttach(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			t.Parallel()
 
 			ctx := testutil.StartSpan(ctx, t)
-			resp, err := apiClient.ContainerCreate(ctx,
-				&container.Config{
+			resp, err := apiClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+				Config: &container.Config{
 					Image: "busybox",
 					Cmd:   []string{"echo", "hello"},
 					Tty:   tc.tty,
 				},
-				&container.HostConfig{},
-				&network.NetworkingConfig{},
-				nil,
-				"",
-			)
+				HostConfig:       &container.HostConfig{},
+				NetworkingConfig: &network.NetworkingConfig{},
+			})
 			assert.NilError(t, err)
-			attach, err := apiClient.ContainerAttach(ctx, resp.ID, container.AttachOptions{
+			attach, err := apiClient.ContainerAttach(ctx, resp.ID, client.ContainerAttachOptions{
 				Stdout: true,
 				Stderr: true,
 			})
@@ -63,6 +64,40 @@ func TestAttach(t *testing.T) {
 			assert.Check(t, is.Equal(mediaType, tc.expectedMediaType))
 		})
 	}
+}
+
+func TestAttachRejectsInvalidDetachKeys(t *testing.T) {
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	resp, err := apiClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
+			Image: "busybox",
+			Cmd:   []string{"top"},
+			Tty:   true,
+		},
+		HostConfig:       &container.HostConfig{},
+		NetworkingConfig: &network.NetworkingConfig{},
+	})
+	assert.NilError(t, err)
+
+	query := url.Values{"detachKeys": {"ctrl-A,a"}}
+	res, body, err := request.Post(ctx, "/containers/"+resp.ID+"/attach?"+query.Encode(),
+		request.With(func(req *http.Request) error {
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "tcp")
+			return nil
+		}),
+	)
+	if body != nil {
+		defer func() { _ = body.Close() }()
+	}
+	assert.NilError(t, err)
+	assert.Equal(t, res.StatusCode, http.StatusBadRequest)
+
+	out, err := request.ReadBody(body)
+	assert.NilError(t, err)
+	assert.Check(t, is.Contains(string(out), "Invalid detach keys"))
 }
 
 // Regression test for #37182
@@ -77,36 +112,35 @@ func TestAttachDisconnectLeak(t *testing.T) {
 	d := daemon.New(t)
 	defer d.Cleanup(t)
 
-	d.StartWithBusybox(ctx, t, "--iptables=false")
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false")
+	defer d.Stop(t)
 
-	client := d.NewClientT(t)
+	apiClient := d.NewClientT(t)
 
-	resp, err := client.ContainerCreate(ctx,
-		&container.Config{
+	resp, err := apiClient.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{
 			Image: "busybox",
 			Cmd:   []string{"/bin/sh", "-c", "while true; usleep 100000; done"},
 		},
-		&container.HostConfig{},
-		&network.NetworkingConfig{},
-		nil,
-		"",
-	)
+		HostConfig:       &container.HostConfig{},
+		NetworkingConfig: &network.NetworkingConfig{},
+	})
 	assert.NilError(t, err)
 	cID := resp.ID
-	defer client.ContainerRemove(ctx, cID, container.RemoveOptions{
+	defer apiClient.ContainerRemove(ctx, cID, client.ContainerRemoveOptions{
 		Force: true,
 	})
 
-	nGoroutines := systemutil.WaitForStableGoroutineCount(ctx, t, client)
+	nGoroutines := systemutil.WaitForStableGoroutineCount(ctx, t, apiClient)
 
-	attach, err := client.ContainerAttach(ctx, cID, container.AttachOptions{
+	attach, err := apiClient.ContainerAttach(ctx, cID, client.ContainerAttachOptions{
 		Stdout: true,
 	})
 	assert.NilError(t, err)
 	defer attach.Close()
 
 	poll.WaitOn(t, func(_ poll.LogT) poll.Result {
-		count := systemutil.WaitForStableGoroutineCount(ctx, t, client)
+		count := systemutil.WaitForStableGoroutineCount(ctx, t, apiClient)
 		if count > nGoroutines {
 			return poll.Success()
 		}
@@ -117,5 +151,5 @@ func TestAttachDisconnectLeak(t *testing.T) {
 
 	attach.Close()
 
-	poll.WaitOn(t, systemutil.CheckGoroutineCount(ctx, client, nGoroutines), poll.WithTimeout(time.Minute))
+	poll.WaitOn(t, systemutil.CheckGoroutineCount(ctx, apiClient, nGoroutines), poll.WithTimeout(time.Minute))
 }

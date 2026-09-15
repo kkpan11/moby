@@ -1,14 +1,14 @@
 //go:build !windows
 
-package macvlan // import "github.com/docker/docker/integration/network/macvlan"
+package macvlan
 
 import (
 	"context"
 	"os"
 	"testing"
 
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/environment"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/environment"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -51,4 +51,11 @@ func TestMain(m *testing.M) {
 	span.End()
 	shutdown(ctx)
 	os.Exit(code)
+}
+
+func setupTest(t *testing.T) context.Context {
+	ctx := testutil.StartSpan(baseContext, t)
+	environment.ProtectAll(ctx, t, testEnv)
+	t.Cleanup(func() { testEnv.Clean(ctx, t) })
+	return ctx
 }

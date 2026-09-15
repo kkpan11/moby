@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -43,7 +43,7 @@ func TestLog(t *testing.T) {
 	defer l.Close()
 
 	var messages []logger.Message
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		messages = append(messages, logger.Message{
 			Timestamp: time.Now(),
 			Line:      append(bytes.Repeat([]byte("a"), 100), '\n'),

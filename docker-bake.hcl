@@ -141,6 +141,16 @@ target "all-cross" {
   inherits = ["all", "_platforms"]
 }
 
+# Export the pinned tools and fixtures for integration tests on a Linux host.
+target "test-integration-deps" {
+  inherits = ["_common"]
+  target = "test-integration-deps"
+  args = {
+    DOCKER_STATIC = "1"
+  }
+  output = [bindir("test-integration-deps")]
+}
+
 #
 # bin image
 #
@@ -165,10 +175,25 @@ target "bin-image-cross" {
 }
 
 #
+# dind
+#
+
+target "dind" {
+  inherits = ["_common"]
+  target = "dind"
+  tags = ["docker-dind"]
+  output = ["type=docker"]
+}
+
+#
 # dev
 #
 
 variable "SYSTEMD" {
+  default = "false"
+}
+
+variable "FIREWALLD" {
   default = "false"
 }
 
@@ -177,6 +202,7 @@ target "dev" {
   target = "dev"
   args = {
     SYSTEMD = SYSTEMD
+    FIREWALLD = FIREWALLD
   }
   tags = ["docker-dev"]
   output = ["type=docker"]

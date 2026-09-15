@@ -1,7 +1,9 @@
-package config // import "github.com/docker/docker/daemon/config"
+package config
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -13,6 +15,10 @@ const (
 	// default value. On Windows keep this empty so the value is auto-detected
 	// based on other options.
 	StockRuntimeName = ""
+
+	WindowsV1RuntimeName = "com.docker.hcsshim.v1"
+
+	defaultStopTimeout = 30
 )
 
 // BridgeConfig is meant to store all the parameters for both the bridge driver and the default bridge network. On
@@ -55,14 +61,6 @@ func (conf *Config) IsSwarmCompatible() error {
 	return nil
 }
 
-// ValidatePlatformConfig checks if any platform-specific configuration settings are invalid.
-func (conf *Config) ValidatePlatformConfig() error {
-	if conf.MTU != 0 && conf.MTU != DefaultNetworkMtu {
-		log.G(context.TODO()).Warn(`WARNING: MTU for the default network is not configurable on Windows, and this option will be ignored.`)
-	}
-	return nil
-}
-
 // IsRootless returns conf.Rootless on Linux but false on Windows
 func (conf *Config) IsRootless() bool {
 	return false
@@ -73,4 +71,29 @@ func setPlatformDefaults(cfg *Config) error {
 	cfg.ExecRoot = filepath.Join(os.Getenv("programdata"), "docker", "exec-root")
 	cfg.Pidfile = filepath.Join(cfg.Root, "docker.pid")
 	return nil
+}
+
+// validatePlatformConfig checks if any platform-specific configuration settings are invalid.
+func validatePlatformConfig(conf *Config) error {
+	if conf.MTU != 0 && conf.MTU != DefaultNetworkMtu {
+		log.G(context.TODO()).Warn(`WARNING: MTU for the default network is not configurable on Windows, and this option will be ignored.`)
+	}
+	if conf.FirewallBackend != "" {
+		return errors.New("firewall-backend can only be configured on Linux")
+	}
+	return nil
+}
+
+// validatePlatformExecOpt validates if the given exec-opt and value are valid
+// for the current platform.
+func validatePlatformExecOpt(opt, value string) error {
+	switch opt {
+	case "isolation":
+		// TODO(thaJeztah): add validation that's currently in Daemon.setDefaultIsolation()
+		return nil
+	case "native.cgroupdriver":
+		return fmt.Errorf("option '%s' is only supported on linux", opt)
+	default:
+		return fmt.Errorf("unknown option: '%s'", opt)
+	}
 }

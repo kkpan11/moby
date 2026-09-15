@@ -40,6 +40,11 @@ func NewFS(root string) (FS, error) {
 	}, nil
 }
 
+// NewRootFS creates a new FS from a filesystem root.
+func NewRootFS(root Root) FS {
+	return &rootFS{root: root}
+}
+
 type fs struct {
 	root string
 }
@@ -90,8 +95,69 @@ func (fs *fs) Open(p string) (io.ReadCloser, error) {
 	return rc, errors.WithStack(err)
 }
 
+type rootFS struct {
+	root Root
+}
+
+func (fs *rootFS) Walk(ctx context.Context, target string, fn gofs.WalkDirFunc) error {
+	seenFiles := make(map[uint64]string)
+	target = cleanRootFSTarget(target)
+
+	return gofs.WalkDir(fs.root.FS(), target, func(path string, dirEntry gofs.DirEntry, walkErr error) (retErr error) {
+		defer func() {
+			if retErr != nil && isNotExist(retErr) {
+				retErr = filepath.SkipDir
+			}
+		}()
+
+		path = filepath.FromSlash(path)
+		if path == "." {
+			return nil
+		}
+
+		var entry gofs.DirEntry
+		if dirEntry != nil {
+			fi, err := fs.root.Lstat(path)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			stat, err := mkrootstat(fs.root, path, fi, seenFiles)
+			if err != nil {
+				return err
+			}
+			entry = &DirEntryInfo{Stat: stat}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if err := fn(path, entry, walkErr); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (fs *rootFS) Open(p string) (io.ReadCloser, error) {
+	rc, err := fs.root.OpenFile(cleanRootPath(p), os.O_RDONLY, 0)
+	return rc, errors.WithStack(err)
+}
+
+func cleanRootFSTarget(target string) string {
+	target = cleanRootPath(target)
+	for strings.HasPrefix(target, string(filepath.Separator)) {
+		target = strings.TrimPrefix(target, string(filepath.Separator))
+	}
+	if target == "" || target == "." {
+		return "."
+	}
+	return filepath.ToSlash(target)
+}
+
 type Dir struct {
-	Stat types.Stat
+	Stat *types.Stat
 	FS   FS
 }
 
@@ -125,12 +191,12 @@ func (fs *subDirFS) Walk(ctx context.Context, target string, fn gofs.WalkDirFunc
 			continue
 		}
 
-		fi := &StatInfo{&d.Stat}
+		fi := &StatInfo{d.Stat.Clone()}
 		if !fi.IsDir() {
 			return errors.WithStack(&os.PathError{Path: d.Stat.Path, Err: syscall.ENOTDIR, Op: "walk subdir"})
 		}
-		dStat := d.Stat
-		if err := fn(d.Stat.Path, &DirEntryInfo{Stat: &dStat}, nil); err != nil {
+		dStat := d.Stat.Clone()
+		if err := fn(d.Stat.Path, &DirEntryInfo{Stat: dStat}, nil); err != nil {
 			return err
 		}
 		if err := d.FS.Walk(ctx, rest, func(p string, entry gofs.DirEntry, err error) error {
@@ -176,8 +242,7 @@ func (fs *subDirFS) Open(p string) (io.ReadCloser, error) {
 	return d.FS.Open(parts[1])
 }
 
-type emptyReader struct {
-}
+type emptyReader struct{}
 
 func (*emptyReader) Read([]byte) (int, error) {
 	return 0, io.EOF
@@ -188,21 +253,26 @@ type StatInfo struct {
 }
 
 func (s *StatInfo) Name() string {
-	return filepath.Base(s.Stat.Path)
+	return filepath.Base(s.Path)
 }
+
 func (s *StatInfo) Size() int64 {
-	return s.Stat.Size_
+	return s.Stat.Size
 }
+
 func (s *StatInfo) Mode() os.FileMode {
 	return os.FileMode(s.Stat.Mode)
 }
+
 func (s *StatInfo) ModTime() time.Time {
 	return time.Unix(s.Stat.ModTime/1e9, s.Stat.ModTime%1e9)
 }
+
 func (s *StatInfo) IsDir() bool {
 	return s.Mode().IsDir()
 }
-func (s *StatInfo) Sys() interface{} {
+
+func (s *StatInfo) Sys() any {
 	return s.Stat
 }
 
@@ -217,22 +287,25 @@ type DirEntryInfo struct {
 
 func (s *DirEntryInfo) Name() string {
 	if s.Stat != nil {
-		return filepath.Base(s.Stat.Path)
+		return filepath.Base(s.Path)
 	}
 	return s.entry.Name()
 }
+
 func (s *DirEntryInfo) IsDir() bool {
 	if s.Stat != nil {
 		return s.Stat.IsDir()
 	}
 	return s.entry.IsDir()
 }
+
 func (s *DirEntryInfo) Type() gofs.FileMode {
 	if s.Stat != nil {
-		return gofs.FileMode(s.Stat.Mode)
+		return gofs.FileMode(s.Mode)
 	}
 	return s.entry.Type()
 }
+
 func (s *DirEntryInfo) Info() (gofs.FileInfo, error) {
 	if s.Stat == nil {
 		fi, err := s.entry.Info()
@@ -246,6 +319,6 @@ func (s *DirEntryInfo) Info() (gofs.FileInfo, error) {
 		s.Stat = stat
 	}
 
-	st := *s.Stat
-	return &StatInfo{&st}, nil
+	st := s.Clone()
+	return &StatInfo{st}, nil
 }

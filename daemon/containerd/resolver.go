@@ -2,27 +2,50 @@ package containerd
 
 import (
 	"context"
-	"crypto/tls"
-	"errors"
 	"net/http"
+	"sync"
 
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/containerd/version"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/version"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/distribution/reference"
-	registrytypes "github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/dockerversion"
-	"github.com/docker/docker/pkg/useragent"
-	"github.com/docker/docker/registry"
+	registrytypes "github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/v2/daemon/pkg/registry"
+	"github.com/moby/moby/v2/dockerversion"
+	"github.com/moby/moby/v2/pkg/useragent"
 )
 
-func (i *ImageService) newResolverFromAuthConfig(ctx context.Context, authConfig *registrytypes.AuthConfig, ref reference.Named) (remotes.Resolver, docker.StatusTracker) {
+func (i *ImageService) newResolverFromAuthConfig(ctx context.Context, authConfig *registrytypes.AuthConfig, ref reference.Named, metaHeaders http.Header) (remotes.Resolver, docker.StatusTracker) {
 	tracker := docker.NewInMemoryTracker()
 
-	hosts := hostsWrapper(i.registryHosts, authConfig, ref, i.registryService)
+	hosts := i.registryHosts
+	if authConfig != nil {
+		authConfig := *authConfig
+		var mu sync.Mutex
+		// Keep each host, client, and authorizer together so registry and token
+		// requests use matching transport settings across resolver phases.
+		hostsByName := map[string][]docker.RegistryHost{}
+		hosts = func(name string) ([]docker.RegistryHost, error) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			if hosts, ok := hostsByName[name]; ok {
+				return hosts, nil
+			}
+			hosts, err := hostsWrapper(i.registryHosts, authConfig, ref, name)
+			if err != nil {
+				return nil, err
+			}
+			hostsByName[name] = hosts
+			return hosts, nil
+		}
+	}
 	headers := http.Header{}
+	if metaHeaders != nil {
+		headers = metaHeaders.Clone()
+	}
 	headers.Set("User-Agent", dockerversion.DockerUserAgent(ctx, useragent.VersionInfo{Name: "containerd-client", Version: version.Version}, useragent.VersionInfo{Name: "storage-driver", Version: i.snapshotter}))
 
 	return docker.NewResolver(docker.ResolverOptions{
@@ -32,32 +55,18 @@ func (i *ImageService) newResolverFromAuthConfig(ctx context.Context, authConfig
 	}), tracker
 }
 
-func hostsWrapper(hostsFn docker.RegistryHosts, optAuthConfig *registrytypes.AuthConfig, ref reference.Named, regService registryResolver) docker.RegistryHosts {
-	var authorizer docker.Authorizer
-	if optAuthConfig != nil {
-		authorizer = authorizerFromAuthConfig(*optAuthConfig, ref)
+func hostsWrapper(hostsFn docker.RegistryHosts, authConfig registrytypes.AuthConfig, ref reference.Named, name string) ([]docker.RegistryHost, error) {
+	hosts, err := hostsFn(name)
+	if err != nil {
+		return nil, err
 	}
-
-	return func(n string) ([]docker.RegistryHost, error) {
-		hosts, err := hostsFn(n)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := range hosts {
-			if hosts[i].Authorizer == nil {
-				hosts[i].Authorizer = authorizer
-				isInsecure := regService.IsInsecureRegistry(hosts[i].Host)
-				if hosts[i].Client.Transport != nil && isInsecure {
-					hosts[i].Client.Transport = httpFallback{super: hosts[i].Client.Transport}
-				}
-			}
-		}
-		return hosts, nil
+	for i := range hosts {
+		hosts[i].Authorizer = authorizerFromAuthConfig(authConfig, ref, hosts[i].Client)
 	}
+	return hosts, nil
 }
 
-func authorizerFromAuthConfig(authConfig registrytypes.AuthConfig, ref reference.Named) docker.Authorizer {
+func authorizerFromAuthConfig(authConfig registrytypes.AuthConfig, ref reference.Named, client *http.Client) docker.Authorizer {
 	cfgHost := registry.ConvertToHostname(authConfig.ServerAddress)
 	if cfgHost == "" {
 		cfgHost = reference.Domain(ref)
@@ -73,19 +82,25 @@ func authorizerFromAuthConfig(authConfig registrytypes.AuthConfig, ref reference
 		}
 	}
 
-	return docker.NewDockerAuthorizer(docker.WithAuthCreds(func(host string) (string, string, error) {
-		if cfgHost != host {
-			log.G(context.TODO()).WithFields(log.Fields{
-				"host":    host,
-				"cfgHost": cfgHost,
-			}).Warn("Host doesn't match")
-			return "", "", nil
-		}
-		if authConfig.IdentityToken != "" {
-			return "", authConfig.IdentityToken, nil
-		}
-		return authConfig.Username, authConfig.Password, nil
-	}))
+	opts := []docker.AuthorizerOpt{
+		docker.WithAuthCreds(func(host string) (string, string, error) {
+			if cfgHost != host {
+				log.G(context.TODO()).WithFields(log.Fields{
+					"host":    host,
+					"cfgHost": cfgHost,
+				}).Warn("Host doesn't match")
+				return "", "", nil
+			}
+			if authConfig.IdentityToken != "" {
+				return "", authConfig.IdentityToken, nil
+			}
+			return authConfig.Username, authConfig.Password, nil
+		}),
+	}
+	if client != nil {
+		opts = append(opts, docker.WithAuthClient(client))
+	}
+	return docker.NewDockerAuthorizer(opts...)
 }
 
 type bearerAuthorizer struct {
@@ -110,25 +125,4 @@ func (a *bearerAuthorizer) Authorize(ctx context.Context, req *http.Request) err
 func (a *bearerAuthorizer) AddResponses(context.Context, []*http.Response) error {
 	// Return not implemented to prevent retry of the request when bearer did not succeed
 	return cerrdefs.ErrNotImplemented
-}
-
-type httpFallback struct {
-	super http.RoundTripper
-}
-
-func (f httpFallback) RoundTrip(r *http.Request) (*http.Response, error) {
-	resp, err := f.super.RoundTrip(r)
-	var tlsErr tls.RecordHeaderError
-	if errors.As(err, &tlsErr) && string(tlsErr.RecordHeader[:]) == "HTTP/" {
-		// server gave HTTP response to HTTPS client
-		plainHttpUrl := *r.URL
-		plainHttpUrl.Scheme = "http"
-
-		plainHttpRequest := *r
-		plainHttpRequest.URL = &plainHttpUrl
-
-		return http.DefaultTransport.RoundTrip(&plainHttpRequest)
-	}
-
-	return resp, err
 }

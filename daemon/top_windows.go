@@ -1,4 +1,4 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
+	"github.com/moby/moby/api/types/container"
+	libcontainerdtypes "github.com/moby/moby/v2/daemon/internal/libcontainerd/types"
 )
 
 // ContainerTop handles `docker top` client requests.
@@ -26,37 +26,42 @@ import (
 //     task manager does and use the private working set as the memory counter.
 //     We could return more info for those who really understand how memory
 //     management works in Windows if we introduced a "raw" stats (above).
-func (daemon *Daemon) ContainerTop(name string, psArgs string) (*containertypes.ContainerTopOKBody, error) {
+func (daemon *Daemon) ContainerTop(name string, psArgs string) (*container.TopResponse, error) {
 	// It's not at all an equivalent to linux 'ps' on Windows
 	if psArgs != "" {
 		return nil, errors.New("Windows does not support arguments to top")
 	}
 
-	container, err := daemon.GetContainer(name)
+	ctr, err := daemon.GetContainer(name)
 	if err != nil {
 		return nil, err
 	}
 
 	task, err := func() (libcontainerdtypes.Task, error) {
-		container.Lock()
-		defer container.Unlock()
+		ctr.Lock()
+		defer ctr.Unlock()
 
-		task, err := container.GetRunningTask()
+		task, err := ctr.GetRunningTask()
 		if err != nil {
 			return nil, err
 		}
-		if container.Restarting {
-			return nil, errContainerIsRestarting(container.ID)
+		if ctr.State.Restarting {
+			return nil, errContainerIsRestarting(ctr.ID)
 		}
 		return task, nil
 	}()
+
+	if err != nil {
+		return nil, err
+	}
 
 	s, err := task.Summary(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	procList := &containertypes.ContainerTopOKBody{}
-	procList.Titles = []string{"Name", "PID", "CPU", "Private Working Set"}
+	procList := &container.TopResponse{
+		Titles: []string{"Name", "PID", "CPU", "Private Working Set"},
+	}
 
 	for _, j := range s {
 		d := time.Duration((j.KernelTime_100Ns + j.UserTime_100Ns) * 100) // Combined time in nanoseconds

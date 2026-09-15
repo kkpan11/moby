@@ -1,18 +1,18 @@
 //go:build !windows
-// +build !windows
 
 package containerdexecutor
 
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/mount"
-	containerdoci "github.com/containerd/containerd/oci"
+	ctd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/mount"
+	containerdoci "github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/continuity/fs"
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/executor/oci"
 	"github.com/moby/buildkit/snapshot"
@@ -20,6 +20,7 @@ import (
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/network"
 	rootlessspecconv "github.com/moby/buildkit/util/rootless/specconv"
+	"github.com/moby/sys/user"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 )
@@ -46,22 +47,31 @@ func getUserSpec(user, rootfsPath string) (specs.User, error) {
 func (w *containerdExecutor) prepareExecutionEnv(ctx context.Context, rootMount executor.Mount, mounts []executor.Mount, meta executor.Meta, details *containerState, netMode pb.NetMode) (string, string, func(), error) {
 	var releasers []func()
 	releaseAll := func() {
-		for i := len(releasers) - 1; i >= 0; i-- {
-			releasers[i]()
+		for _, release := range slices.Backward(releasers) {
+			release()
 		}
 	}
 
-	resolvConf, err := oci.GetResolvConf(ctx, w.root, nil, w.dnsConfig, netMode)
+	stateDirRoot, err := os.OpenRoot(w.root)
 	if err != nil {
 		releaseAll()
 		return "", "", nil, err
 	}
+	defer stateDirRoot.Close()
 
-	hostsFile, clean, err := oci.GetHostsFile(ctx, w.root, meta.ExtraHosts, nil, meta.Hostname)
+	resolvConfName, err := oci.GetResolvConf(ctx, stateDirRoot, nil, w.dnsConfig, netMode)
 	if err != nil {
 		releaseAll()
 		return "", "", nil, err
 	}
+	resolvConf := filepath.Join(w.root, resolvConfName)
+
+	hostsName, clean, err := oci.GetHostsFile(ctx, stateDirRoot, meta.ExtraHosts, nil, meta.Hostname)
+	if err != nil {
+		releaseAll()
+		return "", "", nil, err
+	}
+	hostsFile := filepath.Join(w.root, hostsName)
 	if clean != nil {
 		releasers = append(releasers, clean)
 	}
@@ -102,7 +112,7 @@ func (w *containerdExecutor) prepareExecutionEnv(ctx context.Context, rootMount 
 	return resolvConf, hostsFile, releaseAll, nil
 }
 
-func (w *containerdExecutor) ensureCWD(_ context.Context, details *containerState, meta executor.Meta) error {
+func (w *containerdExecutor) ensureCWD(details *containerState, meta executor.Meta) error {
 	newp, err := fs.RootPath(details.rootfsPath, meta.Cwd)
 	if err != nil {
 		return errors.Wrapf(err, "working dir %s points to invalid target", newp)
@@ -113,13 +123,8 @@ func (w *containerdExecutor) ensureCWD(_ context.Context, details *containerStat
 		return err
 	}
 
-	identity := idtools.Identity{
-		UID: int(uid),
-		GID: int(gid),
-	}
-
 	if _, err := os.Stat(newp); err != nil {
-		if err := idtools.MkdirAllAndChown(newp, 0755, identity); err != nil {
+		if err := user.MkdirAllAndChown(newp, 0755, int(uid), int(gid)); err != nil {
 			return errors.Wrapf(err, "failed to create working directory %s", newp)
 		}
 	}
@@ -129,8 +134,8 @@ func (w *containerdExecutor) ensureCWD(_ context.Context, details *containerStat
 func (w *containerdExecutor) createOCISpec(ctx context.Context, id, resolvConf, hostsFile string, namespace network.Namespace, mounts []executor.Mount, meta executor.Meta, details *containerState) (*specs.Spec, func(), error) {
 	var releasers []func()
 	releaseAll := func() {
-		for i := len(releasers) - 1; i >= 0; i-- {
-			releasers[i]()
+		for _, release := range slices.Backward(releasers) {
+			release()
 		}
 	}
 
@@ -146,7 +151,7 @@ func (w *containerdExecutor) createOCISpec(ctx context.Context, id, resolvConf, 
 	}
 
 	processMode := oci.ProcessSandbox // FIXME(AkihiroSuda)
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.cgroupParent, processMode, nil, w.apparmorProfile, w.selinux, w.traceSocket, opts...)
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.cgroupParent, processMode, nil, w.apparmorProfile, w.selinux, w.traceSocket, w.cdiManager, opts...)
 	if err != nil {
 		releaseAll()
 		return nil, nil, err
@@ -154,28 +159,33 @@ func (w *containerdExecutor) createOCISpec(ctx context.Context, id, resolvConf, 
 	releasers = append(releasers, cleanup)
 	spec.Process.Terminal = meta.Tty
 	if w.rootless {
-		if err := rootlessspecconv.ToRootless(spec); err != nil {
+		removedMounts, err := rootlessspecconv.ToRootless(spec)
+		if err != nil {
 			releaseAll()
 			return nil, nil, err
 		}
+		// The runtime no longer sets these mounts up, but a rootful build still gets
+		// their mount points left in the rootfs. The caller recreates them once the
+		// container is gone. moby/buildkit#6686
+		details.removedMounts = removedMounts
 	}
 	return spec, releaseAll, nil
 }
 
-func (d *containerState) getTaskOpts() ([]containerd.NewTaskOpts, error) {
-	rootfs := containerd.WithRootFS([]mount.Mount{{
+func (d *containerState) getTaskOpts() ([]ctd.NewTaskOpts, error) {
+	rootfs := ctd.WithRootFS([]mount.Mount{{
 		Source:  d.rootfsPath,
 		Type:    "bind",
 		Options: []string{"rbind"},
 	}})
 	if runtime.GOOS == "freebsd" {
-		rootfs = containerd.WithRootFS([]mount.Mount{{
+		rootfs = ctd.WithRootFS([]mount.Mount{{
 			Source:  d.rootfsPath,
 			Type:    "nullfs",
 			Options: []string{},
 		}})
 	}
-	return []containerd.NewTaskOpts{rootfs}, nil
+	return []ctd.NewTaskOpts{rootfs}, nil
 }
 
 func setArgs(spec *specs.Process, args []string) {

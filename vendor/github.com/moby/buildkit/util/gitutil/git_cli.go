@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -20,12 +21,14 @@ type GitCLI struct {
 	args    []string
 	dir     string
 	streams StreamFunc
+	advice  *bool
 
 	workTree string
 	gitDir   string
 
 	sshAuthSock   string
 	sshKnownHosts string
+	hostGitConfig bool
 }
 
 // Option provides a variadic option for configuring the git client.
@@ -49,6 +52,13 @@ func WithExec(exec func(context.Context, *exec.Cmd) error) Option {
 func WithArgs(args ...string) Option {
 	return func(b *GitCLI) {
 		b.args = append(b.args, args...)
+	}
+}
+
+// WithGitAdvice controls whether Git advice messages are emitted.
+func WithGitAdvice(enabled bool) Option {
+	return func(b *GitCLI) {
+		b.advice = &enabled
 	}
 }
 
@@ -96,6 +106,15 @@ func WithSSHKnownHosts(sshKnownHosts string) Option {
 	}
 }
 
+// WithHostGitConfig allows git to read the host system and user git config.
+// This is intended for client-side local git inspection. The default remains
+// isolated so daemon-side callers do not leak host configuration into git.
+func WithHostGitConfig() Option {
+	return func(b *GitCLI) {
+		b.hostGitConfig = true
+	}
+}
+
 type StreamFunc func(context.Context) (io.WriteCloser, io.WriteCloser, func())
 
 // WithStreams configures a callback for getting the streams for a command. The
@@ -107,7 +126,7 @@ func WithStreams(streams StreamFunc) Option {
 	}
 }
 
-// New initializes a new git client
+// NewGitCLI initializes a new git client
 func NewGitCLI(opts ...Option) *GitCLI {
 	c := &GitCLI{}
 	for _, opt := range opts {
@@ -120,7 +139,7 @@ func NewGitCLI(opts ...Option) *GitCLI {
 // with the given options applied on top.
 func (cli *GitCLI) New(opts ...Option) *GitCLI {
 	clone := *cli
-	clone.args = append([]string{}, cli.args...)
+	clone.args = slices.Clone(cli.args)
 
 	for _, opt := range opts {
 		opt(&clone)
@@ -134,13 +153,17 @@ func (cli *GitCLI) Run(ctx context.Context, args ...string) (_ []byte, err error
 	if cli.git != "" {
 		gitBinary = cli.git
 	}
+	proxyEnvVars := [...]string{
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+		"http_proxy", "https_proxy", "no_proxy", "all_proxy",
+	}
 
 	for {
 		var cmd *exec.Cmd
 		if cli.exec == nil {
 			cmd = exec.CommandContext(ctx, gitBinary)
 		} else {
-			cmd = exec.Command(gitBinary)
+			cmd = exec.CommandContext(context.TODO(), gitBinary)
 		}
 
 		cmd.Dir = cli.dir
@@ -150,6 +173,9 @@ func (cli *GitCLI) Run(ctx context.Context, args ...string) (_ []byte, err error
 
 		// Block sneaky repositories from using repos from the filesystem as submodules.
 		cmd.Args = append(cmd.Args, "-c", "protocol.file.allow=user")
+		if cli.advice != nil && !*cli.advice {
+			cmd.Args = append(cmd.Args, "-c", "advice.detachedHead=false")
+		}
 		if cli.workTree != "" {
 			cmd.Args = append(cmd.Args, "--work-tree", cli.workTree)
 		}
@@ -186,9 +212,47 @@ func (cli *GitCLI) Run(ctx context.Context, args ...string) (_ []byte, err error
 			"GIT_TERMINAL_PROMPT=0",
 			"GIT_SSH_COMMAND=" + getGitSSHCommand(cli.sshKnownHosts),
 			//	"GIT_TRACE=1",
-			"GIT_CONFIG_NOSYSTEM=1", // Disable reading from system gitconfig.
-			"HOME=/dev/null",        // Disable reading from user gitconfig.
-			"LC_ALL=C",              // Ensure consistent output.
+			"LC_ALL=C", // Ensure consistent output.
+		}
+		if cli.advice != nil {
+			if *cli.advice {
+				cmd.Env = append(cmd.Env, "GIT_ADVICE=1")
+			} else {
+				cmd.Env = append(cmd.Env, "GIT_ADVICE=0")
+			}
+		}
+		if cli.hostGitConfig {
+			for _, ev := range [...]string{
+				"HOME",
+				"XDG_CONFIG_HOME",
+				"USERPROFILE",
+				"HOMEDRIVE",
+				"HOMEPATH",
+				"GIT_CONFIG_GLOBAL",
+				"GIT_CONFIG_SYSTEM",
+				// When git runs as root under sudo it consults SUDO_UID to trust
+				// repositories owned by the user who invoked sudo, so client-side
+				// callers such as `sudo docker build` don't trip git's "detected
+				// dubious ownership" check and silently lose commit provenance.
+				// This mirrors git's own default behavior and does not disable
+				// safe.directory checks. See docker/buildx#3855.
+				"SUDO_UID",
+			} {
+				if v, ok := os.LookupEnv(ev); ok {
+					cmd.Env = append(cmd.Env, ev+"="+v)
+				}
+			}
+		} else {
+			cmd.Env = append(cmd.Env,
+				"GIT_CONFIG_NOSYSTEM=1",         // Disable reading from system gitconfig.
+				"HOME="+os.DevNull,              // Disable reading from user gitconfig.
+				"GIT_CONFIG_GLOBAL="+os.DevNull, // Disable reading from global gitconfig.
+			)
+		}
+		for _, ev := range proxyEnvVars {
+			if v, ok := os.LookupEnv(ev); ok {
+				cmd.Env = append(cmd.Env, ev+"="+v)
+			}
 		}
 		if cli.sshAuthSock != "" {
 			cmd.Env = append(cmd.Env, "SSH_AUTH_SOCK="+cli.sshAuthSock)
@@ -218,6 +282,14 @@ func (cli *GitCLI) Run(ctx context.Context, args ...string) (_ []byte, err error
 					continue
 				}
 			}
+			if strings.Contains(errbuf.String(), "not our ref") || strings.Contains(errbuf.String(), "unadvertised object") {
+				// server-side error: https://github.com/git/git/blob/34b6ce9b30747131b6e781ff718a45328aa887d0/upload-pack.c#L811-L812
+				// client-side error: https://github.com/git/git/blob/34b6ce9b30747131b6e781ff718a45328aa887d0/fetch-pack.c#L2250-L2253
+				if newArgs := argsNoCommitRefspec(args); len(args) > len(newArgs) {
+					args = newArgs
+					continue
+				}
+			}
 
 			return buf.Bytes(), errors.Wrapf(err, "git stderr:\n%s", errbuf.String())
 		}
@@ -226,7 +298,7 @@ func (cli *GitCLI) Run(ctx context.Context, args ...string) (_ []byte, err error
 }
 
 func getGitSSHCommand(knownHosts string) string {
-	gitSSHCommand := "ssh -F /dev/null"
+	gitSSHCommand := "ssh -F " + os.DevNull
 	if knownHosts != "" {
 		gitSSHCommand += " -o UserKnownHostsFile=" + knownHosts
 	} else {
@@ -243,4 +315,20 @@ func argsNoDepth(args []string) []string {
 		}
 	}
 	return out
+}
+
+func argsNoCommitRefspec(args []string) []string {
+	if len(args) <= 2 {
+		return args
+	}
+	if args[0] != "fetch" {
+		return args
+	}
+
+	// assume the refspec is the last arg
+	if IsCommitSHA(args[len(args)-1]) {
+		return args[:len(args)-1]
+	}
+
+	return args
 }

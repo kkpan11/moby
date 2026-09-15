@@ -11,40 +11,41 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/integration-cli/checker"
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/cli/build"
-	"github.com/docker/docker/integration-cli/daemon"
-	"github.com/docker/docker/testutil"
+	"github.com/moby/moby/v2/integration-cli/checker"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli/build"
+	"github.com/moby/moby/v2/integration-cli/daemon"
+	"github.com/moby/moby/v2/internal/testutil"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
 	"gotest.tools/v3/poll"
 )
 
-func (s *DockerCLIPruneSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIPruneSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIPruneSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIPruneSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
-func pruneNetworkAndVerify(c *testing.T, d *daemon.Daemon, kept, pruned []string) {
+func pruneNetworkAndVerify(t *testing.T, d *daemon.Daemon, kept, pruned []string) {
 	_, err := d.Cmd("network", "prune", "--force")
-	assert.NilError(c, err)
+	assert.NilError(t, err)
 
 	for _, s := range kept {
-		poll.WaitOn(c, pollCheck(c, func(*testing.T) (interface{}, string) {
+		poll.WaitOn(t, pollCheck(t, func(*testing.T) (any, string) {
 			out, err := d.Cmd("network", "ls", "--format", "{{.Name}}")
-			assert.NilError(c, err)
+			assert.NilError(t, err)
 			return out, ""
 		}, checker.Contains(s)), poll.WithTimeout(defaultReconciliationTimeout))
 	}
 
 	for _, s := range pruned {
-		poll.WaitOn(c, pollCheck(c, func(*testing.T) (interface{}, string) {
+		poll.WaitOn(t, pollCheck(t, func(*testing.T) (any, string) {
 			out, err := d.Cmd("network", "ls", "--format", "{{.Name}}")
-			assert.NilError(c, err)
+			assert.NilError(t, err)
 			return out, ""
 		}, checker.Not(checker.Contains(s))), poll.WithTimeout(defaultReconciliationTimeout))
 	}
@@ -104,16 +105,16 @@ func (s *DockerDaemonSuite) TestPruneImageDangling(c *testing.T) {
 
 	out, err := s.d.Cmd("images", "-q", "--no-trunc")
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id))
 	out, err = s.d.Cmd("image", "prune", "--force")
 	assert.NilError(c, err)
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id))
 	out, err = s.d.Cmd("images", "-q", "--no-trunc")
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id))
 	out, err = s.d.Cmd("image", "prune", "--force", "--all")
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id))
 	out, err = s.d.Cmd("images", "-q", "--no-trunc")
 	assert.NilError(c, err)
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id))
@@ -131,11 +132,11 @@ func (s *DockerCLIPruneSuite) TestPruneContainerUntil(c *testing.T) {
 	cli.WaitExited(c, id2, 5*time.Second)
 
 	out = cli.DockerCmd(c, "container", "prune", "--force", "--filter", "until="+until).Combined()
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id1))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id1))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
 	out = cli.DockerCmd(c, "ps", "-a", "-q", "--no-trunc").Combined()
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id1))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
 }
 
 func (s *DockerCLIPruneSuite) TestPruneContainerLabel(c *testing.T) {
@@ -168,29 +169,29 @@ func (s *DockerCLIPruneSuite) TestPruneContainerLabel(c *testing.T) {
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id1))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id3))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id4))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id4))
 
 	out = cli.DockerCmd(c, "container", "prune", "--force", "--filter", "label=foo").Combined()
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id1))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id1))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id3))
 
 	out = cli.DockerCmd(c, "ps", "-a", "-q", "--no-trunc").Combined()
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id1))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id3))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id3))
 
 	out = cli.DockerCmd(c, "container", "prune", "--force", "--filter", "label!=bar").Combined()
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id3))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id3))
 
 	out = cli.DockerCmd(c, "ps", "-a", "-q", "--no-trunc").Combined()
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id3))
 
 	// With config.json label=foobar and CLI label!=foobar, CLI label!=foobar supersede
 	out = cli.DockerCmd(c, "--config", d, "container", "prune", "--force", "--filter", "label!=foobar").Combined()
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
 
 	out = cli.DockerCmd(c, "ps", "-a", "-q", "--no-trunc").Combined()
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
@@ -226,29 +227,29 @@ func (s *DockerCLIPruneSuite) TestPruneVolumeLabel(c *testing.T) {
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id1))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id3))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id4))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id4))
 
 	out = cli.DockerCmd(c, "volume", "prune", "--force", "--filter", "label=foo").Combined()
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id1))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id1))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id3))
 
 	out = cli.DockerCmd(c, "volume", "ls", "--format", "{{.Name}}").Stdout()
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id1))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id3))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id3))
 
 	out = cli.DockerCmd(c, "volume", "prune", "--force", "--filter", "label!=bar").Combined()
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id3))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id3))
 
 	out = cli.DockerCmd(c, "volume", "ls", "--format", "{{.Name}}").Stdout()
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id3))
 
 	// With config.json label=foobar and CLI label!=foobar, CLI label!=foobar supersede
 	out = cli.DockerCmd(c, "--config", d, "volume", "prune", "--force", "--filter", "label!=foobar").Combined()
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
 	out = cli.DockerCmd(c, "volume", "ls", "--format", "{{.Name}}").Stdout()
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
 }
@@ -259,18 +260,18 @@ func (s *DockerCLIPruneSuite) TestPruneNetworkLabel(c *testing.T) {
 	cli.DockerCmd(c, "network", "create", "n3")
 
 	out := cli.DockerCmd(c, "network", "prune", "--force", "--filter", "label=foo").Combined()
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), "n1"))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), "n1"))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), "n2"))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), "n3"))
 
 	out = cli.DockerCmd(c, "network", "prune", "--force", "--filter", "label!=bar").Combined()
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), "n1"))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), "n2"))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), "n3"))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), "n3"))
 
 	out = cli.DockerCmd(c, "network", "prune", "--force").Combined()
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), "n1"))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), "n2"))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), "n2"))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), "n3"))
 }
 
@@ -287,7 +288,7 @@ func (s *DockerDaemonSuite) TestPruneImageLabel(c *testing.T) {
 	id1 := strings.TrimSpace(result.Combined())
 	out, err := s.d.Cmd("images", "-q", "--no-trunc")
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id1))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id1))
 	result = cli.BuildCmd(c, "test2", cli.Daemon(s.d),
 		build.WithDockerfile(`FROM busybox
                  LABEL bar=foo`),
@@ -298,11 +299,11 @@ func (s *DockerDaemonSuite) TestPruneImageLabel(c *testing.T) {
 
 	out, err = s.d.Cmd("images", "-q", "--no-trunc")
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
 
 	out, err = s.d.Cmd("image", "prune", "--force", "--all", "--filter", "label=foo=bar")
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id1))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id1))
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id2))
 
 	out, err = s.d.Cmd("image", "prune", "--force", "--all", "--filter", "label!=bar=foo")
@@ -313,5 +314,5 @@ func (s *DockerDaemonSuite) TestPruneImageLabel(c *testing.T) {
 	out, err = s.d.Cmd("image", "prune", "--force", "--all", "--filter", "label=bar=foo")
 	assert.NilError(c, err)
 	assert.Assert(c, !strings.Contains(strings.TrimSpace(out), id1))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
 }

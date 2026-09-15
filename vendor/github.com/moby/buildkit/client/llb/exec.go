@@ -5,7 +5,7 @@ import (
 	_ "crypto/sha256" // for opencontainers/go-digest
 	"fmt"
 	"net"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/moby/buildkit/solver/pb"
@@ -51,7 +51,7 @@ type mount struct {
 }
 
 type ExecOp struct {
-	MarshalCache
+	cache       MarshalCache
 	proxyEnv    *ProxyEnv
 	root        Output
 	mounts      []*mount
@@ -60,9 +60,13 @@ type ExecOp struct {
 	isValidated bool
 	secrets     []SecretInfo
 	ssh         []SSHInfo
+	cdiDevices  []CDIDeviceInfo
 }
 
 func (e *ExecOp) AddMount(target string, source Output, opt ...MountOption) Output {
+	cache := e.cache.Acquire()
+	defer cache.Release()
+
 	m := &mount{
 		target: target,
 		source: source,
@@ -84,7 +88,7 @@ func (e *ExecOp) AddMount(target string, source Output, opt ...MountOption) Outp
 		}
 		m.output = o
 	}
-	e.Store(nil, nil, nil, nil)
+	cache.Store(nil, nil, nil, nil)
 	e.isValidated = false
 	return m.output
 }
@@ -107,7 +111,7 @@ func (e *ExecOp) Validate(ctx context.Context, c *Constraints) error {
 		return err
 	}
 	if len(args) == 0 {
-		return errors.Errorf("arguments are required")
+		return errors.New("arguments are required")
 	}
 	cwd, err := getDir(e.base)(ctx, c)
 	if err != nil {
@@ -128,15 +132,19 @@ func (e *ExecOp) Validate(ctx context.Context, c *Constraints) error {
 }
 
 func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, []*SourceLocation, error) {
-	if e.Cached(c) {
-		return e.Load()
+	cache := e.cache.Acquire()
+	defer cache.Release()
+
+	if dgst, dt, md, srcs, err := cache.Load(c); err == nil {
+		return dgst, dt, md, srcs, nil
 	}
+
 	if err := e.Validate(ctx, c); err != nil {
 		return "", nil, nil, nil, err
 	}
 	// make sure mounts are sorted
-	sort.Slice(e.mounts, func(i, j int) bool {
-		return e.mounts[i].target < e.mounts[j].target
+	slices.SortFunc(e.mounts, func(a, b *mount) int {
+		return strings.Compare(a.target, b.target)
 	})
 
 	env, err := getEnv(e.base)(ctx, c)
@@ -162,7 +170,10 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 			} else if e.constraints.Platform != nil {
 				os = e.constraints.Platform.OS
 			}
-			env = env.SetDefault("PATH", system.DefaultPathEnv(os))
+			// don't set PATH on Windows. #5445
+			if os != "windows" {
+				env = env.SetDefault("PATH", system.DefaultPathEnv(os))
+			}
 		} else {
 			addCap(&e.constraints, pb.CapExecMetaSetsDefaultPath)
 		}
@@ -193,6 +204,17 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		return "", nil, nil, nil, err
 	}
 
+	var validExitCodes []int32
+	if codes, err := getValidExitCodes(e.base)(ctx, c); err != nil {
+		return "", nil, nil, nil, err
+	} else if codes != nil {
+		validExitCodes = make([]int32, len(codes))
+		for i, code := range codes {
+			validExitCodes[i] = int32(code)
+		}
+		addCap(&e.constraints, pb.CapExecValidExitCode)
+	}
+
 	meta := &pb.Meta{
 		Args:                      args,
 		Env:                       env.ToArray(),
@@ -201,6 +223,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		Hostname:                  hostname,
 		CgroupParent:              cgrpParent,
 		RemoveMountStubsRecursive: true,
+		ValidExitCodes:            validExitCodes,
 	}
 
 	extraHosts, err := getExtraHosts(e.base)(ctx, c)
@@ -232,6 +255,10 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		meta.Ulimit = ul
 	}
 
+	if e.constraints.Metadata.LinuxResources != nil {
+		addCap(&e.constraints, pb.CapExecMetaLinuxResources)
+	}
+
 	network, err := getNetwork(e.base)(ctx, c)
 	if err != nil {
 		return "", nil, nil, nil, err
@@ -247,12 +274,17 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		Network:  network,
 		Security: security,
 	}
+
 	if network != NetModeSandbox {
 		addCap(&e.constraints, pb.CapExecMetaNetwork)
 	}
 
-	if security != SecurityModeSandbox {
+	switch security {
+	case SecurityModeSandbox:
+	case SecurityModeInsecure:
 		addCap(&e.constraints, pb.CapExecMetaSecurity)
+	default:
+		return "", nil, nil, nil, pb.ValidateSecurityMode(security)
 	}
 
 	if p := e.proxyEnv; p != nil {
@@ -302,6 +334,18 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		addCap(&e.constraints, pb.CapExecMountSSH)
 	}
 
+	if len(e.cdiDevices) > 0 {
+		addCap(&e.constraints, pb.CapExecMetaCDI)
+		cd := make([]*pb.CDIDevice, len(e.cdiDevices))
+		for i, d := range e.cdiDevices {
+			cd[i] = &pb.CDIDevice{
+				Name:     d.Name,
+				Optional: d.Optional,
+			}
+		}
+		peo.CdiDevices = cd
+	}
+
 	if e.constraints.Platform == nil {
 		p, err := getPlatform(e.base)(ctx, c)
 		if err != nil {
@@ -320,7 +364,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		inputIndex := pb.InputIndex(len(pop.Inputs))
 		if m.source != nil {
 			if m.tmpfs {
-				return "", nil, nil, nil, errors.Errorf("tmpfs mounts must use scratch")
+				return "", nil, nil, nil, errors.New("tmpfs mounts must use scratch")
 			}
 			inp, err := m.source.ToInput(ctx, c)
 			if err != nil {
@@ -330,7 +374,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 			newInput := true
 
 			for i, inp2 := range pop.Inputs {
-				if *inp == *inp2 {
+				if inp.EqualVT(inp2) {
 					inputIndex = pb.InputIndex(i)
 					newInput = false
 					break
@@ -351,10 +395,10 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		}
 
 		pm := &pb.Mount{
-			Input:    inputIndex,
+			Input:    int64(inputIndex),
 			Dest:     m.target,
 			Readonly: m.readonly,
-			Output:   outputIndex,
+			Output:   int64(outputIndex),
 			Selector: m.selector,
 		}
 		if m.cacheID != "" {
@@ -382,7 +426,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		if m.tmpfs {
 			pm.MountType = pb.MountType_TMPFS
 			pm.TmpfsOpt = &pb.TmpfsOpt{
-				Size_: m.tmpfsOpt.Size,
+				Size: m.tmpfsOpt.Size,
 			}
 		}
 		peo.Mounts = append(peo.Mounts, pm)
@@ -398,7 +442,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		}
 		if s.Target != nil {
 			pm := &pb.Mount{
-				Input:     pb.Empty,
+				Input:     int64(pb.Empty),
 				Dest:      *s.Target,
 				MountType: pb.MountType_SECRET,
 				SecretOpt: &pb.SecretOpt{
@@ -415,7 +459,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 
 	for _, s := range e.ssh {
 		pm := &pb.Mount{
-			Input:     pb.Empty,
+			Input:     int64(pb.Empty),
 			Dest:      s.Target,
 			MountType: pb.MountType_SSH,
 			SSHOpt: &pb.SSHOpt{
@@ -429,12 +473,11 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		peo.Mounts = append(peo.Mounts, pm)
 	}
 
-	dt, err := pop.Marshal()
+	dt, err := deterministicMarshal(pop)
 	if err != nil {
 		return "", nil, nil, nil, err
 	}
-	e.Store(dt, md, e.constraints.SourceLocations, c)
-	return e.Load()
+	return cache.Store(dt, md, e.constraints.SourceLocations, c)
 }
 
 func (e *ExecOp) Output() Output {
@@ -445,10 +488,9 @@ func (e *ExecOp) Inputs() (inputs []Output) {
 	// make sure mounts are sorted
 	// the same sort occurs in (*ExecOp).Marshal, and this
 	// sort must be the same
-	sort.Slice(e.mounts, func(i int, j int) bool {
-		return e.mounts[i].target < e.mounts[j].target
+	slices.SortFunc(e.mounts, func(a, b *mount) int {
+		return strings.Compare(a.target, b.target)
 	})
-
 	seen := map[Output]struct{}{}
 	for _, m := range e.mounts {
 		if m.source != nil {
@@ -465,8 +507,8 @@ func (e *ExecOp) Inputs() (inputs []Output) {
 func (e *ExecOp) getMountIndexFn(m *mount) func() (pb.OutputIndex, error) {
 	return func() (pb.OutputIndex, error) {
 		// make sure mounts are sorted
-		sort.Slice(e.mounts, func(i, j int) bool {
-			return e.mounts[i].target < e.mounts[j].target
+		slices.SortFunc(e.mounts, func(a, b *mount) int {
+			return strings.Compare(a.target, b.target)
 		})
 
 		i := 0
@@ -581,7 +623,8 @@ func Shlex(str string) RunOption {
 		ei.State = shlexf(str, false)(ei.State)
 	})
 }
-func Shlexf(str string, v ...interface{}) RunOption {
+
+func Shlexf(str string, v ...any) RunOption {
 	return runOptionFunc(func(ei *ExecInfo) {
 		ei.State = shlexf(str, true, v...)(ei.State)
 	})
@@ -602,6 +645,47 @@ func AddExtraHost(host string, ip net.IP) RunOption {
 func AddUlimit(name UlimitName, soft int64, hard int64) RunOption {
 	return runOptionFunc(func(ei *ExecInfo) {
 		ei.State = ei.State.AddUlimit(name, soft, hard)
+	})
+}
+
+func AddCDIDevice(opts ...CDIDeviceOption) RunOption {
+	return runOptionFunc(func(ei *ExecInfo) {
+		c := &CDIDeviceInfo{}
+		for _, opt := range opts {
+			opt.SetCDIDeviceOption(c)
+		}
+		ei.CDIDevices = append(ei.CDIDevices, *c)
+	})
+}
+
+type CDIDeviceOption interface {
+	SetCDIDeviceOption(*CDIDeviceInfo)
+}
+
+type cdiDeviceOptionFunc func(*CDIDeviceInfo)
+
+func (fn cdiDeviceOptionFunc) SetCDIDeviceOption(ci *CDIDeviceInfo) {
+	fn(ci)
+}
+
+func CDIDeviceName(name string) CDIDeviceOption {
+	return cdiDeviceOptionFunc(func(ci *CDIDeviceInfo) {
+		ci.Name = name
+	})
+}
+
+var CDIDeviceOptional = cdiDeviceOptionFunc(func(ci *CDIDeviceInfo) {
+	ci.Optional = true
+})
+
+type CDIDeviceInfo struct {
+	Name     string
+	Optional bool
+}
+
+func ValidExitCodes(codes ...int) RunOption {
+	return runOptionFunc(func(ei *ExecInfo) {
+		ei.State = validExitCodes(codes...)(ei.State)
 	})
 }
 
@@ -790,6 +874,7 @@ type ExecInfo struct {
 	ProxyEnv       *ProxyEnv
 	Secrets        []SecretInfo
 	SSH            []SSHInfo
+	CDIDevices     []CDIDeviceInfo
 }
 
 type MountInfo struct {

@@ -17,18 +17,13 @@ copy_binaries() {
 	for file in containerd containerd-shim-runc-v2 ctr runc docker-init rootlesskit dockerd-rootless.sh dockerd-rootless-setuptool.sh; do
 		cp -f "$(command -v "$file")" "$dir/"
 	done
-	# vpnkit might not be available for the target platform, see vpnkit stage in
-	# the Dockerfile for more information.
-	if command -v vpnkit > /dev/null 2>&1; then
-		cp -f "$(command -v vpnkit)" "$dir/"
-	fi
 }
 
 [ -z "$KEEPDEST" ] && rm -rf "$DEST"
 
 (
 	DOCKER_STATIC=1
-	GO_PACKAGE='github.com/docker/docker/cmd/dockerd'
+	GO_PACKAGE='github.com/moby/moby/v2/cmd/dockerd'
 	BINARY_NAME='dockerd'
 	source "${MAKEDIR}/.binary"
 	copy_binaries "$DEST"

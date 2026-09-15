@@ -2,17 +2,20 @@ package build
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/client/buildkit"
-	"github.com/docker/docker/testutil"
+	// Register the npipe: protocol connection helper so the Buildkit client
+	// can dial Windows daemons.
+	_ "github.com/moby/buildkit/client/connhelper/npipe"
+
 	moby_buildkit_v1 "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/util/progress/progressui"
-	"go.opentelemetry.io/otel"
+	"github.com/moby/moby/v2/internal/testutil"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"golang.org/x/sync/errgroup"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/poll"
@@ -29,12 +32,14 @@ func (t *testWriter) Write(p []byte) (int, error) {
 }
 
 func TestBuildkitHistoryTracePropagation(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "buildkit is not supported on Windows")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows" && !testEnv.UsingSnapshotter(),
+		"buildkit is not supported on Windows with graphdrivers")
 
 	ctx := testutil.StartSpan(baseContext, t)
 
-	opts := buildkit.ClientOpts(testEnv.APIClient())
-	bc, err := client.New(ctx, "", opts...)
+	c := testEnv.APIClient()
+	bc, err := client.New(ctx, c.DaemonHost())
+
 	assert.NilError(t, err)
 	defer bc.Close()
 
@@ -80,8 +85,9 @@ func TestBuildkitHistoryTracePropagation(t *testing.T) {
 		return
 	}
 
+	tp := sdktrace.NewTracerProvider()
 	// Split this into a new span so it doesn't clutter up the trace reporting GUI.
-	ctx, span := otel.Tracer("").Start(ctx, "Wait for trace to propagate to history record")
+	ctx, span := tp.Tracer("").Start(ctx, "Wait for trace to propagate to history record")
 	defer span.End()
 
 	t.Log("Waiting for trace to be available")
@@ -106,7 +112,7 @@ func TestBuildkitHistoryTracePropagation(t *testing.T) {
 		}
 
 		if msg.Record.Ref != he.Record.Ref {
-			return poll.Error(fmt.Errorf("got incorrect history record"))
+			return poll.Error(errors.New("got incorrect history record"))
 		}
 		if msg.Record.Trace != nil {
 			return poll.Success()

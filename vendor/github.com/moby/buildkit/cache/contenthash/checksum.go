@@ -3,20 +3,23 @@ package contenthash
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	cerrdefs "github.com/containerd/errdefs"
 	iradix "github.com/hashicorp/go-immutable-radix/v2"
 	simplelru "github.com/hashicorp/golang-lru/v2/simplelru"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/util/cachedigest"
+	"github.com/moby/buildkit/util/pools"
 	"github.com/moby/locker"
 	"github.com/moby/patternmatcher"
 	digest "github.com/opencontainers/go-digest"
@@ -25,10 +28,12 @@ import (
 	fstypes "github.com/tonistiigi/fsutil/types"
 )
 
-var errNotFound = errors.Errorf("not found")
+var errNotFound = errors.New("not found")
 
-var defaultManager *cacheManager
-var defaultManagerOnce sync.Once
+var (
+	defaultManager     *cacheManager
+	defaultManagerOnce sync.Once
+)
 
 func getDefaultManager() *cacheManager {
 	defaultManagerOnce.Do(func() {
@@ -37,6 +42,13 @@ func getDefaultManager() *cacheManager {
 	})
 	return defaultManager
 }
+
+const (
+	CacheRecordTypeFile      = CacheRecordType_FILE
+	CacheRecordTypeDir       = CacheRecordType_DIR
+	CacheRecordTypeDirHeader = CacheRecordType_DIR_HEADER
+	CacheRecordTypeSymlink   = CacheRecordType_SYMLINK
+)
 
 // Layout in the radix tree: Every path is saved by cleaned absolute unix path.
 // Directories have 2 records, one contains digest for directory header, other
@@ -49,6 +61,7 @@ type ChecksumOpts struct {
 	Wildcard        bool
 	IncludePatterns []string
 	ExcludePatterns []string
+	RequiredPaths   []string
 }
 
 func Checksum(ctx context.Context, ref cache.ImmutableRef, path string, opts ChecksumOpts, s session.Group) (digest.Digest, error) {
@@ -82,6 +95,7 @@ type includedPath struct {
 	included         bool
 	includeMatchInfo patternmatcher.MatchInfo
 	excludeMatchInfo patternmatcher.MatchInfo
+	followLinks      bool
 }
 
 type cacheManager struct {
@@ -101,6 +115,9 @@ func (cm *cacheManager) Checksum(ctx context.Context, ref cache.ImmutableRef, p 
 	if err != nil {
 		return "", nil
 	}
+	// only applies for Windows, it's a no-op on non-Windows.
+	enableProcessPrivileges()
+	defer disableProcessPrivileges()
 	return cc.Checksum(ctx, ref, p, opts, s)
 }
 
@@ -242,7 +259,7 @@ func (cc *cacheContext) load() error {
 	}
 
 	var l CacheRecords
-	if err := l.Unmarshal(dt); err != nil {
+	if err := l.UnmarshalVT(dt); err != nil {
 		return err
 	}
 
@@ -272,7 +289,7 @@ func (cc *cacheContext) save() error {
 		return false
 	})
 
-	dt, err := l.Marshal()
+	dt, err := l.MarshalVT()
 	if err != nil {
 		return err
 	}
@@ -312,7 +329,7 @@ func (cc *cacheContext) HandleChange(kind fsutil.ChangeKind, p string, fi os.Fil
 		if _, ok := cc.node.Get([]byte{0}); !ok {
 			cc.txn.Insert([]byte{0}, &CacheRecord{
 				Type:   CacheRecordTypeDirHeader,
-				Digest: digest.FromBytes(nil),
+				Digest: string(digest.FromBytes(nil)),
 			})
 			cc.txn.Insert([]byte(""), &CacheRecord{
 				Type: CacheRecordTypeDir,
@@ -343,9 +360,12 @@ func (cc *cacheContext) HandleChange(kind fsutil.ChangeKind, p string, fi os.Fil
 		return errors.Errorf("invalid fileinfo: %s", p)
 	}
 
+	// if we are replacing a directory with a non-directory, rm -rf the tree under the existing dir
 	v, ok := cc.node.Get(k)
 	if ok {
-		deleteDir(v)
+		if v.Type == CacheRecordTypeDir && !fi.IsDir() {
+			deleteDir(v)
+		}
 	}
 
 	cr := &CacheRecord{
@@ -364,7 +384,7 @@ func (cc *cacheContext) HandleChange(kind fsutil.ChangeKind, p string, fi os.Fil
 		k = append(k, 0)
 		p += "/"
 	}
-	cr.Digest = h.Digest()
+	cr.Digest = string(h.Digest())
 
 	// if we receive a hardlink just use the digest of the source
 	// note that the source may be called later because data writing is async
@@ -372,8 +392,7 @@ func (cc *cacheContext) HandleChange(kind fsutil.ChangeKind, p string, fi os.Fil
 		ln := path.Join("/", filepath.ToSlash(stat.Linkname))
 		v, ok := cc.txn.Get(convertPathToKey(ln))
 		if ok {
-			cp := *v
-			cr = &cp
+			cr = v.CloneVT()
 		}
 		cc.linkMap[ln] = append(cc.linkMap[ln], k)
 	}
@@ -384,7 +403,7 @@ func (cc *cacheContext) HandleChange(kind fsutil.ChangeKind, p string, fi os.Fil
 			for _, l := range links {
 				pp := convertKeyToPath(l)
 				cc.txn.Insert(l, cr)
-				d := path.Dir(string(pp))
+				d := path.Dir(pp)
 				if d == "/" {
 					d = ""
 				}
@@ -411,42 +430,43 @@ func (cc *cacheContext) Checksum(ctx context.Context, mountable cache.Mountable,
 		return cc.lazyChecksum(ctx, m, p, opts.FollowLinks)
 	}
 
-	includedPaths, err := cc.includedPaths(ctx, m, p, opts)
+	prefix, includedPaths, err := cc.includedPaths(ctx, m, p, opts)
 	if err != nil {
 		return "", err
 	}
 
-	if opts.FollowLinks {
-		for i, w := range includedPaths {
-			if w.record.Type == CacheRecordTypeSymlink {
-				dgst, err := cc.lazyChecksum(ctx, m, w.path, opts.FollowLinks)
-				if err != nil {
-					return "", err
-				}
-				includedPaths[i].record = &CacheRecord{Digest: dgst}
+	for i, w := range includedPaths {
+		if w.followLinks && w.record.Type == CacheRecordTypeSymlink {
+			dgst, err := cc.lazyChecksum(ctx, m, w.path, opts.FollowLinks)
+			if err != nil {
+				return "", err
 			}
+			includedPaths[i].record = &CacheRecord{Digest: string(dgst)}
 		}
 	}
+
 	if len(includedPaths) == 0 {
 		return digest.FromBytes([]byte{}), nil
 	}
 
 	if len(includedPaths) == 1 && path.Base(p) == path.Base(includedPaths[0].path) {
-		return includedPaths[0].record.Digest, nil
+		return digest.Digest(includedPaths[0].record.Digest), nil
 	}
 
-	digester := digest.Canonical.Digester()
-	for i, w := range includedPaths {
-		if i != 0 {
-			digester.Hash().Write([]byte{0})
+	h := cachedigest.NewHash(cachedigest.TypeFileList)
+	for _, w := range includedPaths {
+		path := strings.TrimPrefix(w.path, prefix)
+		k := convertPathToKey(path)
+		if len(k) == 0 {
+			k = []byte{0}
 		}
-		digester.Hash().Write([]byte(path.Base(w.path)))
-		digester.Hash().Write([]byte(w.record.Digest))
+		h.Write(k)
+		h.Write([]byte(w.record.Digest))
 	}
-	return digester.Digest(), nil
+	return h.Sum(), nil
 }
 
-func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, opts ChecksumOpts) ([]*includedPath, error) {
+func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, opts ChecksumOpts) (string, []*includedPath, error) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
@@ -457,11 +477,11 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 	root := cc.tree.Root()
 	scan, err := cc.needsScan(root, "", false)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	if scan {
 		if err := cc.scanPath(ctx, m, "", false); err != nil {
-			return nil, err
+			return "", nil, err
 		}
 	}
 
@@ -479,7 +499,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 	if len(opts.IncludePatterns) != 0 {
 		includePatternMatcher, err = patternmatcher.New(opts.IncludePatterns)
 		if err != nil {
-			return nil, errors.Wrapf(err, "invalid includepatterns: %s", opts.IncludePatterns)
+			return "", nil, errors.Wrapf(err, "invalid includepatterns: %s", opts.IncludePatterns)
 		}
 	}
 
@@ -487,7 +507,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 	if len(opts.ExcludePatterns) != 0 {
 		excludePatternMatcher, err = patternmatcher.New(opts.ExcludePatterns)
 		if err != nil {
-			return nil, errors.Wrapf(err, "invalid excludepatterns: %s", opts.ExcludePatterns)
+			return "", nil, errors.Wrapf(err, "invalid excludepatterns: %s", opts.ExcludePatterns)
 		}
 	}
 
@@ -509,7 +529,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 	if opts.Wildcard {
 		origPrefix, k, keyOk, err = wildcardPrefix(root, p)
 		if err != nil {
-			return nil, err
+			return "", nil, err
 		}
 	} else {
 		origPrefix = p
@@ -521,14 +541,14 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		var cr *CacheRecord
 		k, cr, err = getFollowLinks(root, k, false)
 		if err != nil {
-			return nil, err
+			return "", nil, err
 		}
 		keyOk = (cr != nil)
 	}
 
 	if origPrefix != "" {
 		if keyOk {
-			iter.SeekLowerBound(append(append([]byte{}, k...), 0))
+			iter.SeekLowerBound(append(slices.Clone(k), 0))
 		}
 
 		resolvedPrefix = convertKeyToPath(k)
@@ -554,8 +574,8 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		//
 		// When wildcards are enabled, this translation applies to the
 		// portion of 'p' before any wildcards.
-		if strings.HasPrefix(fn, resolvedPrefix) {
-			fn = origPrefix + strings.TrimPrefix(fn, resolvedPrefix)
+		if after, ok := strings.CutPrefix(fn, resolvedPrefix); ok {
+			fn = origPrefix + after
 		}
 
 		for len(parentDirHeaders) != 0 {
@@ -582,12 +602,16 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 		}
 
 		maybeIncludedPath := &includedPath{path: fn}
+		if parentDir == nil && opts.FollowLinks {
+			maybeIncludedPath.followLinks = true
+		}
+
 		var shouldInclude bool
 		if opts.Wildcard {
 			if p != "" && (lastMatchedDir == "" || !strings.HasPrefix(fn, lastMatchedDir+"/")) {
 				include, err := path.Match(p, fn)
 				if err != nil {
-					return nil, err
+					return "", nil, err
 				}
 				if !include {
 					k, _, keyOk = iter.Next()
@@ -604,7 +628,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 				parentDir,
 			)
 			if err != nil {
-				return nil, err
+				return "", nil, err
 			}
 		} else {
 			if !strings.HasPrefix(fn+"/", p+"/") {
@@ -619,7 +643,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 				parentDir,
 			)
 			if err != nil {
-				return nil, err
+				return "", nil, err
 			}
 		}
 
@@ -630,7 +654,7 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 
 		cr, upt, err := cc.checksum(ctx, root, txn, m, k, false)
 		if err != nil {
-			return nil, err
+			return "", nil, err
 		}
 		if upt {
 			updated = true
@@ -669,7 +693,18 @@ func (cc *cacheContext) includedPaths(ctx context.Context, m *mount, p string, o
 	cc.tree = txn.Commit()
 	cc.dirty = updated
 
-	return includedPaths, nil
+	// Validate that all required paths exist.
+	for _, requiredPath := range opts.RequiredPaths {
+		found := slices.ContainsFunc(includedPaths, func(includedPath *includedPath) bool {
+			return strings.HasPrefix(includedPath.path, requiredPath)
+		})
+
+		if !found {
+			return "", nil, errors.Wrapf(cerrdefs.ErrNotFound, "%q", requiredPath)
+		}
+	}
+
+	return origPrefix, includedPaths, nil
 }
 
 func shouldIncludePath(
@@ -759,11 +794,11 @@ func splitWildcards(p string) (d1, d2 string) {
 
 func containsWildcards(name string) bool {
 	for i := 0; i < len(name); i++ {
-		ch := name[i]
-		if ch == '\\' {
-			i++
-		} else if ch == '*' || ch == '?' || ch == '[' {
+		switch name[i] {
+		case '*', '?', '[':
 			return true
+		case '\\':
+			i++
 		}
 	}
 	return false
@@ -784,7 +819,7 @@ func (cc *cacheContext) lazyChecksum(ctx context.Context, m *mount, p string, fo
 			return "", err
 		}
 		if cr != nil && cr.Digest != "" {
-			return cr.Digest, nil
+			return digest.Digest(cr.Digest), nil
 		}
 	} else {
 		cc.mu.RUnlock()
@@ -808,7 +843,7 @@ func (cc *cacheContext) lazyChecksum(ctx context.Context, m *mount, p string, fo
 	if err != nil {
 		return "", err
 	}
-	return cr.Digest, nil
+	return digest.Digest(cr.Digest), nil
 }
 
 func (cc *cacheContext) commitActiveTransaction() {
@@ -866,16 +901,13 @@ func (cc *cacheContext) checksum(ctx context.Context, root *iradix.Node[*CacheRe
 
 	switch cr.Type {
 	case CacheRecordTypeDir:
-		h := sha256.New()
+		h := cachedigest.NewHash(cachedigest.TypeFileList)
 		next := append(k, 0)
 		iter := root.Iterator()
-		iter.SeekLowerBound(append(append([]byte{}, next...), 0))
+		iter.SeekLowerBound(append(slices.Clone(next), 0))
 		subk := next
 		ok := true
-		for {
-			if !ok || !bytes.HasPrefix(subk, next) {
-				break
-			}
+		for ok && bytes.HasPrefix(subk, next) {
 			h.Write(bytes.TrimPrefix(subk, k))
 
 			// We do not follow trailing links when checksumming a directory's
@@ -894,7 +926,7 @@ func (cc *cacheContext) checksum(ctx context.Context, root *iradix.Node[*CacheRe
 			}
 			subk, _, ok = iter.Next()
 		}
-		dgst = digest.NewDigest(digest.SHA256, h)
+		dgst = h.Sum()
 
 	default:
 		p := convertKeyToPath(bytes.TrimSuffix(k, []byte{0}))
@@ -919,7 +951,7 @@ func (cc *cacheContext) checksum(ctx context.Context, root *iradix.Node[*CacheRe
 	}
 
 	cr2 := &CacheRecord{
-		Digest:   dgst,
+		Digest:   string(dgst),
 		Type:     cr.Type,
 		Linkname: cr.Linkname,
 	}
@@ -1034,7 +1066,7 @@ func (cc *cacheContext) scanPath(ctx context.Context, m *mount, p string, follow
 		scanPath = resolvedPath
 	}
 
-	err = filepath.Walk(scanPath, func(itemPath string, fi os.FileInfo, err error) error {
+	walkFunc := func(itemPath string, fi os.FileInfo, err error) error {
 		if scanCounterEnable {
 			scanCounter.Add(1)
 		}
@@ -1073,7 +1105,9 @@ func (cc *cacheContext) scanPath(ctx context.Context, m *mount, p string, follow
 			txn.Insert(k, cr)
 		}
 		return nil
-	})
+	}
+
+	err = cc.walk(scanPath, walkFunc)
 	if err != nil {
 		return err
 	}
@@ -1228,15 +1262,13 @@ func ensureOriginMetadata(md cache.RefMetadata) cache.RefMetadata {
 	return em
 }
 
-var pool32K = sync.Pool{
-	New: func() interface{} {
-		buf := make([]byte, 32*1024) // 32K
-		return &buf
-	},
-}
+var pool32K = pools.New(func() *[]byte {
+	buf := make([]byte, 32*1024) // 32K
+	return &buf
+})
 
 func poolsCopy(dst io.Writer, src io.Reader) (written int64, err error) {
-	buf := pool32K.Get().(*[]byte)
+	buf := pool32K.Get()
 	written, err = io.CopyBuffer(dst, src, *buf)
 	pool32K.Put(buf)
 	return

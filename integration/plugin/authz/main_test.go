@@ -1,6 +1,6 @@
 //go:build !windows
 
-package authz // import "github.com/docker/docker/integration/plugin/authz"
+package authz
 
 import (
 	"context"
@@ -13,11 +13,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/pkg/authorization"
-	"github.com/docker/docker/pkg/plugins"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/daemon"
-	"github.com/docker/docker/testutil/environment"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
+	"github.com/moby/moby/v2/internal/testutil/environment"
+	"github.com/moby/moby/v2/pkg/authorization"
+	"github.com/moby/moby/v2/pkg/plugins"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -71,7 +71,6 @@ func TestMain(m *testing.M) {
 func setupTest(t *testing.T) context.Context {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	skip.If(t, testEnv.IsRootless, "rootless mode has different view of localhost")
 
 	ctx := testutil.StartSpan(baseContext, t)
 	environment.ProtectAll(ctx, t, testEnv)

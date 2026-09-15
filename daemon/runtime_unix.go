@@ -15,14 +15,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/containerd/plugin"
-	v2runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
+	runcoptions "github.com/containerd/containerd/api/types/runc/options"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/log"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/libcontainerd/shimopts"
-	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/docker/pkg/system"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/internal/libcontainerd/shimopts"
+	"github.com/moby/moby/v2/errdefs"
+	"github.com/moby/sys/atomicwriter"
 	"github.com/opencontainers/runtime-spec/specs-go/features"
 	"github.com/pkg/errors"
 )
@@ -36,7 +35,7 @@ const (
 
 type shimConfig struct {
 	Shim     string
-	Opts     interface{}
+	Opts     any
 	Features *features.Features
 
 	// Check if the ShimConfig is valid given the current state of the system.
@@ -57,8 +56,8 @@ func stockRuntimes() map[string]string {
 
 func defaultV2ShimConfig(conf *config.Config, runtimePath string) *shimConfig {
 	shim := &shimConfig{
-		Shim: plugin.RuntimeRuncV2,
-		Opts: &v2runcoptions.Options{
+		Shim: plugins.RuntimeRuncV2,
+		Opts: &runcoptions.Options{
 			BinaryName:    runtimePath,
 			Root:          filepath.Join(conf.ExecRoot, "runtime-"+defaultRuntimeName),
 			SystemdCgroup: UsingSystemd(conf),
@@ -74,7 +73,7 @@ func defaultV2ShimConfig(conf *config.Config, runtimePath string) *shimConfig {
 	} else {
 		var features features.Features
 		if jsonErr := json.Unmarshal(featuresB, &features); jsonErr != nil {
-			log.G(context.TODO()).WithError(err).Warnf("Failed to unmarshal the output of %v as a JSON", featuresCmd.Args)
+			log.G(context.TODO()).WithError(jsonErr).Warnf("Failed to unmarshal the output of %v as a JSON", featuresCmd.Args)
 		} else {
 			shim.Features = &features
 		}
@@ -94,7 +93,7 @@ func initRuntimesDir(cfg *config.Config) error {
 	if err := os.RemoveAll(runtimeDir); err != nil {
 		return err
 	}
-	return system.MkdirAll(runtimeDir, 0o700)
+	return os.MkdirAll(runtimeDir, 0o700)
 }
 
 func setupRuntimes(cfg *config.Config) (runtimes, error) {
@@ -192,7 +191,7 @@ func wrapRuntime(dir, name, binary string, args []string) (string, error) {
 	// containers.
 	suffix := base32Disemvoweled.EncodeToString(sum.Sum(nil))
 	scriptPath := filepath.Join(dir, name+"."+suffix)
-	if err := ioutils.AtomicWriteFile(scriptPath, wrapper.Bytes(), 0o700); err != nil {
+	if err := atomicwriter.WriteFile(scriptPath, wrapper.Bytes(), 0o700); err != nil {
 		return "", err
 	}
 	return scriptPath, nil
@@ -201,7 +200,7 @@ func wrapRuntime(dir, name, binary string, args []string) (string, error) {
 // Get returns the containerd runtime and options for name, suitable to pass
 // into containerd.WithRuntime(). The runtime and options for the default
 // runtime are returned when name is the empty string.
-func (r *runtimes) Get(name string) (string, interface{}, error) {
+func (r *runtimes) Get(name string) (string, any, error) {
 	if name == "" {
 		name = r.Default
 	}
@@ -250,7 +249,7 @@ func (r *runtimes) Features(name string) *features.Features {
 // available for use with Docker by installing them onto PATH following the
 // [binary naming convention] for containerd Runtime v2.
 //
-// [binary naming convention]: https://github.com/containerd/containerd/blob/main/runtime/v2/README.md#binary-naming
+// [binary naming convention]: https://github.com/containerd/containerd/blob/v2.3.0/docs/runtime-v2.md#invoking-runtimes
 func isPermissibleC8dRuntimeName(name string) bool {
 	// containerd uses a rather permissive test to validate runtime names:
 	//

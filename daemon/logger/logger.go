@@ -5,14 +5,14 @@
 // factory, which holds the contextual instance information that
 // allows multiple loggers of the same type to perform different
 // actions, such as logging to different locations.
-package logger // import "github.com/docker/docker/daemon/logger"
+package logger
 
 import (
 	"context"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/backend"
+	"github.com/moby/moby/v2/daemon/server/backend"
 )
 
 // ErrReadLogsNotSupported is returned when the underlying log driver does not support reading
@@ -29,7 +29,7 @@ const (
 	logWatcherBufferSize = 4096
 )
 
-var messagePool = &sync.Pool{New: func() interface{} { return &Message{Line: make([]byte, 0, 256)} }}
+var messagePool = &sync.Pool{New: func() any { return &Message{Line: make([]byte, 0, 256)} }}
 
 // NewMessage returns a new message from the message sync.Pool
 func NewMessage() *Message {
@@ -66,6 +66,8 @@ func (m *Message) AsLogMessage() *backend.LogMessage {
 
 // Logger is the interface for docker logging drivers.
 type Logger interface {
+	// The logger takes ownership of the Message on success. The caller
+	// retains ownership of the Message if an error is returned.
 	Log(*Message) error
 	Name() string
 	Close() error

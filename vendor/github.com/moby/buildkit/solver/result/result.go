@@ -62,7 +62,7 @@ func (r *Result[T]) SingleRef() (T, error) {
 	var zero T
 	if r.Refs != nil && r.Ref == zero {
 		var t T
-		return t, errors.Errorf("invalid map result")
+		return t, errors.New("invalid map result")
 	}
 	return r.Ref, nil
 }
@@ -108,6 +108,20 @@ func (r *Result[T]) EachRef(fn func(T) error) (err error) {
 		}
 	}
 	return err
+}
+
+// IsEmpty returns true if this result does not refer to
+// any references.
+func (r *Result[T]) IsEmpty() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.Refs) > 0 {
+		return false
+	}
+
+	var zero T
+	return r.Ref == zero
 }
 
 // EachRef iterates over references in both a and b.

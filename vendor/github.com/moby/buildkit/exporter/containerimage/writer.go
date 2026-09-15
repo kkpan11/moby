@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/diff"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/labels"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/platforms"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	"github.com/moby/buildkit/cache"
@@ -25,6 +25,8 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver"
+	solvererrdefs "github.com/moby/buildkit/solver/errdefs"
+	"github.com/moby/buildkit/solver/llbsolver/compat"
 	"github.com/moby/buildkit/solver/result"
 	attestationTypes "github.com/moby/buildkit/util/attestation"
 	"github.com/moby/buildkit/util/bklog"
@@ -46,6 +48,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const attestationManifestArtifactType = "application/vnd.docker.attestation.manifest.v1+json"
+
 type WriterOpt struct {
 	Snapshotter  snapshot.Snapshotter
 	ContentStore content.Store
@@ -61,9 +65,16 @@ type ImageWriter struct {
 	opt WriterOpt
 }
 
-func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, sessionID string, inlineCache exptypes.InlineCache, opts *ImageCommitOpts) (*ocispecs.Descriptor, error) {
+func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, sessionID string, inlineCache exptypes.InlineCache, opts *ImageCommitOpts, compatibilityVersion int, exporterType string) (*ocispecs.Descriptor, error) {
 	if _, ok := inp.Metadata[exptypes.ExporterPlatformsKey]; len(inp.Refs) > 0 && !ok {
 		return nil, errors.Errorf("unable to export multiple refs, missing platforms mapping")
+	}
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
+	if compatibilityVersion == compat.CompatibilityVersion013 && opts.RefCfg.Compression.Type == compression.Zstd {
+		feature := fmt.Sprintf("%s exporter compression=%s", exporterType, opts.RefCfg.Compression.Type.String())
+		return nil, solvererrdefs.NewUnsupportedCompatibilityFeatureError(compatibilityVersion, feature)
 	}
 
 	isMap := len(inp.Refs) > 0
@@ -92,10 +103,10 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 		}
 	}
 	if opts.Epoch == nil {
-		if tm, ok, err := epoch.ParseSource(inp); err != nil {
+		if tm, err := epoch.ParseSource(inp, nil); err != nil {
 			return nil, err
-		} else if ok {
-			opts.Epoch = tm
+		} else if tm != nil {
+			opts.Epoch = &epoch.Epoch{Value: tm}
 		}
 	}
 
@@ -105,25 +116,35 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 				return nil, errors.Errorf("invalid annotation: no platform %s found in source", pk)
 			}
 		}
-		if len(a.Index)+len(a.IndexDescriptor)+len(a.ManifestDescriptor) > 0 {
-			opts.EnableOCITypes(ctx, "annotations")
+		if !opts.OCITypesEnabled() && len(a.Index)+len(a.IndexDescriptor)+len(a.ManifestDescriptor) > 0 {
+			return nil, errors.New("cannot export annotations with \"oci-mediatypes=false\"")
 		}
 	}
 
 	if !isMap {
 		if len(ps.Platforms) > 1 {
-			return nil, errors.Errorf("cannot export multiple platforms without multi-platform enabled")
+			return nil, errors.New("cannot export multiple platforms without multi-platform enabled")
 		}
 
 		var ref cache.ImmutableRef
 		var p *exptypes.Platform
+		var expEpoch *time.Time
 		if len(ps.Platforms) > 0 {
 			p = &ps.Platforms[0]
 			if r, ok := inp.FindRef(p.ID); ok {
 				ref = r
 			}
+			if opts.Epoch == nil {
+				expEpoch, err = epoch.ParseSource(inp, p)
+				if err != nil {
+					return nil, err
+				}
+			}
 		} else {
 			ref = inp.Ref
+		}
+		if opts.Epoch != nil {
+			expEpoch = opts.Epoch.Value
 		}
 		config := exptypes.ParseKey(inp.Metadata, exptypes.ExporterImageConfigKey, p)
 		baseImgConfig := exptypes.ParseKey(inp.Metadata, exptypes.ExporterImageBaseConfigKey, p)
@@ -142,7 +163,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 		}
 		remote := &remotes[0]
 		if opts.RewriteTimestamp {
-			remote, err = ic.rewriteRemoteWithEpoch(ctx, opts, remote, baseImg)
+			remote, err = ic.rewriteRemoteWithEpoch(ctx, opts, remote, baseImg, expEpoch)
 			if err != nil {
 				return nil, err
 			}
@@ -168,7 +189,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 			}
 		}
 
-		mfstDesc, configDesc, err := ic.commitDistributionManifest(ctx, opts, ref, config, remote, annotations, inlineCacheEntry, opts.Epoch, session.NewGroup(sessionID), baseImg)
+		mfstDesc, configDesc, err := ic.commitDistributionManifest(ctx, opts, ref, config, remote, annotations, inlineCacheEntry, expEpoch, session.NewGroup(sessionID), baseImg)
 		if err != nil {
 			return nil, err
 		}
@@ -183,8 +204,8 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 		return mfstDesc, nil
 	}
 
-	if len(inp.Attestations) > 0 {
-		opts.EnableOCITypes(ctx, "attestations")
+	if !opts.OCITypesEnabled() && len(inp.Attestations) > 0 {
+		return nil, errors.New("cannot export attestations with \"oci-mediatypes=false\"")
 	}
 
 	refs := make([]cache.ImmutableRef, 0, len(inp.Refs))
@@ -219,7 +240,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 		},
 	}
 
-	if !opts.OCITypes {
+	if !opts.OCITypesEnabled() {
 		idx.MediaType = images.MediaTypeDockerSchema2ManifestList
 	}
 
@@ -243,6 +264,16 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 			baseImg = &baseImgX
 		}
 
+		var expEpoch *time.Time
+		if opts.Epoch == nil {
+			expEpoch, err = epoch.ParseSource(inp, &p)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			expEpoch = opts.Epoch.Value
+		}
+
 		remote := &remotes[remotesMap[p.ID]]
 		if remote == nil {
 			remote = &solver.Remote{
@@ -250,7 +281,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 			}
 		}
 		if opts.RewriteTimestamp {
-			remote, err = ic.rewriteRemoteWithEpoch(ctx, opts, remote, baseImg)
+			remote, err = ic.rewriteRemoteWithEpoch(ctx, opts, remote, baseImg, expEpoch)
 			if err != nil {
 				return nil, err
 			}
@@ -261,7 +292,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 			inlineCacheEntry, _ = inlineCacheResult.FindRef(p.ID)
 		}
 
-		desc, _, err := ic.commitDistributionManifest(ctx, opts, r, config, remote, opts.Annotations.Platform(&p.Platform), inlineCacheEntry, opts.Epoch, session.NewGroup(sessionID), baseImg)
+		desc, _, err := ic.commitDistributionManifest(ctx, opts, r, config, remote, opts.Annotations.Platform(&p.Platform), inlineCacheEntry, expEpoch, session.NewGroup(sessionID), baseImg)
 		if err != nil {
 			return nil, err
 		}
@@ -279,7 +310,6 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 
 			eg, ctx2 := errgroup.WithContext(ctx)
 			for i, att := range attestations {
-				i, att := i, att
 				eg.Go(func() error {
 					att, err := supplementSBOM(ctx2, session.NewGroup(sessionID), r, remote, att)
 					if err != nil {
@@ -294,7 +324,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 			}
 
 			var defaultSubjects []intoto.Subject
-			for _, name := range strings.Split(opts.ImageName, ",") {
+			for name := range strings.SplitSeq(opts.ImageName, ",") {
 				if name == "" {
 					continue
 				}
@@ -312,7 +342,7 @@ func (ic *ImageWriter) Commit(ctx context.Context, inp *exporter.Source, session
 				return nil, err
 			}
 
-			desc, err := ic.commitAttestationsManifest(ctx, opts, desc.Digest.String(), stmts)
+			desc, err := ic.commitAttestationsManifest(ctx, opts, *desc, stmts, opts.OCIArtifactEnabled())
 			if err != nil {
 				return nil, err
 			}
@@ -406,8 +436,8 @@ func rewriteImageLayerWithEpoch(ctx context.Context, cs content.Store, desc ocis
 	return converterFn(ctx, cs, desc)
 }
 
-func (ic *ImageWriter) rewriteRemoteWithEpoch(ctx context.Context, opts *ImageCommitOpts, remote *solver.Remote, baseImg *dockerspec.DockerOCIImage) (*solver.Remote, error) {
-	if opts.Epoch == nil {
+func (ic *ImageWriter) rewriteRemoteWithEpoch(ctx context.Context, opts *ImageCommitOpts, remote *solver.Remote, baseImg *dockerspec.DockerOCIImage, expEpoch *time.Time) (*solver.Remote, error) {
+	if expEpoch == nil {
 		bklog.G(ctx).Warn("rewrite-timestamp is specified, but no source-date-epoch was found")
 		return remote, nil
 	}
@@ -415,10 +445,9 @@ func (ic *ImageWriter) rewriteRemoteWithEpoch(ctx context.Context, opts *ImageCo
 	cs := contentutil.NewStoreWithProvider(ic.opt.ContentStore, remote.Provider)
 	eg, ctx := errgroup.WithContext(ctx)
 	rewriteDone := progress.OneOff(ctx,
-		fmt.Sprintf("rewriting layers with source-date-epoch %d (%s)", opts.Epoch.Unix(), opts.Epoch.String()))
+		fmt.Sprintf("rewriting layers with source-date-epoch %d (%s)", expEpoch.Unix(), expEpoch.String()))
 	var divergedFromBase bool
 	for i, desc := range remoteDescriptors {
-		i, desc := i, desc
 		// Usually we get non-empty diffID here, but if the content was ingested via a third-party containerd client,
 		// diffID here can be empty, and will be computed by the converter.
 		diffID := digest.Digest(desc.Annotations[labels.LabelUncompressed])
@@ -439,9 +468,9 @@ func (ic *ImageWriter) rewriteRemoteWithEpoch(ctx context.Context, opts *ImageCo
 			divergedFromBase = true
 		}
 		eg.Go(func() error {
-			if rewrittenDesc, err := rewriteImageLayerWithEpoch(ctx, cs, desc, opts.RefCfg.Compression, opts.Epoch, immDiffID); err != nil {
+			if rewrittenDesc, err := rewriteImageLayerWithEpoch(ctx, cs, desc, opts.RefCfg.Compression, expEpoch, immDiffID); err != nil {
 				bklog.G(ctx).WithError(err).Warnf("failed to rewrite layer %d/%d to match source-date-epoch %d (%s)",
-					i+1, len(remoteDescriptors), opts.Epoch.Unix(), opts.Epoch.String())
+					i+1, len(remoteDescriptors), expEpoch.Unix(), expEpoch.String())
 			} else if rewrittenDesc != nil {
 				remoteDescriptors[i] = *rewrittenDesc
 			}
@@ -488,7 +517,7 @@ func (ic *ImageWriter) commitDistributionManifest(ctx context.Context, opts *Ima
 	)
 
 	// Use docker media types for older Docker versions and registries
-	if !opts.OCITypes {
+	if !opts.OCITypesEnabled() {
 		manifestType = images.MediaTypeDockerSchema2Manifest
 		configType = images.MediaTypeDockerSchema2Config
 	}
@@ -511,7 +540,7 @@ func (ic *ImageWriter) commitDistributionManifest(ctx context.Context, opts *Ima
 	}
 
 	for i, desc := range remote.Descriptors {
-		desc.Annotations = RemoveInternalLayerAnnotations(desc.Annotations, opts.OCITypes)
+		desc.Annotations = RemoveInternalLayerAnnotations(desc.Annotations, opts.OCITypesEnabled())
 		mfst.Layers = append(mfst.Layers, desc)
 		labels[fmt.Sprintf("containerd.io/gc.ref.content.%d", i+1)] = desc.Digest.String()
 	}
@@ -553,20 +582,18 @@ func (ic *ImageWriter) commitDistributionManifest(ctx context.Context, opts *Ima
 	}, &configDesc, nil
 }
 
-func (ic *ImageWriter) commitAttestationsManifest(ctx context.Context, opts *ImageCommitOpts, target string, statements []intoto.Statement) (*ocispecs.Descriptor, error) {
+func (ic *ImageWriter) commitAttestationsManifest(ctx context.Context, opts *ImageCommitOpts, target ocispecs.Descriptor, statements []intoto.Statement, ociArtifact bool) (*ocispecs.Descriptor, error) {
 	var (
 		manifestType = ocispecs.MediaTypeImageManifest
 		configType   = ocispecs.MediaTypeImageConfig
 	)
-	if !opts.OCITypes {
+	if !opts.OCITypesEnabled() {
 		manifestType = images.MediaTypeDockerSchema2Manifest
 		configType = images.MediaTypeDockerSchema2Config
 	}
 
 	layers := make([]ocispecs.Descriptor, len(statements))
 	for i, statement := range statements {
-		i, statement := i, statement
-
 		data, err := json.Marshal(statement)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to marshal attestation")
@@ -588,15 +615,21 @@ func (ic *ImageWriter) commitAttestationsManifest(ctx context.Context, opts *Ima
 		layers[i] = desc
 	}
 
-	config, err := attestationsConfig(layers)
-	if err != nil {
-		return nil, err
-	}
-	configDigest := digest.FromBytes(config)
-	configDesc := ocispecs.Descriptor{
-		Digest:    configDigest,
-		Size:      int64(len(config)),
-		MediaType: configType,
+	configDesc := ocispecs.DescriptorEmptyJSON
+	config := configDesc.Data
+
+	if !ociArtifact {
+		var err error
+		config, err = attestationsConfig(layers)
+		if err != nil {
+			return nil, err
+		}
+		configDigest := digest.FromBytes(config)
+		configDesc = ocispecs.Descriptor{
+			Digest:    configDigest,
+			Size:      int64(len(config)),
+			MediaType: configType,
+		}
 	}
 
 	mfst := ocispecs.Manifest{
@@ -604,18 +637,23 @@ func (ic *ImageWriter) commitAttestationsManifest(ctx context.Context, opts *Ima
 		Versioned: specs.Versioned{
 			SchemaVersion: 2,
 		},
-		Config: ocispecs.Descriptor{
-			Digest:    configDigest,
-			Size:      int64(len(config)),
-			MediaType: configType,
-		},
+		Config: configDesc,
+	}
+
+	if ociArtifact {
+		mfst.ArtifactType = attestationManifestArtifactType
+		mfst.Subject = &ocispecs.Descriptor{
+			Digest:    target.Digest,
+			Size:      target.Size,
+			MediaType: target.MediaType,
+		}
 	}
 
 	labels := map[string]string{
-		"containerd.io/gc.ref.content.0": configDigest.String(),
+		"containerd.io/gc.ref.content.0": configDesc.Digest.String(),
 	}
 	for i, desc := range layers {
-		desc.Annotations = RemoveInternalLayerAnnotations(desc.Annotations, opts.OCITypes)
+		desc.Annotations = RemoveInternalLayerAnnotations(desc.Annotations, opts.OCITypesEnabled())
 		mfst.Layers = append(mfst.Layers, desc)
 		labels[fmt.Sprintf("containerd.io/gc.ref.content.%d", i+1)] = desc.Digest.String()
 	}
@@ -635,7 +673,7 @@ func (ic *ImageWriter) commitAttestationsManifest(ctx context.Context, opts *Ima
 	if err := content.WriteBlob(ctx, ic.opt.ContentStore, mfstDigest.String(), bytes.NewReader(mfstJSON), mfstDesc, content.WithLabels((labels))); err != nil {
 		return nil, done(errors.Wrapf(err, "error writing manifest blob %s", mfstDigest))
 	}
-	if err := content.WriteBlob(ctx, ic.opt.ContentStore, configDigest.String(), bytes.NewReader(config), configDesc); err != nil {
+	if err := content.WriteBlob(ctx, ic.opt.ContentStore, configDesc.Digest.String(), bytes.NewReader(config), configDesc); err != nil {
 		return nil, done(errors.Wrap(err, "error writing config blob"))
 	}
 	done(nil)
@@ -646,7 +684,7 @@ func (ic *ImageWriter) commitAttestationsManifest(ctx context.Context, opts *Ima
 		MediaType: manifestType,
 		Annotations: map[string]string{
 			attestationTypes.DockerAnnotationReferenceType:   attestationTypes.DockerAnnotationReferenceTypeDefault,
-			attestationTypes.DockerAnnotationReferenceDigest: target,
+			attestationTypes.DockerAnnotationReferenceDigest: string(target.Digest),
 		},
 	}, nil
 }
@@ -674,7 +712,10 @@ func defaultImageConfig() ([]byte, error) {
 	img.Variant = pl.Variant
 	img.RootFS.Type = "layers"
 	img.Config.WorkingDir = "/"
-	img.Config.Env = []string{"PATH=" + system.DefaultPathEnv(pl.OS)}
+	// don't set default PATH on Windows. #5445
+	if pl.OS != "windows" {
+		img.Config.Env = []string{"PATH=" + system.DefaultPathEnv(pl.OS)}
+	}
 	dt, err := json.Marshal(img)
 	return dt, errors.Wrap(err, "failed to create empty image config")
 }

@@ -3,8 +3,9 @@ package images
 import (
 	"context"
 
-	"github.com/docker/docker/image"
-	"github.com/docker/docker/layer"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/image"
+	"github.com/moby/moby/v2/daemon/internal/layer"
 	"github.com/pkg/errors"
 )
 
@@ -15,7 +16,7 @@ func (i *ImageService) GetContainerLayerSize(ctx context.Context, containerID st
 }
 
 // GetLayerFolders returns the layer folders from an image RootFS
-func (i *ImageService) GetLayerFolders(img *image.Image, rwLayer layer.RWLayer, containerID string) ([]string, error) {
+func (i *ImageService) GetLayerFolders(img *image.Image, rwLayer container.RWLayer, containerID string) ([]string, error) {
 	folders := []string{}
 	rd := len(img.RootFS.DiffIDs)
 	for index := 1; index <= rd; index++ {

@@ -1,17 +1,17 @@
 //go:build linux || freebsd
 
-package images // import "github.com/docker/docker/daemon/images"
+package images
 
 import (
 	"context"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/image"
-	"github.com/docker/docker/layer"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/image"
 )
 
 // GetLayerFolders returns the layer folders from an image RootFS
-func (i *ImageService) GetLayerFolders(img *image.Image, rwLayer layer.RWLayer, containerID string) ([]string, error) {
+func (i *ImageService) GetLayerFolders(img *image.Image, rwLayer container.RWLayer, containerID string) ([]string, error) {
 	// Windows specific
 	panic("not implemented")
 }

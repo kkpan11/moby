@@ -1,16 +1,16 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
-	"github.com/containerd/containerd/containers"
-	coci "github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/containers"
+	coci "github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/log"
-	"github.com/docker/docker/container"
-	dconfig "github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/profiles/seccomp"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	dconfig "github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/profiles/seccomp"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 const supportsSeccomp = true
@@ -28,9 +28,13 @@ func WithSeccomp(daemon *Daemon, c *container.Container) coci.SpecOpts {
 			}
 			return err
 		}
-		if !daemon.RawSysInfo().Seccomp {
+		sysInfo, err := daemon.RawSysInfo()
+		if err != nil {
+			return err
+		}
+		if !sysInfo.Seccomp {
 			if c.SeccompProfile != "" && c.SeccompProfile != dconfig.SeccompProfileDefault {
-				return fmt.Errorf("seccomp is not enabled in your kernel, cannot run a custom seccomp profile")
+				return errors.New("seccomp is not enabled in your kernel, cannot run a custom seccomp profile")
 			}
 			log.G(ctx).Warn("seccomp is not enabled in your kernel, running container without default profile")
 			c.SeccompProfile = dconfig.SeccompProfileUnconfined
@@ -39,7 +43,6 @@ func WithSeccomp(daemon *Daemon, c *container.Container) coci.SpecOpts {
 		if s.Linux == nil {
 			s.Linux = &specs.Linux{}
 		}
-		var err error
 		switch {
 		case c.SeccompProfile == dconfig.SeccompProfileDefault:
 			s.Linux.Seccomp, err = seccomp.GetDefaultProfile(s)

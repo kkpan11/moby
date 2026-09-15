@@ -1,4 +1,4 @@
-package container // import "github.com/docker/docker/integration/container"
+package container
 
 import (
 	"bytes"
@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/container"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
@@ -25,16 +25,33 @@ func TestNetworkNat(t *testing.T) {
 
 	ctx := setupTest(t)
 
-	msg := "it works"
-	startServerContainer(ctx, t, msg, 8080)
+	const msg = "it works"
+	const port = 8080
+	startServerContainer(ctx, t, msg, port)
 
 	endpoint := getExternalAddress(t)
-	conn, err := net.Dial("tcp", net.JoinHostPort(endpoint.String(), "8080"))
-	assert.NilError(t, err)
-	defer conn.Close()
 
-	data, err := io.ReadAll(conn)
-	assert.NilError(t, err)
+	var data []byte
+	addr := net.JoinHostPort(endpoint.String(), strconv.Itoa(port))
+	poll.WaitOn(t, func(_ poll.LogT) poll.Result {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			return poll.Continue("waiting for %s to be accessible: %v", addr, err)
+		}
+		defer func() {
+			assert.Check(t, conn.Close())
+		}()
+
+		data, err = io.ReadAll(conn)
+		if err != nil {
+			return poll.Error(err)
+		}
+		// The port proxy can accept a connection before nc is listening.
+		if len(data) == 0 {
+			return poll.Continue("waiting for a response from %s", addr)
+		}
+		return poll.Success()
+	})
 	assert.Check(t, is.Equal(msg, strings.TrimSpace(string(data))))
 }
 
@@ -43,15 +60,31 @@ func TestNetworkLocalhostTCPNat(t *testing.T) {
 
 	ctx := setupTest(t)
 
-	msg := "hi yall"
-	startServerContainer(ctx, t, msg, 8081)
+	const msg = "hi yall"
+	const port = 8081
+	startServerContainer(ctx, t, msg, port)
 
-	conn, err := net.Dial("tcp", "localhost:8081")
-	assert.NilError(t, err)
-	defer conn.Close()
+	var data []byte
+	addr := net.JoinHostPort("localhost", strconv.Itoa(port))
+	poll.WaitOn(t, func(_ poll.LogT) poll.Result {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			return poll.Continue("waiting for %s to be accessible: %v", addr, err)
+		}
+		defer func() {
+			assert.Check(t, conn.Close())
+		}()
 
-	data, err := io.ReadAll(conn)
-	assert.NilError(t, err)
+		data, err = io.ReadAll(conn)
+		if err != nil {
+			return poll.Error(err)
+		}
+		// The port proxy can accept a connection before nc is listening.
+		if len(data) == 0 {
+			return poll.Continue("waiting for a response from %s", addr)
+		}
+		return poll.Success()
+	})
 	assert.Check(t, is.Equal(msg, strings.TrimSpace(string(data))))
 }
 
@@ -75,22 +108,22 @@ func TestNetworkLoopbackNat(t *testing.T) {
 		container.WithNetworkMode("container:"+serverContainerID),
 	)
 
-	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID))
 
-	body, err := apiClient.ContainerLogs(ctx, cID, containertypes.LogsOptions{
+	logs, err := apiClient.ContainerLogs(ctx, cID, client.ContainerLogsOptions{
 		ShowStdout: true,
 	})
 	assert.NilError(t, err)
-	defer body.Close()
+	defer logs.Close()
 
 	var b bytes.Buffer
-	_, err = io.Copy(&b, body)
+	_, err = io.Copy(&b, logs)
 	assert.NilError(t, err)
 
 	assert.Check(t, is.Equal(msg, strings.TrimSpace(b.String())))
 }
 
-func startServerContainer(ctx context.Context, t *testing.T, msg string, port int) string {
+func startServerContainer(ctx context.Context, t *testing.T, msg string, port uint16) string {
 	t.Helper()
 	apiClient := testEnv.APIClient()
 
@@ -99,10 +132,10 @@ func startServerContainer(ctx context.Context, t *testing.T, msg string, port in
 		container.WithCmd("sh", "-c", fmt.Sprintf("echo %q | nc -lp %d", msg, port)),
 		container.WithExposedPorts(fmt.Sprintf("%d/tcp", port)),
 		func(c *container.TestContainerConfig) {
-			c.HostConfig.PortBindings = nat.PortMap{
-				nat.Port(fmt.Sprintf("%d/tcp", port)): []nat.PortBinding{
+			c.HostConfig.PortBindings = network.PortMap{
+				network.MustParsePort(fmt.Sprintf("%d/tcp", port)): []network.PortBinding{
 					{
-						HostPort: fmt.Sprintf("%d", port),
+						HostPort: strconv.FormatUint(uint64(port), 10),
 					},
 				},
 			}
@@ -120,7 +153,7 @@ func getExternalAddress(t *testing.T) net.IP {
 
 	ifaceAddrs, err := iface.Addrs()
 	assert.NilError(t, err)
-	assert.Check(t, 0 != len(ifaceAddrs))
+	assert.Check(t, len(ifaceAddrs) != 0)
 
 	if len(ifaceAddrs) > 1 {
 		// Prefer IPv4 address if multiple addresses found, as rootlesskit

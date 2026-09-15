@@ -1,20 +1,66 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/moby/moby/api/types/container"
+	libcontainerdtypes "github.com/moby/moby/v2/daemon/internal/libcontainerd/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func toContainerdResources(resources container.Resources) *libcontainerdtypes.Resources {
+func toContainerdResources(resources container.Resources) (*libcontainerdtypes.Resources, error) {
 	var r libcontainerdtypes.Resources
 
-	if resources.BlkioWeight != 0 {
-		r.BlockIO = &specs.LinuxBlockIO{
-			Weight: &resources.BlkioWeight,
+	// little helper to lazily initialize the BlockIO struct only if needed
+	blockIO := func() *specs.LinuxBlockIO {
+		if r.BlockIO == nil {
+			r.BlockIO = &specs.LinuxBlockIO{}
 		}
+		return r.BlockIO
+	}
+
+	weightDevices, err := getBlkioWeightDevices(resources)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioWeightDevice != nil {
+		blockIO().WeightDevice = weightDevices
+	}
+
+	readBpsDevices, err := getBlkioThrottleDevices(resources.BlkioDeviceReadBps)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioDeviceReadBps != nil {
+		blockIO().ThrottleReadBpsDevice = readBpsDevices
+	}
+
+	writeBpsDevices, err := getBlkioThrottleDevices(resources.BlkioDeviceWriteBps)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioDeviceWriteBps != nil {
+		blockIO().ThrottleWriteBpsDevice = writeBpsDevices
+	}
+
+	readIOpsDevices, err := getBlkioThrottleDevices(resources.BlkioDeviceReadIOps)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioDeviceReadIOps != nil {
+		blockIO().ThrottleReadIOPSDevice = readIOpsDevices
+	}
+
+	writeIOpsDevices, err := getBlkioThrottleDevices(resources.BlkioDeviceWriteIOps)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioDeviceWriteIOps != nil {
+		blockIO().ThrottleWriteIOPSDevice = writeIOpsDevices
+	}
+
+	if resources.BlkioWeight != 0 {
+		blockIO().Weight = &resources.BlkioWeight
 	}
 
 	cpu := specs.LinuxCPU{
@@ -59,9 +105,6 @@ func toContainerdResources(resources container.Resources) *libcontainerdtypes.Re
 	if resources.MemoryReservation != 0 {
 		memory.Reservation = &resources.MemoryReservation
 	}
-	if resources.KernelMemory != 0 { //nolint:staticcheck // ignore SA1019: memory.Kernel is deprecated: kernel-memory limits are not supported in cgroups v2, and were obsoleted in [kernel v5.4]. This field should no longer be used, as it may be ignored by runtimes.
-		memory.Kernel = &resources.KernelMemory //nolint:staticcheck // ignore SA1019: memory.Kernel is deprecated: kernel-memory limits are not supported in cgroups v2, and were obsoleted in [kernel v5.4]. This field should no longer be used, as it may be ignored by runtimes.
-	}
 	if resources.MemorySwap > 0 {
 		memory.Swap = &resources.MemorySwap
 	}
@@ -71,5 +114,5 @@ func toContainerdResources(resources container.Resources) *libcontainerdtypes.Re
 	}
 
 	r.Pids = getPidsLimit(resources)
-	return &r
+	return &r, nil
 }

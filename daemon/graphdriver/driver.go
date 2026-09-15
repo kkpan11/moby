@@ -1,4 +1,4 @@
-package graphdriver // import "github.com/docker/docker/daemon/graphdriver"
+package graphdriver
 
 import (
 	"context"
@@ -9,14 +9,14 @@ import (
 	"strings"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/idtools"
+	"github.com/moby/go-archive"
+	"github.com/moby/sys/user"
 	"github.com/pkg/errors"
 	"github.com/vbatts/tar-split/tar/storage"
 )
 
 // All registered drivers
-var drivers map[string]InitFunc
+var drivers = make(map[string]InitFunc)
 
 // CreateOpts contains optional arguments for Create() and CreateReadWrite()
 // methods.
@@ -26,7 +26,7 @@ type CreateOpts struct {
 }
 
 // InitFunc initializes the storage driver.
-type InitFunc func(root string, options []string, idMap idtools.IdentityMapping) (Driver, error)
+type InitFunc func(root string, options []string, idMap user.IdentityMapping) (Driver, error)
 
 // ProtoDriver defines the basic capabilities of a driver.
 // This interface exists solely to be a minimum set of methods
@@ -111,10 +111,6 @@ type FileGetCloser interface {
 	Close() error
 }
 
-func init() {
-	drivers = make(map[string]InitFunc)
-}
-
 // Register registers an InitFunc for the driver.
 func Register(name string, initFunc InitFunc) error {
 	if _, exists := drivers[name]; exists {
@@ -125,11 +121,10 @@ func Register(name string, initFunc InitFunc) error {
 	return nil
 }
 
-// GetDriver initializes and returns the registered driver.
-//
-// Deprecated: this function was exported for (integration-)tests, but no longer used, and will be removed in the next release.
-func GetDriver(name string, config Options) (Driver, error) {
-	return getDriver(name, config)
+// IsRegistered checks to see if the drive with the given name is registered
+func IsRegistered(name string) bool {
+	_, exists := drivers[name]
+	return exists
 }
 
 // getDriver initializes and returns the registered driver.
@@ -139,11 +134,6 @@ func getDriver(name string, config Options) (Driver, error) {
 	}
 	log.G(context.TODO()).WithFields(log.Fields{"driver": name, "home-dir": config.Root}).Error("Failed to GetDriver graph")
 
-	// TODO(thaJeztah): remove in next release.
-	if config.ExperimentalEnabled && os.Getenv("DOCKERD_DEPRECATED_GRAPHDRIVER_PLUGINS") != "" {
-		return nil, fmt.Errorf("DEPRECATED: Support for experimental graphdriver plugins has been removed. See https://docs.docker.com/go/deprecated/")
-	}
-
 	return nil, ErrNotSupported
 }
 
@@ -151,7 +141,7 @@ func getDriver(name string, config Options) (Driver, error) {
 type Options struct {
 	Root                string
 	DriverOptions       []string
-	IDMap               idtools.IdentityMapping
+	IDMap               user.IdentityMapping
 	ExperimentalEnabled bool
 }
 
@@ -166,14 +156,14 @@ type Options struct {
 // if scanning prior drivers is ambiguous (i.e., if state is found for
 // multiple drivers), or if no compatible driver is available for the
 // platform and underlying filesystem.
-func New(name string, config Options) (Driver, error) {
+func New(driverName string, config Options) (Driver, error) {
 	ctx := context.TODO()
-	if name != "" {
-		log.G(ctx).Infof("[graphdriver] trying configured driver: %s", name)
-		if err := checkRemoved(name); err != nil {
+	if driverName != "" {
+		log.G(ctx).Infof("[graphdriver] trying configured driver: %s", driverName)
+		if err := checkRemoved(driverName); err != nil {
 			return nil, err
 		}
-		return getDriver(name, config)
+		return getDriver(driverName, config)
 	}
 
 	// Guess for prior driver
@@ -200,8 +190,8 @@ func New(name string, config Options) (Driver, error) {
 			// to ensure the user explicitly selects the driver to load
 			if len(driversMap) > 1 {
 				var driversSlice []string
-				for name := range driversMap {
-					driversSlice = append(driversSlice, name)
+				for d := range driversMap {
+					driversSlice = append(driversSlice, d)
 				}
 
 				err = errors.Errorf("%s contains several valid graphdrivers: %s; cleanup or explicitly choose storage driver (-s <DRIVER>)", config.Root, strings.Join(driversSlice, ", "))
@@ -242,6 +232,12 @@ func New(name string, config Options) (Driver, error) {
 	return nil, errors.Errorf("no supported storage driver found")
 }
 
+// HasPriorDriver returns true if any prior driver is found
+func HasPriorDriver(root string) bool {
+	driversMap := scanPriorDrivers(root)
+	return len(driversMap) > 0
+}
+
 // scanPriorDrivers returns an un-ordered scan of directories of prior storage
 // drivers. The 'vfs' storage driver is not taken into account, and ignored.
 func scanPriorDrivers(root string) map[string]bool {
@@ -269,7 +265,7 @@ func isEmptyDir(name string) bool {
 	}
 	defer f.Close()
 
-	if _, err = f.Readdirnames(1); err == io.EOF {
+	if _, err = f.Readdirnames(1); errors.Is(err, io.EOF) {
 		return true
 	}
 	return false

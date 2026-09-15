@@ -2,6 +2,7 @@ package controlapi
 
 import (
 	"context"
+	"slices"
 
 	"github.com/moby/swarmkit/v2/api"
 	"github.com/moby/swarmkit/v2/api/naming"
@@ -14,9 +15,9 @@ import (
 // GetTask returns a Task given a TaskID.
 // - Returns `InvalidArgument` if TaskID is not provided.
 // - Returns `NotFound` if the Task is not found.
-func (s *Server) GetTask(ctx context.Context, request *api.GetTaskRequest) (*api.GetTaskResponse, error) {
+func (s *Server) GetTask(_ context.Context, request *api.GetTaskRequest) (*api.GetTaskResponse, error) {
 	if request.TaskID == "" {
-		return nil, status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return nil, status.Error(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 
 	var task *api.Task
@@ -35,9 +36,9 @@ func (s *Server) GetTask(ctx context.Context, request *api.GetTaskRequest) (*api
 // - Returns `InvalidArgument` if TaskID is not provided.
 // - Returns `NotFound` if the Task is not found.
 // - Returns an error if the deletion fails.
-func (s *Server) RemoveTask(ctx context.Context, request *api.RemoveTaskRequest) (*api.RemoveTaskResponse, error) {
+func (s *Server) RemoveTask(_ context.Context, request *api.RemoveTaskRequest) (*api.RemoveTaskResponse, error) {
 	if request.TaskID == "" {
-		return nil, status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return nil, status.Error(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 
 	err := s.store.Update(func(tx store.Tx) error {
@@ -72,7 +73,7 @@ func filterTasks(candidates []*api.Task, filters ...func(*api.Task) bool) []*api
 }
 
 // ListTasks returns a list of all tasks.
-func (s *Server) ListTasks(ctx context.Context, request *api.ListTasksRequest) (*api.ListTasksResponse, error) {
+func (s *Server) ListTasks(_ context.Context, request *api.ListTasksRequest) (*api.ListTasksResponse, error) {
 	var (
 		tasks []*api.Task
 		err   error
@@ -136,15 +137,8 @@ func (s *Server) ListTasks(ctx context.Context, request *api.ListTasksRequest) (
 				return filterContains(r, request.Filters.Runtimes)
 			},
 			func(e *api.Task) bool {
-				if len(request.Filters.DesiredStates) == 0 {
-					return true
-				}
-				for _, c := range request.Filters.DesiredStates {
-					if c == e.DesiredState {
-						return true
-					}
-				}
-				return false
+				ds := request.Filters.DesiredStates
+				return len(ds) == 0 || slices.Contains(ds, e.DesiredState)
 			},
 			func(e *api.Task) bool {
 				if !request.Filters.UpToDate {

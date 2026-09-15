@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/moby/buildkit/util/bklog"
-
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
 	fstypes "github.com/tonistiigi/fsutil/types"
@@ -17,8 +16,8 @@ import (
 
 type Stream interface {
 	Context() context.Context
-	SendMsg(m interface{}) error
-	RecvMsg(m interface{}) error
+	SendMsg(m any) error
+	RecvMsg(m any) error
 }
 
 func newStreamWriter(stream grpc.ClientStream) io.WriteCloser {
@@ -32,7 +31,7 @@ type bufferedWriteCloser struct {
 }
 
 func (bwc *bufferedWriteCloser) Close() error {
-	if err := bwc.Writer.Flush(); err != nil {
+	if err := bwc.Flush(); err != nil {
 		return errors.WithStack(err)
 	}
 	return bwc.Closer.Close()
@@ -59,10 +58,10 @@ func (wc *streamWriterCloser) Write(dt []byte) (int, error) {
 		return n1 + n2, nil
 	}
 
-	if err := wc.ClientStream.SendMsg(&BytesMessage{Data: dt}); err != nil {
+	if err := wc.SendMsg(&BytesMessage{Data: dt}); err != nil {
 		// SendMsg return EOF on remote errors
 		if errors.Is(err, io.EOF) {
-			if err := errors.WithStack(wc.ClientStream.RecvMsg(struct{}{})); err != nil {
+			if err := errors.WithStack(wc.RecvMsg(struct{}{})); err != nil {
 				return 0, err
 			}
 		}
@@ -72,18 +71,18 @@ func (wc *streamWriterCloser) Write(dt []byte) (int, error) {
 }
 
 func (wc *streamWriterCloser) Close() error {
-	if err := wc.ClientStream.CloseSend(); err != nil {
+	if err := wc.CloseSend(); err != nil {
 		return errors.WithStack(err)
 	}
 	// block until receiver is done
 	var bm BytesMessage
-	if err := wc.ClientStream.RecvMsg(&bm); err != io.EOF {
+	if err := wc.RecvMsg(&bm); !errors.Is(err, io.EOF) {
 		return errors.WithStack(err)
 	}
 	return nil
 }
 
-func recvDiffCopy(ds grpc.ClientStream, dest string, cu CacheUpdater, progress progressCb, differ fsutil.DiffType, filter func(string, *fstypes.Stat) bool) (err error) {
+func recvDiffCopy(ds grpc.ClientStream, dest string, cu CacheUpdater, progress progressCb, differ fsutil.DiffType, filter, metadataOnlyFilter func(string, *fstypes.Stat) bool) (err error) {
 	st := time.Now()
 	defer func() {
 		bklog.G(ds.Context()).Debugf("diffcopy took: %v", time.Since(st))
@@ -107,14 +106,16 @@ func recvDiffCopy(ds grpc.ClientStream, dest string, cu CacheUpdater, progress p
 		ProgressCb:    progress,
 		Filter:        fsutil.FilterFunc(filter),
 		Differ:        differ,
+		MetadataOnly:  metadataOnlyFilter,
 	}))
 }
 
-func syncTargetDiffCopy(ds grpc.ServerStream, dest string) error {
+func syncTargetDiffCopy(ds grpc.ServerStream, dest string, deleteMode bool) error {
 	if err := os.MkdirAll(dest, 0700); err != nil {
 		return errors.Wrapf(err, "failed to create synctarget dest dir %s", dest)
 	}
-	return errors.WithStack(fsutil.Receive(ds.Context(), ds, dest, fsutil.ReceiveOpt{
+
+	opt := fsutil.ReceiveOpt{
 		Merge: true,
 		Filter: func() func(string, *fstypes.Stat) bool {
 			uid := os.Getuid()
@@ -125,12 +126,29 @@ func syncTargetDiffCopy(ds grpc.ServerStream, dest string) error {
 				return true
 			}
 		}(),
-	}))
+	}
+
+	osRoot, err := os.OpenRoot(dest)
+	if err != nil {
+		return errors.Wrapf(err, "failed to open synctarget dest root %s", dest)
+	}
+	root := fsutil.NewRoot(osRoot)
+	defer root.Close()
+
+	if deleteMode {
+		opt.Merge = false
+		// Request every source file so delete mode mirrors file contents without
+		// relying on fsutil's path-based content comparison.
+		opt.Differ = fsutil.DiffNone
+	}
+
+	return errors.WithStack(fsutil.ReceiveRoot(ds.Context(), ds, root, opt))
 }
 
 func writeTargetFile(ds grpc.ServerStream, wc io.WriteCloser) error {
+	var bm BytesMessage
 	for {
-		bm := BytesMessage{}
+		bm.Data = bm.Data[:0]
 		if err := ds.RecvMsg(&bm); err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil

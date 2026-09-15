@@ -10,14 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/request"
 	"github.com/docker/go-connections/sockets"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"github.com/pkg/errors"
 	"golang.org/x/net/websocket"
 	"gotest.tools/v3/assert"
@@ -91,12 +90,12 @@ func (s *DockerAPISuite) TestPostContainersAttachContainerNotFound(c *testing.T)
 func (s *DockerAPISuite) TestGetContainersWsAttachContainerNotFound(c *testing.T) {
 	ctx := testutil.GetContext(c)
 	res, body, err := request.Get(ctx, "/containers/doesnotexist/attach/ws")
-	assert.Equal(c, res.StatusCode, http.StatusNotFound)
 	assert.NilError(c, err)
+	assert.Equal(c, res.StatusCode, http.StatusNotFound)
 	b, err := request.ReadBody(body)
 	assert.NilError(c, err)
 	expected := "No such container: doesnotexist"
-	assert.Assert(c, strings.Contains(getErrorMessage(c, b), expected))
+	assert.Assert(c, is.Contains(getErrorMessage(c, b), expected))
 }
 
 func (s *DockerAPISuite) TestPostContainersAttach(c *testing.T) {
@@ -178,7 +177,7 @@ func (s *DockerAPISuite) TestPostContainersAttach(c *testing.T) {
 	expectTimeout(wc, br, "stdout")
 
 	// Test the client API
-	apiClient, err := client.NewClientWithOpts(client.FromEnv)
+	apiClient, err := client.New(client.FromEnv)
 	assert.NilError(c, err)
 	defer apiClient.Close()
 
@@ -186,7 +185,7 @@ func (s *DockerAPISuite) TestPostContainersAttach(c *testing.T) {
 	cid = strings.TrimSpace(cid)
 
 	// Make sure we don't see "hello" if Logs is false
-	attachOpts := container.AttachOptions{
+	attachOpts := client.ContainerAttachOptions{
 		Stream: true,
 		Stdin:  true,
 		Stdout: true,
@@ -207,7 +206,7 @@ func (s *DockerAPISuite) TestPostContainersAttach(c *testing.T) {
 	assert.NilError(c, err)
 
 	defer resp.Conn.Close()
-	resp.Conn.SetReadDeadline(time.Now().Add(time.Second))
+	assert.NilError(c, resp.Conn.SetReadDeadline(time.Now().Add(time.Second)))
 
 	_, err = resp.Conn.Write([]byte("success"))
 	assert.NilError(c, err)
@@ -296,7 +295,7 @@ func readTimeout(r io.Reader, buf []byte, timeout time.Duration) (n int, err err
 	}()
 	select {
 	case <-ch:
-		return
+		return n, err
 	case <-time.After(timeout):
 		return 0, errors.New("Timeout")
 	}

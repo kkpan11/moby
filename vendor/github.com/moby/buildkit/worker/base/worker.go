@@ -2,25 +2,27 @@ package base
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/diff"
-	"github.com/containerd/containerd/gc"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/gc"
 	"github.com/containerd/platforms"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/executor/resources"
+	resourcestypes "github.com/moby/buildkit/executor/resources/types"
 	"github.com/moby/buildkit/exporter"
 	imageexporter "github.com/moby/buildkit/exporter/containerimage"
 	localexporter "github.com/moby/buildkit/exporter/local"
@@ -33,20 +35,26 @@ import (
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/snapshot/imagerefchecker"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
+	"github.com/moby/buildkit/solver/llbsolver/linuxresources"
 	"github.com/moby/buildkit/solver/llbsolver/mounts"
 	"github.com/moby/buildkit/solver/llbsolver/ops"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/source"
+	"github.com/moby/buildkit/source/containerblob"
 	"github.com/moby/buildkit/source/containerimage"
 	"github.com/moby/buildkit/source/git"
 	"github.com/moby/buildkit/source/http"
 	"github.com/moby/buildkit/source/local"
 	"github.com/moby/buildkit/util/archutil"
 	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/network"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/progress/controller"
+	"github.com/moby/buildkit/worker"
+	"github.com/moby/sys/user"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -62,11 +70,13 @@ const labelCreatedAt = "buildkit/createdat"
 // See also CommonOpt.
 type WorkerOpt struct {
 	ID               string
+	Root             string
 	Labels           map[string]string
 	Platforms        []ocispecs.Platform
 	GCPolicy         []client.PruneInfo
 	BuildkitVersion  client.BuildkitVersion
 	NetworkProviders map[pb.NetMode]network.Provider
+	ProxyProvider    network.ProxyProvider
 	Executor         executor.Executor
 	Snapshotter      snapshot.Snapshotter
 	ContentStore     *containerdsnapshot.Store
@@ -74,13 +84,14 @@ type WorkerOpt struct {
 	Differ           diff.Comparer
 	ImageStore       images.Store // optional
 	RegistryHosts    docker.RegistryHosts
-	IdentityMapping  *idtools.IdentityMapping
+	IdentityMapping  *user.IdentityMapping
 	LeaseManager     *leaseutil.Manager
 	GarbageCollect   func(context.Context) (gc.Stats, error)
 	ParallelismSem   *semaphore.Weighted
 	MetadataStore    *metadata.Store
 	MountPoolRoot    string
 	ResourceMonitor  *resources.Monitor
+	CDIManager       *cdidevices.Manager
 }
 
 // Worker is a local worker instance with dedicated snapshotter, cache, and so on.
@@ -92,6 +103,9 @@ type Worker struct {
 	imageWriter     *imageexporter.ImageWriter
 	ImageSource     *containerimage.Source
 	OCILayoutSource *containerimage.Source
+	GitSource       *git.Source
+	HTTPSource      *http.Source
+	platformsMu     sync.Mutex
 }
 
 // NewWorker instantiates a local worker
@@ -110,6 +124,7 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 		ContentStore:    opt.ContentStore,
 		Differ:          opt.Differ,
 		MetadataStore:   opt.MetadataStore,
+		Root:            opt.Root,
 		MountPoolRoot:   opt.MountPoolRoot,
 	})
 	if err != nil {
@@ -137,14 +152,27 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 
 	sm.Register(is)
 
+	var gitSource *git.Source
+	ibs, err := containerblob.NewSource(containerblob.SourceOpt{
+		ContentStore:  opt.ContentStore,
+		CacheAccessor: cm,
+		RegistryHosts: opt.RegistryHosts,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sm.Register(ibs)
 	if err := git.Supported(); err == nil {
 		gs, err := git.NewSource(git.Opt{
 			CacheAccessor: cm,
+			RegistryHosts: opt.RegistryHosts,
 		})
 		if err != nil {
 			return nil, err
 		}
 		sm.Register(gs)
+		gitSource = gs
 	} else {
 		bklog.G(ctx).Warnf("git source cannot be enabled: %v", err)
 	}
@@ -206,25 +234,40 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 		imageWriter:     iw,
 		ImageSource:     is,
 		OCILayoutSource: os,
+		GitSource:       gitSource,
+		HTTPSource:      hs,
 	}, nil
 }
 
+func (w *Worker) GarbageCollect(ctx context.Context) error {
+	if w.WorkerOpt.GarbageCollect == nil {
+		return nil
+	}
+	_, err := w.WorkerOpt.GarbageCollect(ctx)
+	return err
+}
+
 func (w *Worker) Close() error {
-	var rerr error
+	var errs []error
 	if err := w.MetadataStore.Close(); err != nil {
-		rerr = multierror.Append(rerr, err)
+		errs = append(errs, err)
+	}
+	if w.ProxyProvider != nil {
+		if err := w.ProxyProvider.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	for _, provider := range w.NetworkProviders {
 		if err := provider.Close(); err != nil {
-			rerr = multierror.Append(rerr, err)
+			errs = append(errs, err)
 		}
 	}
 	if w.ResourceMonitor != nil {
 		if err := w.ResourceMonitor.Close(); err != nil {
-			rerr = multierror.Append(rerr, err)
+			errs = append(errs, err)
 		}
 	}
-	return rerr
+	return stderrors.Join(errs...)
 }
 
 func (w *Worker) ContentStore() *containerdsnapshot.Store {
@@ -233,6 +276,10 @@ func (w *Worker) ContentStore() *containerdsnapshot.Store {
 
 func (w *Worker) LeaseManager() *leaseutil.Manager {
 	return w.WorkerOpt.LeaseManager
+}
+
+func (w *Worker) CDIManager() *cdidevices.Manager {
+	return w.WorkerOpt.CDIManager
 }
 
 func (w *Worker) ID() string {
@@ -244,6 +291,8 @@ func (w *Worker) Labels() map[string]string {
 }
 
 func (w *Worker) Platforms(noCache bool) []ocispecs.Platform {
+	w.platformsMu.Lock()
+	defer w.platformsMu.Unlock()
 	if noCache {
 		matchers := make([]platforms.MatchComparer, len(w.WorkerOpt.Platforms))
 		for i, p := range w.WorkerOpt.Platforms {
@@ -289,7 +338,7 @@ func (w *Worker) LoadRef(ctx context.Context, id string, hidden bool) (cache.Imm
 	var needsRemoteProviders cache.NeedsRemoteProviderError
 	if errors.As(err, &needsRemoteProviders) {
 		if optGetter := solver.CacheOptGetterOf(ctx); optGetter != nil {
-			var keys []interface{}
+			var keys []any
 			for _, dgst := range needsRemoteProviders {
 				keys = append(keys, cache.DescHandlerKey(dgst))
 			}
@@ -319,13 +368,59 @@ func (w *Worker) CacheManager() cache.Manager {
 	return w.CacheMgr
 }
 
-func (w *Worker) ResolveOp(v solver.Vertex, s frontend.FrontendLLBBridge, sm *session.Manager) (solver.Op, error) {
+type proxyPolicyExecutor struct {
+	executor.Executor
+	getProxyPolicy func() (network.ProxyPolicy, error)
+}
+
+func (e *proxyPolicyExecutor) Run(ctx context.Context, id string, rootfs executor.Mount, mounts []executor.Mount, process executor.ProcessInfo, started chan<- struct{}) (resourcestypes.Recorder, error) {
+	if process.Meta.Proxy != nil {
+		policy, err := e.proxyPolicy()
+		if err != nil {
+			return nil, err
+		}
+		process.Meta.Proxy.Policy = policy
+	}
+	return e.Executor.Run(ctx, id, rootfs, mounts, process, started)
+}
+
+func (e *proxyPolicyExecutor) Exec(ctx context.Context, id string, process executor.ProcessInfo) error {
+	if process.Meta.Proxy != nil {
+		policy, err := e.proxyPolicy()
+		if err != nil {
+			return err
+		}
+		process.Meta.Proxy.Policy = policy
+	}
+	return e.Executor.Exec(ctx, id, process)
+}
+
+func (e *proxyPolicyExecutor) proxyPolicy() (network.ProxyPolicy, error) {
+	policy, err := e.getProxyPolicy()
+	if err != nil {
+		return nil, err
+	}
+	return policy, nil
+}
+
+func (w *Worker) ResolveOp(v solver.Vertex, s frontend.FrontendLLBBridge, sm *session.Manager, proxyOpt worker.ProxyOpt) (solver.Op, error) {
 	if baseOp, ok := v.Sys().(*pb.Op); ok {
 		switch op := baseOp.Op.(type) {
 		case *pb.Op_Source:
 			return ops.NewSourceOp(v, op, baseOp.Platform, w.SourceManager, w.ParallelismSem, sm, w)
 		case *pb.Op_Exec:
-			return ops.NewExecOp(v, op, baseOp.Platform, w.CacheMgr, w.ParallelismSem, sm, w.WorkerOpt.Executor, w)
+			var linuxResources *pb.LinuxResources
+			if m, ok := v.Options().Metadata.(*linuxresources.Metadata); ok && m != nil {
+				linuxResources = m.LinuxResources
+			}
+			exec := w.WorkerOpt.Executor
+			proxyNetwork := proxyOpt.Network && op.Exec.Network != pb.NetMode_NONE
+			if proxyNetwork {
+				if proxyOpt.Policy != nil {
+					exec = &proxyPolicyExecutor{Executor: exec, getProxyPolicy: proxyOpt.Policy}
+				}
+			}
+			return ops.NewExecOp(v, op, baseOp.Platform, w.CacheMgr, w.ParallelismSem, sm, exec, w, linuxResources, proxyNetwork)
 		case *pb.Op_File:
 			return ops.NewFileOp(v, op, w.CacheMgr, w.ParallelismSem, w)
 		case *pb.Op_Build:
@@ -334,6 +429,8 @@ func (w *Worker) ResolveOp(v solver.Vertex, s frontend.FrontendLLBBridge, sm *se
 			return ops.NewMergeOp(v, op, w)
 		case *pb.Op_Diff:
 			return ops.NewDiffOp(v, op, w)
+		case *pb.Op_Passthrough:
+			return ops.NewPassthroughOp(v, op)
 		default:
 			return nil, errors.Errorf("no support for %T", op)
 		}
@@ -360,7 +457,7 @@ func (w *Worker) PruneCacheMounts(ctx context.Context, ids map[string]bool) erro
 			}
 			// if ref is unused try to clean it up right away by releasing it
 			if mref, err := w.CacheMgr.GetMutable(ctx, md.ID()); err == nil {
-				go mref.Release(context.TODO())
+				go mref.Release(context.WithoutCancel(ctx))
 			}
 		}
 	}
@@ -369,13 +466,24 @@ func (w *Worker) PruneCacheMounts(ctx context.Context, ids map[string]bool) erro
 	return nil
 }
 
-func (w *Worker) ResolveSourceMetadata(ctx context.Context, op *pb.SourceOp, opt sourceresolver.Opt, sm *session.Manager, g session.Group) (*sourceresolver.MetaResponse, error) {
+func (w *Worker) ParseSource(op *pb.SourceOp, platform *pb.Platform) (source.Identifier, error) {
+	return w.SourceManager.Identifier(&pb.Op_Source{Source: op}, platform)
+}
+
+func (w *Worker) ResolveSourceMetadata(ctx context.Context, op *pb.SourceOp, opt sourceresolver.Opt, sm *session.Manager, jobCtx solver.JobContext) (*sourceresolver.MetaResponse, error) {
 	if opt.SourcePolicies != nil {
 		return nil, errors.New("source policies can not be set for worker")
 	}
 
+	var p *ocispecs.Platform
+	if imgOpt := opt.ImageOpt; imgOpt != nil && imgOpt.Platform != nil {
+		p = imgOpt.Platform
+	} else if ociOpt := opt.OCILayoutOpt; ociOpt != nil && ociOpt.Platform != nil {
+		p = ociOpt.Platform
+	}
+
 	var platform *pb.Platform
-	if p := opt.Platform; p != nil {
+	if p != nil {
 		platform = &pb.Platform{
 			Architecture: p.Architecture,
 			OS:           p.OS,
@@ -384,9 +492,14 @@ func (w *Worker) ResolveSourceMetadata(ctx context.Context, op *pb.SourceOp, opt
 		}
 	}
 
-	id, err := w.SourceManager.Identifier(&pb.Op_Source{Source: op}, platform)
+	id, err := w.ParseSource(op, platform)
 	if err != nil {
 		return nil, err
+	}
+
+	var g session.Group
+	if jobCtx != nil {
+		g = jobCtx.Session()
 	}
 
 	switch idt := id.(type) {
@@ -394,33 +507,83 @@ func (w *Worker) ResolveSourceMetadata(ctx context.Context, op *pb.SourceOp, opt
 		if opt.ImageOpt == nil {
 			opt.ImageOpt = &sourceresolver.ResolveImageOpt{}
 		}
-		dgst, config, err := w.ImageSource.ResolveImageConfig(ctx, idt.Reference.String(), opt, sm, g)
+		if p != nil {
+			opt.ImageOpt.Platform = p
+		}
+		resp, err := w.ImageSource.ResolveImageMetadata(ctx, idt, opt.ImageOpt, sm, g)
 		if err != nil {
 			return nil, err
 		}
 		return &sourceresolver.MetaResponse{
-			Op: op,
-			Image: &sourceresolver.ResolveImageResponse{
-				Digest: dgst,
-				Config: config,
-			},
+			Op:    op,
+			Image: resp,
 		}, nil
 	case *containerimage.OCIIdentifier:
-		opt.OCILayoutOpt = &sourceresolver.ResolveOCILayoutOpt{
-			Store: sourceresolver.ResolveImageConfigOptStore{
-				StoreID:   idt.StoreID,
-				SessionID: idt.SessionID,
-			},
+		if opt.OCILayoutOpt == nil {
+			opt.OCILayoutOpt = &sourceresolver.ResolveOCILayoutOpt{}
 		}
-		dgst, config, err := w.OCILayoutSource.ResolveImageConfig(ctx, idt.Reference.String(), opt, sm, g)
+		if p != nil {
+			opt.OCILayoutOpt.Platform = p
+		}
+		resp, err := w.OCILayoutSource.ResolveOCILayoutMetadata(ctx, idt, opt.OCILayoutOpt, sm, g)
+		if err != nil {
+			return nil, err
+		}
+		return &sourceresolver.MetaResponse{
+			Op:    op,
+			Image: resp,
+		}, nil
+	case *git.GitIdentifier:
+		if w.GitSource == nil {
+			return nil, errors.New("git source is not supported")
+		}
+		mdOpt := git.MetadataOpts{}
+		if opt.GitOpt != nil {
+			mdOpt.ReturnObject = opt.GitOpt.ReturnObject
+		}
+		md, err := w.GitSource.ResolveMetadata(ctx, idt, sm, jobCtx, mdOpt)
 		if err != nil {
 			return nil, err
 		}
 		return &sourceresolver.MetaResponse{
 			Op: op,
-			Image: &sourceresolver.ResolveImageResponse{
-				Digest: dgst,
-				Config: config,
+			Git: &sourceresolver.ResolveGitResponse{
+				Checksum:       md.Checksum,
+				Ref:            md.Ref,
+				CommitChecksum: md.CommitChecksum,
+				CommitObject:   md.CommitObject,
+				TagObject:      md.TagObject,
+			},
+		}, nil
+	case *http.HTTPIdentifier:
+		if w.HTTPSource == nil {
+			return nil, errors.New("http source is not supported")
+		}
+		mdOpt := http.MetadataOpts{}
+		if opt.HTTPOpt != nil && opt.HTTPOpt.ChecksumReq != nil {
+			mdOpt.ChecksumReq = &http.MetadataChecksumRequest{
+				Algo:   http.MetadataChecksumAlgo(opt.HTTPOpt.ChecksumReq.Algo),
+				Suffix: slices.Clone(opt.HTTPOpt.ChecksumReq.Suffix),
+			}
+		}
+		md, err := w.HTTPSource.ResolveMetadata(ctx, idt, sm, jobCtx, mdOpt)
+		if err != nil {
+			return nil, err
+		}
+		var checksumResponse *sourceresolver.ResolveHTTPChecksumResponse
+		if md.ChecksumResponse != nil {
+			checksumResponse = &sourceresolver.ResolveHTTPChecksumResponse{
+				Digest: md.ChecksumResponse.Digest,
+				Suffix: slices.Clone(md.ChecksumResponse.Suffix),
+			}
+		}
+		return &sourceresolver.MetaResponse{
+			Op: op,
+			HTTP: &sourceresolver.ResolveHTTPResponse{
+				Digest:           md.Digest,
+				Filename:         md.Filename,
+				LastModified:     md.LastModified,
+				ChecksumResponse: checksumResponse,
 			},
 		}, nil
 	}
@@ -479,7 +642,6 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cac
 	if len(remote.Descriptors) > 0 {
 		var eg errgroup.Group
 		for _, desc := range remote.Descriptors {
-			desc := desc
 			eg.Go(func() error {
 				if _, err := remote.Provider.Info(ctx, desc.Digest); err != nil {
 					return err
@@ -500,7 +662,9 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cac
 	}
 
 	descHandler := &cache.DescHandler{
-		Provider: func(session.Group) content.Provider { return remote.Provider },
+		Provider: func(g session.Group) content.Provider {
+			return contentutil.ProviderForSession(remote.Provider, g)
+		},
 		Progress: pg,
 	}
 	snapshotLabels := func([]ocispecs.Descriptor, int) map[string]string { return nil }

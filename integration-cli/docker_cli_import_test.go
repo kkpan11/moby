@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"compress/gzip"
 	"context"
 	"os"
@@ -10,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
 )
@@ -19,12 +18,12 @@ type DockerCLIImportSuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerCLIImportSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIImportSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIImportSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIImportSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 func (s *DockerCLIImportSuite) TestImportDisplay(c *testing.T) {
@@ -66,7 +65,7 @@ func (s *DockerCLIImportSuite) TestImportFile(c *testing.T) {
 
 	icmd.RunCmd(icmd.Cmd{
 		Command: []string{dockerBinary, "export", "test-import"},
-		Stdout:  bufio.NewWriter(temporaryFile),
+		Stdout:  temporaryFile,
 	}).Assert(c, icmd.Success)
 
 	out := cli.DockerCmd(c, "import", temporaryFile.Name()).Combined()
@@ -110,7 +109,7 @@ func (s *DockerCLIImportSuite) TestImportFileWithMessage(c *testing.T) {
 
 	icmd.RunCmd(icmd.Cmd{
 		Command: []string{dockerBinary, "export", "test-import"},
-		Stdout:  bufio.NewWriter(temporaryFile),
+		Stdout:  temporaryFile,
 	}).Assert(c, icmd.Success)
 
 	message := "Testing commit message"
@@ -144,7 +143,7 @@ func (s *DockerCLIImportSuite) TestImportWithQuotedChanges(c *testing.T) {
 	assert.Assert(c, err == nil, "failed to create temporary file")
 	defer os.Remove(temporaryFile.Name())
 
-	cli.Docker(cli.Args("export", "test-import"), cli.WithStdout(bufio.NewWriter(temporaryFile))).Assert(c, icmd.Success)
+	cli.Docker(cli.Args("export", "test-import"), cli.WithStdout(temporaryFile)).Assert(c, icmd.Success)
 
 	result := cli.DockerCmd(c, "import", "-c", `ENTRYPOINT ["/bin/sh", "-c"]`, temporaryFile.Name())
 	imgRef := strings.TrimSpace(result.Stdout())

@@ -11,12 +11,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/fakecontext"
-	"github.com/docker/docker/testutil/fakegit"
-	"github.com/docker/docker/testutil/fakestorage"
-	"github.com/docker/docker/testutil/request"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/fakecontext"
+	"github.com/moby/moby/v2/internal/testutil/fakegit"
+	"github.com/moby/moby/v2/internal/testutil/fakestorage"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -122,7 +122,6 @@ RUN echo 'right'
 	assert.NilError(c, err)
 	assert.Equal(c, res.StatusCode, http.StatusOK)
 
-	defer body.Close()
 	content, err := request.ReadBody(body)
 	assert.NilError(c, err)
 
@@ -314,32 +313,43 @@ func (s *DockerAPISuite) TestBuildOnBuildCache(c *testing.T) {
 	assert.Assert(c, is.Len(imageIDs, 2))
 	parentID, childID := imageIDs[0], imageIDs[1]
 
-	client := testEnv.APIClient()
+	apiClient := testEnv.APIClient()
 	ctx := testutil.GetContext(c)
 
 	// check parentID is correct
 	// Parent is graphdriver-only
 	if !testEnv.UsingSnapshotter() {
-		image, _, err := client.ImageInspectWithRaw(ctx, childID)
+		var buf bytes.Buffer
+		_, err := apiClient.ImageInspect(ctx, childID, client.ImageInspectWithRawResponse(&buf))
 		assert.NilError(c, err)
 
-		assert.Check(c, is.Equal(parentID, image.Parent))
+		var image struct {
+			// Parent is the ID of the parent image.
+			//
+			// Depending on how the image was created, this field may be empty and
+			// is only set for images that were built/created locally. This field
+			// is omitted if the image was pulled from an image registry.
+			Parent string `json:",omitempty"`
+		}
+		rawResponse := buf.Bytes()
+		err = json.Unmarshal(rawResponse, &image)
+		assert.NilError(c, err, string(rawResponse))
+		assert.Check(c, is.Equal(parentID, image.Parent), string(rawResponse))
 	}
 }
 
 func (s *DockerRegistrySuite) TestBuildCopyFromForcePull(c *testing.T) {
-	client := testEnv.APIClient()
+	apiClient := testEnv.APIClient()
 
 	repoName := fmt.Sprintf("%v/dockercli/busybox", privateRegistryURL)
 	// tag the image to upload it to the private registry
 	ctx := testutil.GetContext(c)
-	err := client.ImageTag(ctx, "busybox", repoName)
-	assert.Check(c, err)
+	_, err := apiClient.ImageTag(ctx, client.ImageTagOptions{Source: "busybox", Target: repoName})
+	assert.NilError(c, err)
 	// push the image to the registry
-	rc, err := client.ImagePush(ctx, repoName, image.PushOptions{RegistryAuth: "{}"})
-	assert.Check(c, err)
-	_, err = io.Copy(io.Discard, rc)
-	assert.Check(c, err)
+	rc, err := apiClient.ImagePush(ctx, repoName, client.ImagePushOptions{RegistryAuth: "{}"})
+	assert.NilError(c, err)
+	assert.NilError(c, rc.Wait(ctx))
 
 	dockerfile := fmt.Sprintf(`
 		FROM %s AS foo
@@ -556,14 +566,14 @@ type buildLine struct {
 	}
 }
 
-func getImageIDsFromBuild(c *testing.T, output []byte) []string {
+func getImageIDsFromBuild(t *testing.T, output []byte) []string {
 	var ids []string
-	for _, line := range bytes.Split(output, []byte("\n")) {
+	for line := range bytes.SplitSeq(output, []byte("\n")) {
 		if len(line) == 0 {
 			continue
 		}
 		entry := buildLine{}
-		assert.NilError(c, json.Unmarshal(line, &entry))
+		assert.NilError(t, json.Unmarshal(line, &entry))
 		if entry.Aux.ID != "" {
 			ids = append(ids, entry.Aux.ID)
 		}

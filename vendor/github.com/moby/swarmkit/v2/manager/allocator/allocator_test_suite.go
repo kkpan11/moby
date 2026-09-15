@@ -685,7 +685,7 @@ func (suite *testSuite) TestNoDuplicateIPs() {
 	defer cancel()
 
 	assignedIPs := make(map[string]string)
-	hasUniqueIP := func(fakeT assert.TestingT, s *store.MemoryStore, task *api.Task) bool {
+	hasUniqueIP := func(_ assert.TestingT, _ *store.MemoryStore, task *api.Task) bool {
 		if len(task.Networks) == 0 {
 			panic("missing networks")
 		}
@@ -702,8 +702,8 @@ func (suite *testSuite) TestNoDuplicateIPs() {
 		return true
 	}
 
-	reps := 100
-	for i := 0; i != reps; i++ {
+	const reps = 100
+	for i := range reps {
 		suite.NoError(s.Update(func(tx store.Tx) error {
 			t2 := &api.Task{
 				// The allocator iterates over the tasks in
@@ -760,7 +760,7 @@ func (suite *testSuite) TestAllocatorRestoreForDuplicateIPs() {
 		}
 		suite.NoError(store.CreateNetwork(tx, in))
 
-		for i := 0; i != numsvcstsks; i++ {
+		for i := range numsvcstsks {
 			svc := &api.Service{
 				ID: "testServiceID" + strconv.Itoa(i),
 				Spec: api.ServiceSpec{
@@ -802,7 +802,7 @@ func (suite *testSuite) TestAllocatorRestoreForDuplicateIPs() {
 		return nil
 	}))
 
-	for i := 0; i != numsvcstsks; i++ {
+	for i := range numsvcstsks {
 		suite.NoError(s.Update(func(tx store.Tx) error {
 			tsk := &api.Task{
 				ID: "testTaskID" + strconv.Itoa(i),
@@ -834,7 +834,7 @@ func (suite *testSuite) TestAllocatorRestoreForDuplicateIPs() {
 		return true
 	}
 
-	hasNoIPOverlapTasks := func(fakeT assert.TestingT, s *store.MemoryStore, task *api.Task) bool {
+	hasNoIPOverlapTasks := func(fakeT assert.TestingT, _ *store.MemoryStore, task *api.Task) bool {
 		assert.NotEqual(fakeT, len(task.Networks), 0)
 		assert.NotEqual(fakeT, len(task.Networks[0].Addresses), 0)
 
@@ -859,7 +859,7 @@ func (suite *testSuite) TestAllocatorRestoreForDuplicateIPs() {
 	defer cancel()
 
 	// Confirm tasks have no IPs that overlap with the services VIPs on restart
-	for i := 0; i != numsvcstsks; i++ {
+	for range numsvcstsks {
 		watchTask(suite.T(), s, taskWatch, false, hasNoIPOverlapTasks)
 		watchService(suite.T(), serviceWatch, false, hasNoIPOverlapServices)
 	}
@@ -897,7 +897,7 @@ func (suite *testSuite) TestAllocatorRestartNoEndpointSpec() {
 		}
 		suite.NoError(store.CreateNetwork(tx, in))
 
-		for i := 0; i != numsvcstsks; i++ {
+		for i := range numsvcstsks {
 			svc := &api.Service{
 				ID: "testServiceID" + strconv.Itoa(i),
 				Spec: api.ServiceSpec{
@@ -932,7 +932,7 @@ func (suite *testSuite) TestAllocatorRestartNoEndpointSpec() {
 		return nil
 	}))
 
-	for i := 0; i != numsvcstsks; i++ {
+	for i := range numsvcstsks {
 		suite.NoError(s.Update(func(tx store.Tx) error {
 			tsk := &api.Task{
 				ID: "testTaskID" + strconv.Itoa(i),
@@ -978,7 +978,7 @@ func (suite *testSuite) TestAllocatorRestartNoEndpointSpec() {
 		return true
 	}
 
-	hasNoIPOverlapTasks := func(fakeT assert.TestingT, s *store.MemoryStore, task *api.Task) bool {
+	hasNoIPOverlapTasks := func(fakeT assert.TestingT, _ *store.MemoryStore, task *api.Task) bool {
 		assert.NotEqual(fakeT, len(task.Networks), 0)
 		assert.NotEqual(fakeT, len(task.Networks[0].Addresses), 0)
 		assignedIP := task.Networks[0].Addresses[0]
@@ -1003,7 +1003,7 @@ func (suite *testSuite) TestAllocatorRestartNoEndpointSpec() {
 	defer cancel()
 
 	// Confirm tasks have no IPs that overlap with the services VIPs on restart
-	for i := 0; i != numsvcstsks; i++ {
+	for range numsvcstsks {
 		watchTask(suite.T(), s, taskWatch, false, hasNoIPOverlapTasks)
 		watchService(suite.T(), serviceWatch, false, hasNoIPOverlapServices)
 	}
@@ -1078,7 +1078,7 @@ func (suite *testSuite) TestAllocatorRestoreForUnallocatedNetwork() {
 		}
 		suite.NoError(store.CreateNetwork(tx, n2))
 
-		for i := 0; i != numsvcstsks; i++ {
+		for i := range numsvcstsks {
 			svc := &api.Service{
 				ID: "testServiceID" + strconv.Itoa(i),
 				Spec: api.ServiceSpec{
@@ -1130,7 +1130,7 @@ func (suite *testSuite) TestAllocatorRestoreForUnallocatedNetwork() {
 		return nil
 	}))
 
-	for i := 0; i != numsvcstsks; i++ {
+	for i := range numsvcstsks {
 		suite.NoError(s.Update(func(tx store.Tx) error {
 			tsk := &api.Task{
 				ID: "testTaskID" + strconv.Itoa(i),
@@ -1176,7 +1176,7 @@ func (suite *testSuite) TestAllocatorRestoreForUnallocatedNetwork() {
 		return true
 	}
 
-	hasNoIPOverlapTasks := func(fakeT assert.TestingT, s *store.MemoryStore, task *api.Task) bool {
+	hasNoIPOverlapTasks := func(fakeT assert.TestingT, _ *store.MemoryStore, task *api.Task) bool {
 		assert.NotEqual(fakeT, len(task.Networks), 0)
 		assert.NotEqual(fakeT, len(task.Networks[0].Addresses), 0)
 		assignedIP := task.Networks[1].Addresses[0]
@@ -1201,7 +1201,7 @@ func (suite *testSuite) TestAllocatorRestoreForUnallocatedNetwork() {
 	defer cancel()
 
 	// Confirm tasks have no IPs that overlap with the services VIPs on restart
-	for i := 0; i != numsvcstsks; i++ {
+	for range numsvcstsks {
 		watchTask(suite.T(), s, taskWatch, false, hasNoIPOverlapTasks)
 		watchService(suite.T(), serviceWatch, false, hasNoIPOverlapServices)
 	}
@@ -2056,7 +2056,7 @@ func isValidSubnet(t assert.TestingT, subnet string) bool {
 
 type mockTester struct{}
 
-func (m mockTester) Errorf(format string, args ...interface{}) {
+func (m mockTester) Errorf(_ string, _ ...any) {
 }
 
 // Returns a timeout given whether we should expect a timeout:  In the case where we do expect a timeout,
@@ -2083,24 +2083,21 @@ func watchNode(t *testing.T, watch chan events.Event, expectTimeout bool,
 		case event := <-watch:
 			if n, ok := event.(api.EventUpdateNode); ok {
 				node = n.Node.Copy()
-				if fn == nil || (fn != nil && fn(mockTester{}, originalNode, node, networks)) {
+				if fn == nil || fn(mockTester{}, originalNode, node, networks) {
 					return
 				}
 			}
 
 			if n, ok := event.(api.EventDeleteNode); ok {
 				node = n.Node.Copy()
-				if fn == nil || (fn != nil && fn(mockTester{}, originalNode, node, networks)) {
+				if fn == nil || fn(mockTester{}, originalNode, node, networks) {
 					return
 				}
 			}
 
 		case <-time.After(getWatchTimeout(expectTimeout)):
 			if !expectTimeout {
-				if node != nil && fn != nil {
-					fn(t, originalNode, node, networks)
-				}
-
+				fn(t, originalNode, node, networks)
 				t.Fatal("timed out before watchNode found expected node state", string(debug.Stack()))
 			}
 
@@ -2116,24 +2113,21 @@ func watchNetwork(t *testing.T, watch chan events.Event, expectTimeout bool, fn 
 		case event := <-watch:
 			if n, ok := event.(api.EventUpdateNetwork); ok {
 				network = n.Network.Copy()
-				if fn == nil || (fn != nil && fn(mockTester{}, network)) {
+				if fn == nil || fn(mockTester{}, network) {
 					return
 				}
 			}
 
 			if n, ok := event.(api.EventDeleteNetwork); ok {
 				network = n.Network.Copy()
-				if fn == nil || (fn != nil && fn(mockTester{}, network)) {
+				if fn == nil || fn(mockTester{}, network) {
 					return
 				}
 			}
 
 		case <-time.After(getWatchTimeout(expectTimeout)):
 			if !expectTimeout {
-				if network != nil && fn != nil {
-					fn(t, network)
-				}
-
+				fn(t, network)
 				t.Fatal("timed out before watchNetwork found expected network state", string(debug.Stack()))
 			}
 
@@ -2149,24 +2143,21 @@ func watchService(t *testing.T, watch chan events.Event, expectTimeout bool, fn 
 		case event := <-watch:
 			if s, ok := event.(api.EventUpdateService); ok {
 				service = s.Service.Copy()
-				if fn == nil || (fn != nil && fn(mockTester{}, service)) {
+				if fn == nil || fn(mockTester{}, service) {
 					return
 				}
 			}
 
 			if s, ok := event.(api.EventDeleteService); ok {
 				service = s.Service.Copy()
-				if fn == nil || (fn != nil && fn(mockTester{}, service)) {
+				if fn == nil || fn(mockTester{}, service) {
 					return
 				}
 			}
 
 		case <-time.After(getWatchTimeout(expectTimeout)):
 			if !expectTimeout {
-				if service != nil && fn != nil {
-					fn(t, service)
-				}
-
+				fn(t, service)
 				t.Fatalf("timed out before watchService found expected service state\n stack = %s", string(debug.Stack()))
 			}
 
@@ -2182,24 +2173,21 @@ func watchTask(t *testing.T, s *store.MemoryStore, watch chan events.Event, expe
 		case event := <-watch:
 			if t, ok := event.(api.EventUpdateTask); ok {
 				task = t.Task.Copy()
-				if fn == nil || (fn != nil && fn(mockTester{}, s, task)) {
+				if fn == nil || fn(mockTester{}, s, task) {
 					return
 				}
 			}
 
 			if t, ok := event.(api.EventDeleteTask); ok {
 				task = t.Task.Copy()
-				if fn == nil || (fn != nil && fn(mockTester{}, s, task)) {
+				if fn == nil || fn(mockTester{}, s, task) {
 					return
 				}
 			}
 
 		case <-time.After(getWatchTimeout(expectTimeout)):
 			if !expectTimeout {
-				if task != nil && fn != nil {
-					fn(t, s, task)
-				}
-
+				fn(t, s, task)
 				t.Fatalf("timed out before watchTask found expected task state %s", debug.Stack())
 			}
 

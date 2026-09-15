@@ -1,105 +1,109 @@
-package container
+package container_test
 
 import (
 	"testing"
 
-	"github.com/docker/docker/errdefs"
-	"gotest.tools/v3/assert"
-	is "gotest.tools/v3/assert/cmp"
+	"github.com/moby/moby/api/types/container"
 )
 
 func TestValidateRestartPolicy(t *testing.T) {
 	tests := []struct {
 		name        string
-		input       RestartPolicy
+		input       container.RestartPolicy
 		expectedErr string
 	}{
 		{
 			name:  "empty",
-			input: RestartPolicy{},
+			input: container.RestartPolicy{},
 		},
 		{
 			name:        "empty with invalid MaxRestartCount (for backward compatibility)",
-			input:       RestartPolicy{MaximumRetryCount: 123},
+			input:       container.RestartPolicy{MaximumRetryCount: 123},
 			expectedErr: "", // Allowed for backward compatibility
 		},
 		{
 			name:        "empty with negative MaxRestartCount)",
-			input:       RestartPolicy{MaximumRetryCount: -123},
+			input:       container.RestartPolicy{MaximumRetryCount: -123},
 			expectedErr: "", // Allowed for backward compatibility
 		},
 		{
 			name:  "always",
-			input: RestartPolicy{Name: RestartPolicyAlways},
+			input: container.RestartPolicy{Name: container.RestartPolicyAlways},
 		},
 		{
 			name:        "always with MaxRestartCount",
-			input:       RestartPolicy{Name: RestartPolicyAlways, MaximumRetryCount: 123},
+			input:       container.RestartPolicy{Name: container.RestartPolicyAlways, MaximumRetryCount: 123},
 			expectedErr: "invalid restart policy: maximum retry count can only be used with 'on-failure'",
 		},
 		{
 			name:        "always with negative MaxRestartCount",
-			input:       RestartPolicy{Name: RestartPolicyAlways, MaximumRetryCount: -123},
+			input:       container.RestartPolicy{Name: container.RestartPolicyAlways, MaximumRetryCount: -123},
 			expectedErr: "invalid restart policy: maximum retry count can only be used with 'on-failure' and cannot be negative",
 		},
 		{
 			name:  "unless-stopped",
-			input: RestartPolicy{Name: RestartPolicyUnlessStopped},
+			input: container.RestartPolicy{Name: container.RestartPolicyUnlessStopped},
 		},
 		{
 			name:        "unless-stopped with MaxRestartCount",
-			input:       RestartPolicy{Name: RestartPolicyUnlessStopped, MaximumRetryCount: 123},
+			input:       container.RestartPolicy{Name: container.RestartPolicyUnlessStopped, MaximumRetryCount: 123},
 			expectedErr: "invalid restart policy: maximum retry count can only be used with 'on-failure'",
 		},
 		{
 			name:        "unless-stopped with negative MaxRestartCount",
-			input:       RestartPolicy{Name: RestartPolicyUnlessStopped, MaximumRetryCount: -123},
+			input:       container.RestartPolicy{Name: container.RestartPolicyUnlessStopped, MaximumRetryCount: -123},
 			expectedErr: "invalid restart policy: maximum retry count can only be used with 'on-failure' and cannot be negative",
 		},
 		{
 			name:  "disabled",
-			input: RestartPolicy{Name: RestartPolicyDisabled},
+			input: container.RestartPolicy{Name: container.RestartPolicyDisabled},
 		},
 		{
 			name:        "disabled with MaxRestartCount",
-			input:       RestartPolicy{Name: RestartPolicyDisabled, MaximumRetryCount: 123},
+			input:       container.RestartPolicy{Name: container.RestartPolicyDisabled, MaximumRetryCount: 123},
 			expectedErr: "invalid restart policy: maximum retry count can only be used with 'on-failure'",
 		},
 		{
 			name:        "disabled with negative MaxRestartCount",
-			input:       RestartPolicy{Name: RestartPolicyDisabled, MaximumRetryCount: -123},
+			input:       container.RestartPolicy{Name: container.RestartPolicyDisabled, MaximumRetryCount: -123},
 			expectedErr: "invalid restart policy: maximum retry count can only be used with 'on-failure' and cannot be negative",
 		},
 		{
 			name:  "on-failure",
-			input: RestartPolicy{Name: RestartPolicyOnFailure},
+			input: container.RestartPolicy{Name: container.RestartPolicyOnFailure},
 		},
 		{
 			name:  "on-failure with MaxRestartCount",
-			input: RestartPolicy{Name: RestartPolicyOnFailure, MaximumRetryCount: 123},
+			input: container.RestartPolicy{Name: container.RestartPolicyOnFailure, MaximumRetryCount: 123},
 		},
 		{
 			name:        "on-failure with negative MaxRestartCount",
-			input:       RestartPolicy{Name: RestartPolicyOnFailure, MaximumRetryCount: -123},
+			input:       container.RestartPolicy{Name: container.RestartPolicyOnFailure, MaximumRetryCount: -123},
 			expectedErr: "invalid restart policy: maximum retry count cannot be negative",
 		},
 		{
 			name:        "unknown policy",
-			input:       RestartPolicy{Name: "unknown"},
+			input:       container.RestartPolicy{Name: "unknown"},
 			expectedErr: "invalid restart policy: unknown policy 'unknown'; use one of 'no', 'always', 'on-failure', or 'unless-stopped'",
 		},
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateRestartPolicy(tc.input)
+			err := container.ValidateRestartPolicy(tc.input)
 			if tc.expectedErr == "" {
-				assert.Check(t, err)
-			} else {
-				assert.Check(t, is.ErrorType(err, errdefs.IsInvalidParameter))
-				assert.Check(t, is.Error(err, tc.expectedErr))
+				checkNoError(t, err)
+				return
 			}
+
+			if err == nil {
+				t.Errorf("ValidateRestartPolicy(%+v) error = nil, want %q", tc.input, tc.expectedErr)
+				return
+			}
+			if _, ok := err.(interface{ InvalidParameter() }); !ok {
+				t.Errorf("ValidateRestartPolicy(%+v) error = %T, want invalid-parameter error", tc.input, err)
+			}
+			checkError(t, err, tc.expectedErr)
 		})
 	}
 }

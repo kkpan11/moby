@@ -1,4 +1,4 @@
-package logger // import "github.com/docker/docker/daemon/logger"
+package logger
 
 import (
 	"context"
@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/api/types/plugins/logdriver"
-	"github.com/docker/docker/pkg/plugingetter"
+	"github.com/moby/moby/v2/daemon/logger/internal/logdriver"
+	"github.com/moby/moby/v2/pkg/plugingetter"
 	"github.com/pkg/errors"
 )
 
@@ -33,7 +33,12 @@ type pluginAdapter struct {
 	buf logdriver.LogEntry
 }
 
-func (a *pluginAdapter) Log(msg *Message) error {
+func (a *pluginAdapter) Log(msg *Message) (err error) {
+	defer func() {
+		if err == nil {
+			PutMessage(msg)
+		}
+	}()
 	a.mu.Lock()
 
 	a.buf.Line = msg.Line
@@ -48,12 +53,11 @@ func (a *pluginAdapter) Log(msg *Message) error {
 		}
 	}
 
-	err := a.enc.Encode(&a.buf)
+	err = a.enc.Encode(&a.buf)
 	a.buf.Reset()
 
 	a.mu.Unlock()
 
-	PutMessage(msg)
 	return err
 }
 
@@ -107,7 +111,7 @@ func (a *pluginAdapterWithRead) ReadLogs(ctx context.Context, config ReadConfig)
 
 			var buf logdriver.LogEntry
 			if err := dec.Decode(&buf); err != nil {
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
 					return
 				}
 				watcher.Err <- errors.Wrap(err, "error decoding log message")

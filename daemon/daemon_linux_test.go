@@ -1,6 +1,6 @@
 //go:build linux
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"net"
@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/internal/testutils/netnsutils"
-	"github.com/docker/docker/libnetwork/types"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/libnetwork/types"
+	"github.com/moby/moby/v2/internal/testutil/netnsutils"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
 	"github.com/vishvananda/netlink"
@@ -363,12 +363,20 @@ func TestIfaceAddrs(t *testing.T) {
 
 			createBridge(t, "test", tt.nws...)
 
-			ipv4Nw, ipv6Nw, err := ifaceAddrs("test")
+			ipv4Nw, err := ifaceAddrs("test", netlink.FAMILY_V4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ipv6Nw, err := ifaceAddrs("test", netlink.FAMILY_V6)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			assert.Check(t, is.DeepEqual(tt.nws, ipv4Nw,
+			ipnets := make([]*net.IPNet, len(ipv4Nw))
+			for i := range ipv4Nw {
+				ipnets[i] = ipv4Nw[i].IPNet
+			}
+			assert.Check(t, is.DeepEqual(ipnets, tt.nws,
 				cmpopts.SortSlices(func(a, b *net.IPNet) bool { return a.String() < b.String() })))
 			// IPv6 link-local address
 			assert.Check(t, is.Len(ipv6Nw, 1))

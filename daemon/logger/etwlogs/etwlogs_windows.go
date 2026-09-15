@@ -10,7 +10,7 @@
 //
 // Each container log message generates an ETW event that also contains:
 // the container name and ID, the timestamp, and the stream type.
-package etwlogs // import "github.com/docker/docker/daemon/logger/etwlogs"
+package etwlogs
 
 import (
 	"context"
@@ -20,7 +20,7 @@ import (
 	"unsafe"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger"
 	"golang.org/x/sys/windows"
 )
 
@@ -44,17 +44,10 @@ var (
 )
 
 var (
-	providerHandle windows.Handle
+	providerHandle = windows.InvalidHandle
 	refCount       int
 	mu             sync.Mutex
 )
-
-func init() {
-	providerHandle = windows.InvalidHandle
-	if err := logger.RegisterLogDriver(name, New); err != nil {
-		panic(err)
-	}
-}
 
 // New creates a new etwLogs logger for the given container and registers the EWT provider.
 func New(info logger.Info) (logger.Logger, error) {

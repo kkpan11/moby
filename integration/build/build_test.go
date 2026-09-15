@@ -1,24 +1,29 @@
-package build // import "github.com/docker/docker/integration/build"
+package build
 
 import (
 	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/fakecontext"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
+	"github.com/moby/moby/api/types/build"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/fakecontext"
+	"github.com/moby/moby/v2/internal/testutil/request"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/skip"
@@ -27,7 +32,7 @@ import (
 func TestBuildWithRemoveAndForceRemove(t *testing.T) {
 	ctx := setupTest(t)
 
-	cases := []struct {
+	tests := []struct {
 		name                           string
 		dockerfile                     string
 		numberOfIntermediateContainers int
@@ -90,13 +95,11 @@ func TestBuildWithRemoveAndForceRemove(t *testing.T) {
 		},
 	}
 
-	client := testEnv.APIClient()
-	for _, c := range cases {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
+	apiClient := testEnv.APIClient()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := testutil.StartSpan(ctx, t)
-			dockerfile := []byte(c.dockerfile)
+			dockerfile := []byte(tc.dockerfile)
 
 			buff := bytes.NewBuffer(nil)
 			tw := tar.NewWriter(buff)
@@ -107,25 +110,25 @@ func TestBuildWithRemoveAndForceRemove(t *testing.T) {
 			_, err := tw.Write(dockerfile)
 			assert.NilError(t, err)
 			assert.NilError(t, tw.Close())
-			resp, err := client.ImageBuild(ctx, buff, types.ImageBuildOptions{Remove: c.rm, ForceRemove: c.forceRm, NoCache: true})
+			resp, err := apiClient.ImageBuild(ctx, buff, client.ImageBuildOptions{Remove: tc.rm, ForceRemove: tc.forceRm, NoCache: true})
 			assert.NilError(t, err)
 			defer resp.Body.Close()
 			filter, err := buildContainerIdsFilter(resp.Body)
 			assert.NilError(t, err)
-			remainingContainers, err := client.ContainerList(ctx, container.ListOptions{Filters: filter, All: true})
+			remainingContainers, err := apiClient.ContainerList(ctx, client.ContainerListOptions{Filters: filter, All: true})
 			assert.NilError(t, err)
-			assert.Equal(t, c.numberOfIntermediateContainers, len(remainingContainers), "Expected %v remaining intermediate containers, got %v", c.numberOfIntermediateContainers, len(remainingContainers))
+			assert.Equal(t, tc.numberOfIntermediateContainers, len(remainingContainers.Items), "Expected %v remaining intermediate containers, got %v", tc.numberOfIntermediateContainers, len(remainingContainers.Items))
 		})
 	}
 }
 
-func buildContainerIdsFilter(buildOutput io.Reader) (filters.Args, error) {
+func buildContainerIdsFilter(buildOutput io.Reader) (client.Filters, error) {
 	const intermediateContainerPrefix = " ---> Running in "
-	filter := filters.NewArgs()
+	filter := client.Filters{}
 
 	dec := json.NewDecoder(buildOutput)
 	for {
-		m := jsonmessage.JSONMessage{}
+		m := jsonstream.Message{}
 		err := dec.Decode(&m)
 		if err == io.EOF {
 			return filter, nil
@@ -133,8 +136,8 @@ func buildContainerIdsFilter(buildOutput io.Reader) (filters.Args, error) {
 		if err != nil {
 			return filter, err
 		}
-		if ix := strings.Index(m.Stream, intermediateContainerPrefix); ix != -1 {
-			filter.Add("id", strings.TrimSpace(m.Stream[ix+len(intermediateContainerPrefix):]))
+		if _, id, ok := strings.Cut(m.Stream, intermediateContainerPrefix); ok {
+			filter.Add("id", strings.TrimSpace(id))
 		}
 	}
 }
@@ -160,16 +163,12 @@ func TestBuildMultiStageCopy(t *testing.T) {
 		t.Run(target, func(t *testing.T) {
 			imgName := strings.ToLower(t.Name())
 
-			resp, err := apiclient.ImageBuild(
-				ctx,
-				source.AsTarReader(t),
-				types.ImageBuildOptions{
-					Remove:      true,
-					ForceRemove: true,
-					Target:      target,
-					Tags:        []string{imgName},
-				},
-			)
+			resp, err := apiclient.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+				Remove:      true,
+				ForceRemove: true,
+				Target:      target,
+				Tags:        []string{imgName},
+			})
 			assert.NilError(t, err)
 
 			out := bytes.NewBuffer(nil)
@@ -181,7 +180,7 @@ func TestBuildMultiStageCopy(t *testing.T) {
 			assert.NilError(t, err)
 
 			// verify the image was successfully built
-			_, _, err = apiclient.ImageInspectWithRaw(ctx, imgName)
+			_, err = apiclient.ImageInspect(ctx, imgName)
 			if err != nil {
 				t.Log(out)
 			}
@@ -210,19 +209,17 @@ func TestBuildMultiStageParentConfig(t *testing.T) {
 
 	apiclient := testEnv.APIClient()
 	imgName := strings.ToLower(t.Name())
-	resp, err := apiclient.ImageBuild(ctx,
-		source.AsTarReader(t),
-		types.ImageBuildOptions{
-			Remove:      true,
-			ForceRemove: true,
-			Tags:        []string{imgName},
-		})
+	resp, err := apiclient.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+		Remove:      true,
+		ForceRemove: true,
+		Tags:        []string{imgName},
+	})
 	assert.NilError(t, err)
 	_, err = io.Copy(io.Discard, resp.Body)
 	assert.Check(t, resp.Body.Close())
 	assert.NilError(t, err)
 
-	img, _, err := apiclient.ImageInspectWithRaw(ctx, imgName)
+	img, err := apiclient.ImageInspect(ctx, imgName)
 	assert.NilError(t, err)
 
 	expected := "/foo/sub2"
@@ -257,21 +254,19 @@ func TestBuildLabelWithTargets(t *testing.T) {
 
 	apiclient := testEnv.APIClient()
 	// For `target-a` build
-	resp, err := apiclient.ImageBuild(ctx,
-		source.AsTarReader(t),
-		types.ImageBuildOptions{
-			Remove:      true,
-			ForceRemove: true,
-			Tags:        []string{imgName},
-			Labels:      testLabels,
-			Target:      "target-a",
-		})
+	resp, err := apiclient.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+		Remove:      true,
+		ForceRemove: true,
+		Tags:        []string{imgName},
+		Labels:      testLabels,
+		Target:      "target-a",
+	})
 	assert.NilError(t, err)
 	_, err = io.Copy(io.Discard, resp.Body)
 	assert.Check(t, resp.Body.Close())
 	assert.NilError(t, err)
 
-	img, _, err := apiclient.ImageInspectWithRaw(ctx, imgName)
+	img, err := apiclient.ImageInspect(ctx, imgName)
 	assert.NilError(t, err)
 
 	testLabels["label-a"] = "inline-a"
@@ -286,7 +281,7 @@ func TestBuildLabelWithTargets(t *testing.T) {
 	delete(testLabels, "label-a")
 	resp, err = apiclient.ImageBuild(ctx,
 		source.AsTarReader(t),
-		types.ImageBuildOptions{
+		client.ImageBuildOptions{
 			Remove:      true,
 			ForceRemove: true,
 			Tags:        []string{imgName},
@@ -298,7 +293,7 @@ func TestBuildLabelWithTargets(t *testing.T) {
 	assert.Check(t, resp.Body.Close())
 	assert.NilError(t, err)
 
-	img, _, err = apiclient.ImageInspectWithRaw(ctx, imgName)
+	img, err = apiclient.ImageInspect(ctx, imgName)
 	assert.NilError(t, err)
 
 	testLabels["label-b"] = "inline-b"
@@ -325,12 +320,10 @@ COPY    3/ /target/
 	defer source.Close()
 
 	apiclient := testEnv.APIClient()
-	resp, err := apiclient.ImageBuild(ctx,
-		source.AsTarReader(t),
-		types.ImageBuildOptions{
-			Remove:      true,
-			ForceRemove: true,
-		})
+	resp, err := apiclient.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+		Remove:      true,
+		ForceRemove: true,
+	})
 	assert.NilError(t, err)
 	_, err = io.Copy(io.Discard, resp.Body)
 	assert.Check(t, resp.Body.Close())
@@ -361,12 +354,10 @@ RUN cat somefile`
 	defer source.Close()
 
 	apiclient := testEnv.APIClient()
-	resp, err := apiclient.ImageBuild(ctx,
-		source.AsTarReader(t),
-		types.ImageBuildOptions{
-			Remove:      true,
-			ForceRemove: true,
-		})
+	resp, err := apiclient.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+		Remove:      true,
+		ForceRemove: true,
+	})
 
 	out := bytes.NewBuffer(nil)
 	assert.NilError(t, err)
@@ -380,12 +371,17 @@ RUN cat somefile`
 	assert.NilError(t, err)
 	assert.Assert(t, is.Equal(3, len(imageIDs)))
 
-	img, _, err := apiclient.ImageInspectWithRaw(ctx, imageIDs[2])
+	img, err := apiclient.ImageInspect(ctx, imageIDs[2])
 	assert.NilError(t, err)
 	assert.Check(t, is.Contains(img.Config.Env, "bar=baz"))
 }
 
-// #35403 #36122
+// TestBuildUncleanTarFilenames is a regression test for cache invalidation
+// with non-canonical, in-context archive paths.
+//
+// See:
+// - https://github.com/moby/moby/issues/35403
+// - https://github.com/moby/moby/issues/36122
 func TestBuildUncleanTarFilenames(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 
@@ -401,18 +397,16 @@ COPY bar /
 	buf := bytes.NewBuffer(nil)
 	w := tar.NewWriter(buf)
 	writeTarRecord(t, w, "Dockerfile", dockerfile)
-	writeTarRecord(t, w, "../foo", "foocontents0")
+	writeTarRecord(t, w, "dir/../foo", "foocontents0")
 	writeTarRecord(t, w, "/bar", "barcontents0")
 	err := w.Close()
 	assert.NilError(t, err)
 
 	apiclient := testEnv.APIClient()
-	resp, err := apiclient.ImageBuild(ctx,
-		buf,
-		types.ImageBuildOptions{
-			Remove:      true,
-			ForceRemove: true,
-		})
+	resp, err := apiclient.ImageBuild(ctx, buf, client.ImageBuildOptions{
+		Remove:      true,
+		ForceRemove: true,
+	})
 
 	out := bytes.NewBuffer(nil)
 	assert.NilError(t, err)
@@ -425,14 +419,14 @@ COPY bar /
 	buf = bytes.NewBuffer(nil)
 	w = tar.NewWriter(buf)
 	writeTarRecord(t, w, "Dockerfile", dockerfile)
-	writeTarRecord(t, w, "../foo", "foocontents1")
+	writeTarRecord(t, w, "dir/../foo", "foocontents1")
 	writeTarRecord(t, w, "/bar", "barcontents1")
 	err = w.Close()
 	assert.NilError(t, err)
 
 	resp, err = apiclient.ImageBuild(ctx,
 		buf,
-		types.ImageBuildOptions{
+		client.ImageBuildOptions{
 			Remove:      true,
 			ForceRemove: true,
 		})
@@ -469,12 +463,10 @@ RUN [ ! -f foo ]
 	defer source.Close()
 
 	apiClient := testEnv.APIClient()
-	resp, err := apiClient.ImageBuild(ctx,
-		source.AsTarReader(t),
-		types.ImageBuildOptions{
-			Remove:      true,
-			ForceRemove: true,
-		})
+	resp, err := apiClient.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+		Remove:      true,
+		ForceRemove: true,
+	})
 
 	out := bytes.NewBuffer(nil)
 	assert.NilError(t, err)
@@ -488,6 +480,7 @@ RUN [ ! -f foo ]
 // #37581
 // #40444 (Windows Containers only)
 func TestBuildWithHugeFile(t *testing.T) {
+	t.Skip("Test is flaky, and often causes out of space issues on GitHub Actions")
 	ctx := setupTest(t)
 
 	var dockerfile string
@@ -515,12 +508,10 @@ RUN for g in $(seq 0 8); do dd if=/dev/urandom of=rnd bs=1K count=1 seek=$((1024
 	assert.NilError(t, err)
 
 	apiClient := testEnv.APIClient()
-	resp, err := apiClient.ImageBuild(ctx,
-		buf,
-		types.ImageBuildOptions{
-			Remove:      true,
-			ForceRemove: true,
-		})
+	resp, err := apiClient.ImageBuild(ctx, buf, client.ImageBuildOptions{
+		Remove:      true,
+		ForceRemove: true,
+	})
 
 	out := bytes.NewBuffer(nil)
 	assert.NilError(t, err)
@@ -556,12 +547,10 @@ COPY --from=intermediate C:\\stuff C:\\stuff
 	assert.NilError(t, err)
 
 	apiClient := testEnv.APIClient()
-	resp, err := apiClient.ImageBuild(ctx,
-		buf,
-		types.ImageBuildOptions{
-			Remove:      true,
-			ForceRemove: true,
-		})
+	resp, err := apiClient.ImageBuild(ctx, buf, client.ImageBuildOptions{
+		Remove:      true,
+		ForceRemove: true,
+	})
 
 	out := bytes.NewBuffer(nil)
 	assert.NilError(t, err)
@@ -612,7 +601,6 @@ func TestBuildWithEmptyDockerfile(t *testing.T) {
 	apiClient := testEnv.APIClient()
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -624,12 +612,12 @@ func TestBuildWithEmptyDockerfile(t *testing.T) {
 
 			_, err = apiClient.ImageBuild(ctx,
 				buf,
-				types.ImageBuildOptions{
+				client.ImageBuildOptions{
 					Remove:      true,
 					ForceRemove: true,
 				})
 
-			assert.Check(t, is.Contains(err.Error(), tc.expectedErr))
+			assert.Check(t, is.ErrorContains(err, tc.expectedErr))
 		})
 	}
 }
@@ -651,15 +639,11 @@ func TestBuildPreserveOwnership(t *testing.T) {
 		t.Run(target, func(t *testing.T) {
 			ctx := testutil.StartSpan(ctx, t)
 
-			resp, err := apiClient.ImageBuild(
-				ctx,
-				source.AsTarReader(t),
-				types.ImageBuildOptions{
-					Remove:      true,
-					ForceRemove: true,
-					Target:      target,
-				},
-			)
+			resp, err := apiClient.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+				Remove:      true,
+				ForceRemove: true,
+				Target:      target,
+			})
 			assert.NilError(t, err)
 
 			out := bytes.NewBuffer(nil)
@@ -682,14 +666,58 @@ func TestBuildPlatformInvalid(t *testing.T) {
 	err := w.Close()
 	assert.NilError(t, err)
 
-	_, err = testEnv.APIClient().ImageBuild(ctx, buf, types.ImageBuildOptions{
+	_, err = testEnv.APIClient().ImageBuild(ctx, buf, client.ImageBuildOptions{
 		Remove:      true,
 		ForceRemove: true,
-		Platform:    "foobar",
+		Platforms:   []ocispec.Platform{{OS: "foobar"}},
 	})
 
 	assert.Check(t, is.ErrorContains(err, "unknown operating system or architecture"))
-	assert.Check(t, is.ErrorType(err, errdefs.IsInvalidParameter))
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+}
+
+func TestBuildCacheUsesDockerfilePlatform(t *testing.T) {
+	skip.If(t, testEnv.DaemonInfo.OSType != "linux", "test images are only available on linux")
+
+	platform := "linux/arm64/v8"
+	baseImage := "hello-world:arm64"
+	daemonPlatform := platforms.Normalize(ocispec.Platform{
+		OS:           "linux",
+		Architecture: testEnv.DaemonInfo.Architecture,
+	})
+	if daemonPlatform.Architecture == "arm64" {
+		platform = "linux/amd64"
+		baseImage = "hello-world:amd64"
+	}
+	requestedPlatform, err := platforms.Parse(platform)
+	assert.NilError(t, err)
+	assert.Assert(t, !platforms.Only(daemonPlatform).Match(requestedPlatform))
+
+	ctx := setupTest(t)
+	source := fakecontext.New(t, "", fakecontext.WithDockerfile(fmt.Sprintf(`
+FROM --platform=%s %s
+ENV CACHE_TEST=1
+`, platform, baseImage)))
+	defer source.Close()
+
+	buildImage := func() string {
+		resp, err := testEnv.APIClient().ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+			Version: build.BuilderV1,
+		})
+		assert.NilError(t, err)
+		defer resp.Body.Close()
+
+		out := bytes.NewBuffer(nil)
+		_, err = io.Copy(out, resp.Body)
+		assert.NilError(t, err)
+		return out.String()
+	}
+
+	buildImage()
+	out := buildImage()
+	if !assert.Check(t, is.Contains(out, "Using cache")) {
+		t.Log(out)
+	}
 }
 
 // TestBuildWorkdirNoCacheMiss is a regression test for https://github.com/moby/moby/issues/47627
@@ -711,8 +739,8 @@ func TestBuildWorkdirNoCacheMiss(t *testing.T) {
 			apiClient := testEnv.APIClient()
 
 			buildAndGetID := func() string {
-				resp, err := apiClient.ImageBuild(ctx, source.AsTarReader(t), types.ImageBuildOptions{
-					Version: types.BuilderV1,
+				resp, err := apiClient.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+					Version: build.BuilderV1,
 				})
 				assert.NilError(t, err)
 				defer resp.Body.Close()
@@ -730,7 +758,7 @@ func TestBuildWorkdirNoCacheMiss(t *testing.T) {
 	}
 }
 
-func TestBuildEmitsImageCreateEvent(t *testing.T) {
+func TestBuildEmitsEvents(t *testing.T) {
 	ctx := setupTest(t)
 
 	dockerfile := "FROM busybox\nRUN echo hello > /hello"
@@ -739,64 +767,162 @@ func TestBuildEmitsImageCreateEvent(t *testing.T) {
 
 	apiClient := testEnv.APIClient()
 
-	for _, builderVersion := range []types.BuilderVersion{types.BuilderV1, types.BuilderBuildKit} {
-		builderVersion := builderVersion
+	for _, builderVersion := range []build.BuilderVersion{build.BuilderV1, build.BuilderBuildKit} {
 		t.Run("v"+string(builderVersion), func(t *testing.T) {
-			if builderVersion == types.BuilderBuildKit {
-				skip.If(t, testEnv.UsingSnapshotter(),
-					"FIXME: Passing a context via a tarball is not supported with the containerd image store. See: https://github.com/moby/moby/issues/47717")
-				skip.If(t, testEnv.DaemonInfo.OSType == "windows", "Buildkit is not supported on Windows")
-			}
+			skip.If(t, builderVersion == build.BuilderBuildKit && testEnv.DaemonInfo.OSType == "windows" && !testEnv.UsingSnapshotter(),
+				"Buildkit is not supported on Windows with graphdrivers")
+			for _, tc := range []struct {
+				name           string
+				tag            string
+				expectCreate   int
+				expectTag      int
+				expectTagValue string
+			}{
+				{
+					name:         "no tag",
+					tag:          "",
+					expectCreate: 1,
+					expectTag:    0,
+				},
+				{
+					name:           "with tag",
+					tag:            "testbuildemitsevents",
+					expectCreate:   1,
+					expectTag:      1,
+					expectTagValue: "testbuildemitsevents:latest",
+				},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
 
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
+					ctx, cancel := context.WithCancel(ctx)
+					defer cancel()
 
-			since := time.Now()
+					// Use the daemon's own clock for the event window, not the test
+					// runner's: the two can drift when the test suite talks to a
+					// remote daemon, which would make daemon-stamped build events
+					// fall outside a runner-clock-bounded window.
+					since := request.DaemonUnixTime(ctx, t, apiClient, testEnv)
 
-			resp, err := apiClient.ImageBuild(ctx, source.AsTarReader(t), types.ImageBuildOptions{
-				Version: builderVersion,
-				NoCache: true,
-			})
-			assert.NilError(t, err)
-
-			defer resp.Body.Close()
-
-			out := bytes.NewBuffer(nil)
-			_, err = io.Copy(out, resp.Body)
-			assert.NilError(t, err)
-
-			t.Log(out.String())
-
-			eventsChan, errs := apiClient.Events(ctx, events.ListOptions{
-				Since: since.Format(time.RFC3339Nano),
-				Until: time.Now().Format(time.RFC3339Nano),
-			})
-			imageCreateEvts := 0
-			finished := false
-			for !finished {
-				select {
-				case evt := <-eventsChan:
-					t.Log("Got event type:", evt.Type, "action:", evt.Action)
-
-					if evt.Type == events.ImageEventType && evt.Action == events.ActionCreate {
-						imageCreateEvts++
+					buildOpts := client.ImageBuildOptions{
+						Version: builderVersion,
+						NoCache: true,
 					}
-				case err := <-errs:
-					assert.Check(t, err == nil || err == io.EOF)
-					finished = true
-				}
-			}
+					if tc.tag != "" {
+						buildOpts.Tags = []string{tc.tag}
+					}
 
-			assert.Check(t, is.Equal(1, imageCreateEvts))
+					resp, err := apiClient.ImageBuild(ctx, source.AsTarReader(t), buildOpts)
+					assert.NilError(t, err)
+
+					defer resp.Body.Close()
+
+					out := bytes.NewBuffer(nil)
+					_, err = io.Copy(out, resp.Body)
+					assert.NilError(t, err)
+					buildLogs := out.String()
+					imageID := readBuildImageIDs(t, bytes.NewReader(out.Bytes()))
+					assert.Assert(t, imageID != "", "could not determine built image ID from build output:\n%s", buildLogs)
+
+					// Clean up tagged image if we created one
+					if tc.tag != "" {
+						t.Cleanup(func() {
+							if _, err := apiClient.ImageRemove(context.Background(), tc.tag, client.ImageRemoveOptions{Force: true}); err != nil {
+								t.Logf("failed to remove image %s: %v", tc.tag, err)
+							}
+						})
+					}
+
+					until := request.DaemonUnixTime(ctx, t, apiClient, testEnv)
+					result := apiClient.Events(ctx, client.EventsListOptions{
+						Since: since,
+						Until: until,
+						// Scope to the image this subtest built: the daemon is shared
+						// across (sub)tests, so an unfiltered stream would also pick up
+						// create/tag events from unrelated concurrent activity.
+						Filters: make(client.Filters).Add(string(events.ImageEventType), imageID),
+					})
+					eventsChan := result.Messages
+					errs := result.Err
+
+					var eventsReceived []string
+					imageCreateEvts := 0
+					imageTagEvts := 0
+					var imageTagEvtName string
+					finished := false
+					for !finished {
+						select {
+						case evt := <-eventsChan:
+							eventsReceived = append(eventsReceived, fmt.Sprintf("type: %v, action: %v", evt.Type, evt.Action))
+							if evt.Type == events.ImageEventType && evt.Action == events.ActionCreate {
+								imageCreateEvts++
+							}
+							if evt.Type == events.ImageEventType && evt.Action == events.ActionTag {
+								imageTagEvts++
+								imageTagEvtName = evt.Actor.Attributes["name"]
+							}
+						case err := <-errs:
+							assert.Check(t, err == nil || errors.Is(err, io.EOF))
+							finished = true
+						}
+					}
+
+					createOk := assert.Check(t, is.Equal(tc.expectCreate, imageCreateEvts))
+					tagOk := assert.Check(t, is.Equal(tc.expectTag, imageTagEvts))
+					if !createOk || !tagOk {
+						t.Logf("build-logs:\n%s", buildLogs)
+						t.Logf("events received:\n%s", strings.Join(eventsReceived, "\n"))
+					}
+					if tc.expectTagValue != "" {
+						assert.Check(t, is.Equal(tc.expectTagValue, imageTagEvtName))
+					}
+				})
+			}
 		})
 	}
+}
+
+func TestBuildHistoryDoesNotPreventRemoval(t *testing.T) {
+	skip.If(t, !testEnv.UsingSnapshotter(), "only relevant to c8d integration")
+
+	ctx := setupTest(t)
+
+	dockerfile := "FROM busybox\nRUN echo hello world > /hello"
+	source := fakecontext.New(t, "", fakecontext.WithDockerfile(dockerfile))
+	defer source.Close()
+
+	apiClient := testEnv.APIClient()
+
+	buildImage := func(imgName string) error {
+		resp, err := apiClient.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+			Remove:      true,
+			ForceRemove: true,
+			Tags:        []string{imgName},
+			Version:     build.BuilderBuildKit,
+		})
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		_, err = io.Copy(io.Discard, resp.Body)
+		return err
+	}
+
+	err := buildImage("history-a")
+	assert.NilError(t, err)
+
+	res, err := apiClient.ImageRemove(ctx, "history-a", client.ImageRemoveOptions{})
+	assert.NilError(t, err)
+	assert.Check(t, slices.ContainsFunc(res.Items, func(r image.DeleteResponse) bool {
+		return r.Deleted != ""
+	}))
 }
 
 func readBuildImageIDs(t *testing.T, rd io.Reader) string {
 	t.Helper()
 	decoder := json.NewDecoder(rd)
 	for {
-		var jm jsonmessage.JSONMessage
+		var jm jsonstream.Message
 		if err := decoder.Decode(&jm); err != nil {
 			if err == io.EOF {
 				break
@@ -812,7 +938,8 @@ func readBuildImageIDs(t *testing.T, rd io.Reader) string {
 			ID string `json:"ID"`
 		}
 
-		if json.Unmarshal(*jm.Aux, &auxId); auxId.ID != "" {
+		json.Unmarshal(*jm.Aux, &auxId)
+		if auxId.ID != "" {
 			return auxId.ID
 		}
 	}
@@ -841,7 +968,7 @@ type buildLine struct {
 
 func getImageIDsFromBuild(output []byte) ([]string, error) {
 	var ids []string
-	for _, line := range bytes.Split(output, []byte("\n")) {
+	for line := range bytes.SplitSeq(output, []byte("\n")) {
 		if len(line) == 0 {
 			continue
 		}

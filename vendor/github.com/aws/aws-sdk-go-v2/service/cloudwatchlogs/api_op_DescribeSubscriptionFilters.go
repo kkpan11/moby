@@ -5,11 +5,8 @@ package cloudwatchlogs
 import (
 	"context"
 	"fmt"
-	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/smithy-go/middleware"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Lists the subscription filters for the specified log group. You can list all
@@ -66,9 +63,6 @@ type DescribeSubscriptionFiltersOutput struct {
 }
 
 func (c *Client) addOperationDescribeSubscriptionFiltersMiddlewares(stack *middleware.Stack, options Options) (err error) {
-	if err := stack.Serialize.Add(&setOperationInputMiddleware{}, middleware.After); err != nil {
-		return err
-	}
 	err = stack.Serialize.Add(&awsAwsjson11_serializeOpDescribeSubscriptionFilters{}, middleware.After)
 	if err != nil {
 		return err
@@ -77,56 +71,23 @@ func (c *Client) addOperationDescribeSubscriptionFiltersMiddlewares(stack *middl
 	if err != nil {
 		return err
 	}
-	if err := addProtocolFinalizerMiddlewares(stack, options, "DescribeSubscriptionFilters"); err != nil {
-		return fmt.Errorf("add protocol finalizers: %v", err)
-	}
 
-	if err = addlegacyEndpointContextSetter(stack, options); err != nil {
-		return err
-	}
-	if err = addSetLoggerMiddleware(stack, options); err != nil {
-		return err
-	}
-	if err = awsmiddleware.AddClientRequestIDMiddleware(stack); err != nil {
-		return err
-	}
-	if err = smithyhttp.AddComputeContentLengthMiddleware(stack); err != nil {
+	if err = addComputeContentLength(stack); err != nil {
 		return err
 	}
 	if err = addResolveEndpointMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = v4.AddComputePayloadSHA256Middleware(stack); err != nil {
+	if err = addComputePayloadSHA256(stack); err != nil {
 		return err
 	}
-	if err = addRetryMiddlewares(stack, options); err != nil {
+	if err = addRecordResponseTiming(stack, options); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRawResponseToMetadata(stack); err != nil {
-		return err
-	}
-	if err = awsmiddleware.AddRecordResponseTiming(stack); err != nil {
-		return err
-	}
-	if err = addClientUserAgent(stack, options); err != nil {
-		return err
-	}
-	if err = smithyhttp.AddErrorCloseResponseBodyMiddleware(stack); err != nil {
-		return err
-	}
-	if err = smithyhttp.AddCloseResponseBodyMiddleware(stack); err != nil {
-		return err
-	}
-	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+	if err = addCredentialSource(stack, options); err != nil {
 		return err
 	}
 	if err = addOpDescribeSubscriptionFiltersValidationMiddleware(stack); err != nil {
-		return err
-	}
-	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeSubscriptionFilters(options.Region), middleware.Before); err != nil {
-		return err
-	}
-	if err = awsmiddleware.AddRecursionDetection(stack); err != nil {
 		return err
 	}
 	if err = addRequestIDRetrieverMiddleware(stack); err != nil {
@@ -141,16 +102,11 @@ func (c *Client) addOperationDescribeSubscriptionFiltersMiddlewares(stack *middl
 	if err = addDisableHTTPSMiddleware(stack, options); err != nil {
 		return err
 	}
+	if err = addInterceptors(stack, options); err != nil {
+		return err
+	}
 	return nil
 }
-
-// DescribeSubscriptionFiltersAPIClient is a client that implements the
-// DescribeSubscriptionFilters operation.
-type DescribeSubscriptionFiltersAPIClient interface {
-	DescribeSubscriptionFilters(context.Context, *DescribeSubscriptionFiltersInput, ...func(*Options)) (*DescribeSubscriptionFiltersOutput, error)
-}
-
-var _ DescribeSubscriptionFiltersAPIClient = (*Client)(nil)
 
 // DescribeSubscriptionFiltersPaginatorOptions is the paginator options for
 // DescribeSubscriptionFilters
@@ -219,6 +175,9 @@ func (p *DescribeSubscriptionFiltersPaginator) NextPage(ctx context.Context, opt
 	}
 	params.Limit = limit
 
+	optFns = append([]func(*Options){
+		addIsPaginatorUserAgent,
+	}, optFns...)
 	result, err := p.client.DescribeSubscriptionFilters(ctx, &params, optFns...)
 	if err != nil {
 		return nil, err
@@ -238,10 +197,10 @@ func (p *DescribeSubscriptionFiltersPaginator) NextPage(ctx context.Context, opt
 	return result, nil
 }
 
-func newServiceMetadataMiddleware_opDescribeSubscriptionFilters(region string) *awsmiddleware.RegisterServiceMetadata {
-	return &awsmiddleware.RegisterServiceMetadata{
-		Region:        region,
-		ServiceID:     ServiceID,
-		OperationName: "DescribeSubscriptionFilters",
-	}
+// DescribeSubscriptionFiltersAPIClient is a client that implements the
+// DescribeSubscriptionFilters operation.
+type DescribeSubscriptionFiltersAPIClient interface {
+	DescribeSubscriptionFilters(context.Context, *DescribeSubscriptionFiltersInput, ...func(*Options)) (*DescribeSubscriptionFiltersOutput, error)
 }
+
+var _ DescribeSubscriptionFiltersAPIClient = (*Client)(nil)

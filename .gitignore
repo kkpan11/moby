@@ -14,10 +14,9 @@ thumbs.db
 .editorconfig
 
 # build artifacts
-bundles/
-cli/winresources/*/*.syso
-cli/winresources/*/winres.json
-contrib/builder/rpm/*/changelog
+/bundles/
+/cmd/dockerd/winresources/winres.json
+/cmd/dockerd/*.syso
 
 # ci artifacts
 *.exe

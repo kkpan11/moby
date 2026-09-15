@@ -96,7 +96,7 @@ func CreateExtension(tx Tx, e *api.Extension) error {
 
 // UpdateExtension updates an existing extension in the store.
 // Returns ErrNotExist if the object doesn't exist.
-func UpdateExtension(tx Tx, e *api.Extension) error {
+func UpdateExtension(_ Tx, _ *api.Extension) error {
 	// TODO(aaronl): For the moment, extensions are immutable
 	return errors.New("extensions are immutable")
 }
@@ -153,36 +153,36 @@ func FindExtensions(tx ReadTx, by By) ([]*api.Extension, error) {
 
 type extensionIndexerByID struct{}
 
-func (indexer extensionIndexerByID) FromArgs(args ...interface{}) ([]byte, error) {
+func (indexer extensionIndexerByID) FromArgs(args ...any) ([]byte, error) {
 	return api.ExtensionIndexerByID{}.FromArgs(args...)
 }
-func (indexer extensionIndexerByID) PrefixFromArgs(args ...interface{}) ([]byte, error) {
+func (indexer extensionIndexerByID) PrefixFromArgs(args ...any) ([]byte, error) {
 	return api.ExtensionIndexerByID{}.PrefixFromArgs(args...)
 }
-func (indexer extensionIndexerByID) FromObject(obj interface{}) (bool, []byte, error) {
+func (indexer extensionIndexerByID) FromObject(obj any) (bool, []byte, error) {
 	return api.ExtensionIndexerByID{}.FromObject(obj.(extensionEntry).Extension)
 }
 
 type extensionIndexerByName struct{}
 
-func (indexer extensionIndexerByName) FromArgs(args ...interface{}) ([]byte, error) {
+func (indexer extensionIndexerByName) FromArgs(args ...any) ([]byte, error) {
 	return api.ExtensionIndexerByName{}.FromArgs(args...)
 }
-func (indexer extensionIndexerByName) PrefixFromArgs(args ...interface{}) ([]byte, error) {
+func (indexer extensionIndexerByName) PrefixFromArgs(args ...any) ([]byte, error) {
 	return api.ExtensionIndexerByName{}.PrefixFromArgs(args...)
 }
-func (indexer extensionIndexerByName) FromObject(obj interface{}) (bool, []byte, error) {
+func (indexer extensionIndexerByName) FromObject(obj any) (bool, []byte, error) {
 	return api.ExtensionIndexerByName{}.FromObject(obj.(extensionEntry).Extension)
 }
 
 type extensionCustomIndexer struct{}
 
-func (indexer extensionCustomIndexer) FromArgs(args ...interface{}) ([]byte, error) {
+func (indexer extensionCustomIndexer) FromArgs(args ...any) ([]byte, error) {
 	return api.ExtensionCustomIndexer{}.FromArgs(args...)
 }
-func (indexer extensionCustomIndexer) PrefixFromArgs(args ...interface{}) ([]byte, error) {
+func (indexer extensionCustomIndexer) PrefixFromArgs(args ...any) ([]byte, error) {
 	return api.ExtensionCustomIndexer{}.PrefixFromArgs(args...)
 }
-func (indexer extensionCustomIndexer) FromObject(obj interface{}) (bool, [][]byte, error) {
+func (indexer extensionCustomIndexer) FromObject(obj any) (bool, [][]byte, error) {
 	return api.ExtensionCustomIndexer{}.FromObject(obj.(extensionEntry).Extension)
 }

@@ -9,12 +9,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/integration-cli/checker"
-	"github.com/docker/docker/testutil"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration-cli/checker"
+	"github.com/moby/moby/v2/internal/testutil"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
 )
 
@@ -26,15 +28,15 @@ func (s *DockerSwarmSuite) TestServiceCreateMountVolume(c *testing.T) {
 	id := strings.TrimSpace(out)
 
 	var tasks []swarm.Task
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		tasks = d.GetServiceTasks(ctx, c, id)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		tasks = d.GetServiceTasks(ctx, t, id)
 		return len(tasks) > 0, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	task := tasks[0]
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		if task.NodeID == "" || task.Status.ContainerStatus == nil {
-			task = d.GetTask(ctx, c, task.ID)
+			task = d.GetTask(ctx, t, task.ID)
 		}
 		return task.NodeID != "" && task.Status.ContainerStatus != nil, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
@@ -44,7 +46,7 @@ func (s *DockerSwarmSuite) TestServiceCreateMountVolume(c *testing.T) {
 	assert.NilError(c, err, out)
 
 	var mountConfig []mount.Mount
-	assert.Assert(c, json.Unmarshal([]byte(out), &mountConfig) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &mountConfig))
 	assert.Equal(c, len(mountConfig), 1)
 
 	assert.Equal(c, mountConfig[0].Source, "foo")
@@ -58,7 +60,7 @@ func (s *DockerSwarmSuite) TestServiceCreateMountVolume(c *testing.T) {
 	assert.NilError(c, err, out)
 
 	var mounts []container.MountPoint
-	assert.Assert(c, json.Unmarshal([]byte(out), &mounts) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &mounts))
 	assert.Equal(c, len(mounts), 1)
 
 	assert.Equal(c, mounts[0].Type, mount.TypeVolume)
@@ -70,16 +72,20 @@ func (s *DockerSwarmSuite) TestServiceCreateMountVolume(c *testing.T) {
 func (s *DockerSwarmSuite) TestServiceCreateWithSecretSimple(c *testing.T) {
 	ctx := testutil.GetContext(c)
 	d := s.AddDaemon(ctx, c, true, true)
+	apiClient := d.NewClientT(c)
 
 	serviceName := "test-service-secret"
 	testName := "test_secret"
-	id := d.CreateSecret(c, swarm.SecretSpec{
-		Annotations: swarm.Annotations{
-			Name: testName,
+	scr, err := apiClient.SecretCreate(ctx, client.SecretCreateOptions{
+		Spec: swarm.SecretSpec{
+			Annotations: swarm.Annotations{
+				Name: testName,
+			},
+			Data: []byte("TESTINGDATA"),
 		},
-		Data: []byte("TESTINGDATA"),
 	})
-	assert.Assert(c, id != "", "secrets: %s", id)
+	assert.NilError(c, err)
+	assert.Assert(c, scr.ID != "", "secrets: %s", scr.ID)
 
 	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", serviceName, "--secret", testName, "busybox", "top")
 	assert.NilError(c, err, out)
@@ -88,7 +94,7 @@ func (s *DockerSwarmSuite) TestServiceCreateWithSecretSimple(c *testing.T) {
 	assert.NilError(c, err)
 
 	var refs []swarm.SecretReference
-	assert.Assert(c, json.Unmarshal([]byte(out), &refs) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &refs))
 	assert.Equal(c, len(refs), 1)
 
 	assert.Equal(c, refs[0].SecretName, testName)
@@ -99,7 +105,8 @@ func (s *DockerSwarmSuite) TestServiceCreateWithSecretSimple(c *testing.T) {
 
 	out, err = d.Cmd("service", "rm", serviceName)
 	assert.NilError(c, err, out)
-	d.DeleteSecret(c, testName)
+	_, err = apiClient.SecretRemove(c.Context(), testName, client.SecretRemoveOptions{})
+	assert.NilError(c, err)
 }
 
 func (s *DockerSwarmSuite) TestServiceCreateWithSecretSourceTargetPaths(c *testing.T) {
@@ -115,15 +122,18 @@ func (s *DockerSwarmSuite) TestServiceCreateWithSecretSourceTargetPaths(c *testi
 
 	var secretFlags []string
 
+	apiClient := d.NewClientT(c)
 	for testName, testTarget := range testPaths {
-		id := d.CreateSecret(c, swarm.SecretSpec{
-			Annotations: swarm.Annotations{
-				Name: testName,
+		scr, err := apiClient.SecretCreate(ctx, client.SecretCreateOptions{
+			Spec: swarm.SecretSpec{
+				Annotations: swarm.Annotations{
+					Name: testName,
+				},
+				Data: []byte("TESTINGDATA " + testName + " " + testTarget),
 			},
-			Data: []byte("TESTINGDATA " + testName + " " + testTarget),
 		})
-		assert.Assert(c, id != "", "secrets: %s", id)
-
+		assert.NilError(c, err)
+		assert.Assert(c, scr.ID != "", "secrets: %s", scr.ID)
 		secretFlags = append(secretFlags, "--secret", fmt.Sprintf("source=%s,target=%s", testName, testTarget))
 	}
 
@@ -138,19 +148,19 @@ func (s *DockerSwarmSuite) TestServiceCreateWithSecretSourceTargetPaths(c *testi
 	assert.NilError(c, err)
 
 	var refs []swarm.SecretReference
-	assert.Assert(c, json.Unmarshal([]byte(out), &refs) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &refs))
 	assert.Equal(c, len(refs), len(testPaths))
 
 	var tasks []swarm.Task
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		tasks = d.GetServiceTasks(ctx, c, serviceName)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		tasks = d.GetServiceTasks(ctx, t, serviceName)
 		return len(tasks) > 0, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	task := tasks[0]
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		if task.NodeID == "" || task.Status.ContainerStatus == nil {
-			task = d.GetTask(ctx, c, task.ID)
+			task = d.GetTask(ctx, t, task.ID)
 		}
 		return task.NodeID != "" && task.Status.ContainerStatus != nil, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
@@ -173,13 +183,17 @@ func (s *DockerSwarmSuite) TestServiceCreateWithSecretReferencedTwice(c *testing
 	ctx := testutil.GetContext(c)
 	d := s.AddDaemon(ctx, c, true, true)
 
-	id := d.CreateSecret(c, swarm.SecretSpec{
-		Annotations: swarm.Annotations{
-			Name: "mysecret",
+	apiClient := d.NewClientT(c)
+	scr, err := apiClient.SecretCreate(ctx, client.SecretCreateOptions{
+		Spec: swarm.SecretSpec{
+			Annotations: swarm.Annotations{
+				Name: "mysecret",
+			},
+			Data: []byte("TESTINGDATA"),
 		},
-		Data: []byte("TESTINGDATA"),
 	})
-	assert.Assert(c, id != "", "secrets: %s", id)
+	assert.NilError(c, err)
+	assert.Assert(c, scr.ID != "", "secrets: %s", scr.ID)
 
 	serviceName := "svc"
 	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", serviceName, "--secret", "source=mysecret,target=target1", "--secret", "source=mysecret,target=target2", "busybox", "top")
@@ -189,19 +203,19 @@ func (s *DockerSwarmSuite) TestServiceCreateWithSecretReferencedTwice(c *testing
 	assert.NilError(c, err)
 
 	var refs []swarm.SecretReference
-	assert.Assert(c, json.Unmarshal([]byte(out), &refs) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &refs))
 	assert.Equal(c, len(refs), 2)
 
 	var tasks []swarm.Task
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		tasks = d.GetServiceTasks(ctx, c, serviceName)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		tasks = d.GetServiceTasks(ctx, t, serviceName)
 		return len(tasks) > 0, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	task := tasks[0]
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		if task.NodeID == "" || task.Status.ContainerStatus == nil {
-			task = d.GetTask(ctx, c, task.ID)
+			task = d.GetTask(ctx, t, task.ID)
 		}
 		return task.NodeID != "" && task.Status.ContainerStatus != nil, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
@@ -221,16 +235,20 @@ func (s *DockerSwarmSuite) TestServiceCreateWithSecretReferencedTwice(c *testing
 func (s *DockerSwarmSuite) TestServiceCreateWithConfigSimple(c *testing.T) {
 	ctx := testutil.GetContext(c)
 	d := s.AddDaemon(ctx, c, true, true)
+	apiClient := d.NewClientT(c)
 
 	serviceName := "test-service-config"
 	testName := "test_config"
-	id := d.CreateConfig(c, swarm.ConfigSpec{
-		Annotations: swarm.Annotations{
-			Name: testName,
+	result, err := apiClient.ConfigCreate(ctx, client.ConfigCreateOptions{
+		Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{
+				Name: testName,
+			},
+			Data: []byte("TESTINGDATA"),
 		},
-		Data: []byte("TESTINGDATA"),
 	})
-	assert.Assert(c, id != "", "configs: %s", id)
+	assert.NilError(c, err)
+	assert.Assert(c, result.ID != "", "configs: %s", result.ID)
 
 	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", serviceName, "--config", testName, "busybox", "top")
 	assert.NilError(c, err, out)
@@ -239,7 +257,7 @@ func (s *DockerSwarmSuite) TestServiceCreateWithConfigSimple(c *testing.T) {
 	assert.NilError(c, err)
 
 	var refs []swarm.ConfigReference
-	assert.Assert(c, json.Unmarshal([]byte(out), &refs) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &refs))
 	assert.Equal(c, len(refs), 1)
 
 	assert.Equal(c, refs[0].ConfigName, testName)
@@ -250,7 +268,8 @@ func (s *DockerSwarmSuite) TestServiceCreateWithConfigSimple(c *testing.T) {
 
 	out, err = d.Cmd("service", "rm", serviceName)
 	assert.NilError(c, err, out)
-	d.DeleteConfig(c, testName)
+	_, err = apiClient.ConfigRemove(ctx, testName, client.ConfigRemoveOptions{})
+	assert.NilError(c, err)
 }
 
 func (s *DockerSwarmSuite) TestServiceCreateWithConfigSourceTargetPaths(c *testing.T) {
@@ -265,15 +284,18 @@ func (s *DockerSwarmSuite) TestServiceCreateWithConfigSourceTargetPaths(c *testi
 
 	var configFlags []string
 
+	apiClient := d.NewClientT(c)
 	for testName, testTarget := range testPaths {
-		id := d.CreateConfig(c, swarm.ConfigSpec{
-			Annotations: swarm.Annotations{
-				Name: testName,
+		result, err := apiClient.ConfigCreate(ctx, client.ConfigCreateOptions{
+			Spec: swarm.ConfigSpec{
+				Annotations: swarm.Annotations{
+					Name: testName,
+				},
+				Data: []byte("TESTINGDATA " + testName + " " + testTarget),
 			},
-			Data: []byte("TESTINGDATA " + testName + " " + testTarget),
 		})
-		assert.Assert(c, id != "", "configs: %s", id)
-
+		assert.NilError(c, err)
+		assert.Assert(c, result.ID != "", "configs: %s", result.ID)
 		configFlags = append(configFlags, "--config", fmt.Sprintf("source=%s,target=%s", testName, testTarget))
 	}
 
@@ -288,19 +310,19 @@ func (s *DockerSwarmSuite) TestServiceCreateWithConfigSourceTargetPaths(c *testi
 	assert.NilError(c, err)
 
 	var refs []swarm.ConfigReference
-	assert.Assert(c, json.Unmarshal([]byte(out), &refs) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &refs))
 	assert.Equal(c, len(refs), len(testPaths))
 
 	var tasks []swarm.Task
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		tasks = d.GetServiceTasks(ctx, c, serviceName)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		tasks = d.GetServiceTasks(ctx, t, serviceName)
 		return len(tasks) > 0, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	task := tasks[0]
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		if task.NodeID == "" || task.Status.ContainerStatus == nil {
-			task = d.GetTask(ctx, c, task.ID)
+			task = d.GetTask(ctx, t, task.ID)
 		}
 		return task.NodeID != "" && task.Status.ContainerStatus != nil, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
@@ -322,14 +344,17 @@ func (s *DockerSwarmSuite) TestServiceCreateWithConfigSourceTargetPaths(c *testi
 func (s *DockerSwarmSuite) TestServiceCreateWithConfigReferencedTwice(c *testing.T) {
 	ctx := testutil.GetContext(c)
 	d := s.AddDaemon(ctx, c, true, true)
-
-	id := d.CreateConfig(c, swarm.ConfigSpec{
-		Annotations: swarm.Annotations{
-			Name: "myconfig",
+	apiClient := d.NewClientT(c)
+	result, err := apiClient.ConfigCreate(ctx, client.ConfigCreateOptions{
+		Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{
+				Name: "myconfig",
+			},
+			Data: []byte("TESTINGDATA"),
 		},
-		Data: []byte("TESTINGDATA"),
 	})
-	assert.Assert(c, id != "", "configs: %s", id)
+	assert.NilError(c, err)
+	assert.Assert(c, result.ID != "", "configs: %s", result.ID)
 
 	serviceName := "svc"
 	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", serviceName, "--config", "source=myconfig,target=target1", "--config", "source=myconfig,target=target2", "busybox", "top")
@@ -339,19 +364,19 @@ func (s *DockerSwarmSuite) TestServiceCreateWithConfigReferencedTwice(c *testing
 	assert.NilError(c, err)
 
 	var refs []swarm.ConfigReference
-	assert.Assert(c, json.Unmarshal([]byte(out), &refs) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &refs))
 	assert.Equal(c, len(refs), 2)
 
 	var tasks []swarm.Task
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		tasks = d.GetServiceTasks(ctx, c, serviceName)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		tasks = d.GetServiceTasks(ctx, t, serviceName)
 		return len(tasks) > 0, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	task := tasks[0]
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		if task.NodeID == "" || task.Status.ContainerStatus == nil {
-			task = d.GetTask(ctx, c, task.ID)
+			task = d.GetTask(ctx, t, task.ID)
 		}
 		return task.NodeID != "" && task.Status.ContainerStatus != nil, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
@@ -376,15 +401,15 @@ func (s *DockerSwarmSuite) TestServiceCreateMountTmpfs(c *testing.T) {
 	id := strings.TrimSpace(out)
 
 	var tasks []swarm.Task
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		tasks = d.GetServiceTasks(ctx, c, id)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		tasks = d.GetServiceTasks(ctx, t, id)
 		return len(tasks) > 0, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	task := tasks[0]
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		if task.NodeID == "" || task.Status.ContainerStatus == nil {
-			task = d.GetTask(ctx, c, task.ID)
+			task = d.GetTask(ctx, t, task.ID)
 		}
 		return task.NodeID != "" && task.Status.ContainerStatus != nil, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
@@ -394,7 +419,7 @@ func (s *DockerSwarmSuite) TestServiceCreateMountTmpfs(c *testing.T) {
 	assert.NilError(c, err, out)
 
 	var mountConfig []mount.Mount
-	assert.Assert(c, json.Unmarshal([]byte(out), &mountConfig) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &mountConfig))
 	assert.Equal(c, len(mountConfig), 1)
 
 	assert.Equal(c, mountConfig[0].Source, "")
@@ -408,7 +433,7 @@ func (s *DockerSwarmSuite) TestServiceCreateMountTmpfs(c *testing.T) {
 	assert.NilError(c, err, out)
 
 	var mounts []container.MountPoint
-	assert.Assert(c, json.Unmarshal([]byte(out), &mounts) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &mounts))
 	assert.Equal(c, len(mounts), 1)
 
 	assert.Equal(c, mounts[0].Type, mount.TypeTmpfs)
@@ -419,7 +444,7 @@ func (s *DockerSwarmSuite) TestServiceCreateMountTmpfs(c *testing.T) {
 	out, err = s.nodeCmd(c, task.NodeID, "logs", task.Status.ContainerStatus.ContainerID)
 	assert.NilError(c, err, out)
 	assert.Assert(c, strings.HasPrefix(strings.TrimSpace(out), "tmpfs on /foo type tmpfs"))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), "size=1024k"))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), "size=1024k"))
 }
 
 func (s *DockerSwarmSuite) TestServiceCreateWithNetworkAlias(c *testing.T) {
@@ -433,15 +458,15 @@ func (s *DockerSwarmSuite) TestServiceCreateWithNetworkAlias(c *testing.T) {
 	id := strings.TrimSpace(out)
 
 	var tasks []swarm.Task
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		tasks = d.GetServiceTasks(ctx, c, id)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		tasks = d.GetServiceTasks(ctx, t, id)
 		return len(tasks) > 0, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	task := tasks[0]
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		if task.NodeID == "" || task.Status.ContainerStatus == nil {
-			task = d.GetTask(ctx, c, task.ID)
+			task = d.GetTask(ctx, t, task.ID)
 		}
 		return task.NodeID != "" && task.Status.ContainerStatus != nil, ""
 	}, checker.Equals(true)), poll.WithTimeout(defaultReconciliationTimeout))
@@ -452,8 +477,8 @@ func (s *DockerSwarmSuite) TestServiceCreateWithNetworkAlias(c *testing.T) {
 
 	// Make sure the only alias seen is the container-id
 	var aliases []string
-	assert.Assert(c, json.Unmarshal([]byte(out), &aliases) == nil)
+	assert.NilError(c, json.Unmarshal([]byte(out), &aliases))
 	assert.Equal(c, len(aliases), 1)
 
-	assert.Assert(c, strings.Contains(task.Status.ContainerStatus.ContainerID, aliases[0]))
+	assert.Assert(c, is.Contains(task.Status.ContainerStatus.ContainerID, aliases[0]))
 }

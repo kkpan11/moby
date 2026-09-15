@@ -7,7 +7,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
@@ -18,7 +18,6 @@ import (
 	"github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/flightcontrol"
-	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	"github.com/moby/patternmatcher/ignorefile"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -41,6 +40,13 @@ const (
 	keyShmSize          = "shm-size"
 	keyTargetPlatform   = "platform"
 	keyUlimit           = "ulimit"
+	keyMemory           = "memory"
+	keyMemorySwap       = "memswap"
+	keyCPUShares        = "cpushares"
+	keyCPUPeriod        = "cpuperiod"
+	keyCPUQuota         = "cpuquota"
+	keyCpusetCpus       = "cpusetcpus"
+	keyCpusetMems       = "cpusetmems"
 	keyCacheFrom        = "cache-from"    // for registry only. deprecated in favor of keyCacheImports
 	keyCacheImports     = "cache-imports" // JSON representation of []CacheOptionsEntry
 
@@ -51,22 +57,24 @@ const (
 	keyHostnameArg          = "build-arg:BUILDKIT_SANDBOX_HOSTNAME"
 	keyDockerfileLintArg    = "build-arg:BUILDKIT_DOCKERFILE_CHECK"
 	keyContextKeepGitDirArg = "build-arg:BUILDKIT_CONTEXT_KEEP_GIT_DIR"
-	keySourceDateEpoch      = "build-arg:SOURCE_DATE_EPOCH"
+	keyGitAdviceArg         = "build-arg:BUILDKIT_GIT_ADVICE"
 )
 
 type Config struct {
 	BuildArgs        map[string]string
 	CacheIDNamespace string
 	CgroupParent     string
-	Epoch            *time.Time
 	ExtraHosts       []llb.HostIP
 	Hostname         string
 	ImageResolveMode llb.ResolveMode
 	Labels           map[string]string
 	NetworkMode      pb.NetMode
+	GitAdvice        bool
 	ShmSize          int64
 	Target           string
-	Ulimits          []pb.Ulimit
+	Ulimits          []*pb.Ulimit
+	LinuxResources   *pb.LinuxResources
+	Devices          []*pb.CDIDevice
 	LinterConfig     *linter.Config
 
 	CacheImports           []client.CacheOptionsEntry
@@ -85,11 +93,13 @@ type Client struct {
 	localsSessionIDs map[string]string
 
 	dockerignore     []byte
+	dockerignoreMu   sync.Mutex
 	dockerignoreName string
 }
 
 type SBOM struct {
-	Generator string
+	Generator  string
+	Parameters map[string]string
 }
 
 type Source struct {
@@ -144,12 +154,18 @@ func (bc *Client) BuildOpts() client.BuildOpts {
 	return bc.bopts
 }
 
+func (bc *Client) GatewayClient() client.Client {
+	return bc.client
+}
+
 func (bc *Client) init() error {
 	opts := bc.bopts.Opts
 
-	defaultBuildPlatform := platforms.Normalize(platforms.DefaultSpec())
+	var defaultBuildPlatform ocispecs.Platform
 	if workers := bc.bopts.Workers; len(workers) > 0 && len(workers[0].Platforms) > 0 {
 		defaultBuildPlatform = workers[0].Platforms[0]
+	} else {
+		defaultBuildPlatform = platforms.Normalize(platforms.DefaultSpec())
 	}
 	buildPlatforms := []ocispecs.Platform{defaultBuildPlatform}
 	targetPlatforms := []ocispecs.Platform{}
@@ -187,6 +203,12 @@ func (bc *Client) init() error {
 	}
 	bc.Ulimits = ulimits
 
+	linuxRes, err := parseLinuxResources(opts)
+	if err != nil {
+		return errors.Wrap(err, "failed to parse resource limits")
+	}
+	bc.LinuxResources = linuxRes
+
 	defaultNetMode, err := parseNetMode(opts[keyForceNetwork])
 	if err != nil {
 		return err
@@ -213,7 +235,7 @@ func (bc *Client) init() error {
 			return errors.Errorf("invalid boolean value for multi-platform: %s", v)
 		}
 		if !b && multiPlatform {
-			return errors.Errorf("conflicting config: returning multiple target platforms is not allowed")
+			return errors.New("conflicting config: returning multiple target platforms is not allowed")
 		}
 		multiPlatform = b
 	}
@@ -222,7 +244,7 @@ func (bc *Client) init() error {
 	var cacheImports []client.CacheOptionsEntry
 	// new API
 	if cacheImportsStr := opts[keyCacheImports]; cacheImportsStr != "" {
-		var cacheImportsUM []controlapi.CacheOptionsEntry
+		var cacheImportsUM []*controlapi.CacheOptionsEntry
 		if err := json.Unmarshal([]byte(cacheImportsStr), &cacheImportsUM); err != nil {
 			return errors.Wrapf(err, "failed to unmarshal %s (%q)", keyCacheImports, cacheImportsStr)
 		}
@@ -232,8 +254,8 @@ func (bc *Client) init() error {
 	}
 	// old API
 	if cacheFromStr := opts[keyCacheFrom]; cacheFromStr != "" {
-		cacheFrom := strings.Split(cacheFromStr, ",")
-		for _, s := range cacheFrom {
+		cacheFrom := strings.SplitSeq(cacheFromStr, ",")
+		for s := range cacheFrom {
 			im := client.CacheOptionsEntry{
 				Type: "registry",
 				Attrs: map[string]string{
@@ -246,28 +268,31 @@ func (bc *Client) init() error {
 	}
 	bc.CacheImports = cacheImports
 
-	epoch, err := parseSourceDateEpoch(opts[keySourceDateEpoch])
-	if err != nil {
-		return err
-	}
-	bc.Epoch = epoch
-
 	attests, err := attestations.Parse(opts)
 	if err != nil {
 		return err
 	}
 	if attrs, ok := attests[attestations.KeyTypeSbom]; ok {
-		src, ok := attrs["generator"]
-		if !ok {
-			return errors.Errorf("sbom scanner cannot be empty")
+		params := make(map[string]string)
+		var ref reference.Named
+		for k, v := range attrs {
+			if k == "generator" {
+				ref, err = reference.ParseNormalizedNamed(v)
+				if err != nil {
+					return errors.Wrapf(err, "failed to parse sbom scanner %s", v)
+				}
+				ref = reference.TagNameOnly(ref)
+			} else {
+				params[k] = v
+			}
 		}
-		ref, err := reference.ParseNormalizedNamed(src)
-		if err != nil {
-			return errors.Wrapf(err, "failed to parse sbom scanner %s", src)
+		if ref == nil {
+			return errors.New("sbom scanner cannot be empty")
 		}
-		ref = reference.TagNameOnly(ref)
+
 		bc.SBOM = &SBOM{
-			Generator: ref.String(),
+			Generator:  ref.String(),
+			Parameters: params,
 		}
 	}
 
@@ -286,6 +311,12 @@ func (bc *Client) init() error {
 		bc.LinterConfig, err = linter.ParseLintOptions(v)
 		if err != nil {
 			return errors.Wrapf(err, "failed to parse %s", keyDockerfileLintArg)
+		}
+	}
+	if v := opts[keyGitAdviceArg]; v != "" {
+		bc.GitAdvice, err = strconv.ParseBool(v)
+		if err != nil {
+			return errors.Wrapf(err, "failed to parse %s", keyGitAdviceArg)
 		}
 	}
 
@@ -442,23 +473,25 @@ func (bc *Client) MainContext(ctx context.Context, opts ...llb.LocalOption) (*ll
 	return &st, nil
 }
 
-func (bc *Client) NamedContext(ctx context.Context, name string, opt ContextOpt) (*llb.State, *dockerspec.DockerOCIImage, error) {
+func (bc *Client) NamedContext(name string, opt ContextOpt) (*NamedContext, error) {
 	named, err := reference.ParseNormalizedNamed(name)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "invalid context name %s", name)
+		return nil, errors.Wrapf(err, "invalid context name %s", name)
 	}
 	name = strings.TrimSuffix(reference.FamiliarString(named), ":latest")
 
-	pp := platforms.DefaultSpec()
+	var pp ocispecs.Platform
 	if opt.Platform != nil {
 		pp = *opt.Platform
+	} else {
+		pp = platforms.DefaultSpec()
 	}
-	pname := name + "::" + platforms.Format(platforms.Normalize(pp))
-	st, img, err := bc.namedContext(ctx, name, pname, opt)
-	if err != nil || st != nil {
-		return st, img, err
+	pname := name + "::" + platforms.FormatAll(platforms.Normalize(pp))
+	nc, err := bc.namedContext(name, pname, opt)
+	if err != nil || nc != nil {
+		return nc, err
 	}
-	return bc.namedContext(ctx, name, name, opt)
+	return bc.namedContext(name, name, opt)
 }
 
 func (bc *Client) IsNoCache(name string) bool {
@@ -502,6 +535,8 @@ func WithInternalName(name string) llb.ConstraintsOpt {
 }
 
 func (bc *Client) dockerIgnorePatterns(ctx context.Context, bctx *buildContext) ([]string, error) {
+	bc.dockerignoreMu.Lock()
+	defer bc.dockerignoreMu.Unlock()
 	if bc.dockerignore == nil {
 		sessionID := bc.bopts.SessionID
 		if v, ok := bc.localsSessionIDs[bctx.contextLocalName]; ok {

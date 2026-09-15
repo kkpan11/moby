@@ -1,20 +1,21 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"bufio"
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/libnetwork/ns"
-	"github.com/docker/docker/libnetwork/resolvconf"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/internal/rootless"
+	"github.com/moby/moby/v2/daemon/libnetwork/ns"
+	"github.com/moby/moby/v2/daemon/libnetwork/resolvconf"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
 	"github.com/pkg/errors"
@@ -93,7 +94,7 @@ func (daemon *Daemon) cleanupMounts(cfg *config.Config) error {
 	}
 
 	// `info.Root` here is the root mountpoint of the passed in path (`daemon.root`).
-	// The ony cases that need to be cleaned up is when the daemon has performed a
+	// The only cases that need to be cleaned up is when the daemon has performed a
 	//   `mount --bind /daemon/root /daemon/root && mount --make-shared /daemon/root`
 	// This is only done when the daemon is started up and `/daemon/root` is not
 	// already on a shared mountpoint.
@@ -113,20 +114,22 @@ func (daemon *Daemon) cleanupMounts(cfg *config.Config) error {
 	return os.Remove(unmountFile)
 }
 
-func getCleanPatterns(id string) (regexps []*regexp.Regexp) {
+func getCleanPatterns(id string) []*regexp.Regexp {
 	var patterns []string
 	if id == "" {
 		id = "[0-9a-f]{64}"
 		patterns = append(patterns, "containers/"+id+"/mounts/shm", "containers/"+id+"/shm")
 	}
 	patterns = append(patterns, "overlay2/"+id+"/merged$", "zfs/graph/"+id+"$")
+
+	var regexps []*regexp.Regexp
 	for _, p := range patterns {
 		r, err := regexp.Compile(p)
 		if err == nil {
 			regexps = append(regexps, r)
 		}
 	}
-	return
+	return regexps
 }
 
 func shouldUnmountRoot(root string, info *mountinfo.Info) bool {
@@ -145,45 +148,24 @@ func setupResolvConf(config *config.Config) {
 	if config.ResolvConf != "" {
 		return
 	}
+	// FIXME(thaJeztah): we can't use [github.com/moby/moby/v2/daemon/libnetwork/internal/resolvconf.Path] here, because it's internal to libnetwork.
 	config.ResolvConf = resolvconf.Path()
 }
 
-// ifaceAddrs returns the IPv4 and IPv6 addresses assigned to the network
+// ifaceAddrs returns the addresses from family assigned to the network
 // interface with name linkName.
 //
 // No error is returned if the named interface does not exist.
-func ifaceAddrs(linkName string) (v4, v6 []*net.IPNet, err error) {
+func ifaceAddrs(linkName string, family int) ([]netlink.Addr, error) {
 	nl := ns.NlHandle()
 	link, err := nl.LinkByName(linkName)
 	if err != nil {
 		if !errors.As(err, new(netlink.LinkNotFoundError)) {
-			return nil, nil, err
-		}
-		return nil, nil, nil
-	}
-
-	get := func(family int) ([]*net.IPNet, error) {
-		addrs, err := nl.AddrList(link, family)
-		if err != nil {
 			return nil, err
 		}
-
-		ipnets := make([]*net.IPNet, len(addrs))
-		for i := range addrs {
-			ipnets[i] = addrs[i].IPNet
-		}
-		return ipnets, nil
+		return nil, nil
 	}
-
-	v4, err = get(netlink.FAMILY_V4)
-	if err != nil {
-		return nil, nil, err
-	}
-	v6, err = get(netlink.FAMILY_V6)
-	if err != nil {
-		return nil, nil, err
-	}
-	return v4, v6, nil
+	return nl.AddrList(link, family)
 }
 
 var (
@@ -251,10 +233,19 @@ func supportsRecursivelyReadOnly(cfg *configStore, runtime string) error {
 	if features == nil {
 		return fmt.Errorf("rro is not supported by runtime %q: OCI features struct is not available", runtime)
 	}
-	for _, s := range features.MountOptions {
-		if s == "rro" {
-			return nil
-		}
+	if slices.Contains(features.MountOptions, "rro") {
+		return nil
 	}
 	return fmt.Errorf("rro is not supported by runtime %q", runtime)
+}
+
+func (daemon *Daemon) runInNetNS(f func() error) error {
+	if rootless.RunningWithRootlessKit() {
+		if detachedNetNS, err := rootless.DetachedNetNS(); err != nil {
+			return err
+		} else if detachedNetNS != "" {
+			return rootless.RunInNetNS(detachedNetNS, f)
+		}
+	}
+	return f()
 }

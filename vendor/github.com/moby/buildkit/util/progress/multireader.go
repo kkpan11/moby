@@ -2,6 +2,7 @@ package progress
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 )
@@ -99,18 +100,18 @@ func (mr *MultiReader) Reader(ctx context.Context) Reader {
 	}()
 
 	if !mr.initialized {
-		go mr.handle()
+		go mr.handle(context.WithoutCancel(ctx))
 		mr.initialized = true
 	}
 
 	return pr
 }
 
-func (mr *MultiReader) handle() error {
+func (mr *MultiReader) handle(ctx context.Context) error {
 	for {
-		p, err := mr.main.Read(context.TODO())
+		p, err := mr.main.Read(ctx)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				mr.mu.Lock()
 				cancelErr := context.Canceled
 				for w, c := range mr.writers {

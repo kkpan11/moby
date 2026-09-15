@@ -1,13 +1,14 @@
-package system // import "github.com/docker/docker/integration/system"
+package system
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"testing"
 
-	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/daemon"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/skip"
@@ -17,9 +18,10 @@ func TestInfoAPI(t *testing.T) {
 	ctx := setupTest(t)
 	apiClient := testEnv.APIClient()
 
-	info, err := apiClient.Info(ctx)
+	result, err := apiClient.Info(ctx, client.InfoOptions{})
 	assert.NilError(t, err)
 
+	info := result.Info
 	// TODO(thaJeztah): make sure we have other tests that run a local daemon and check other fields based on known state.
 	assert.Check(t, info.ID != "")
 	assert.Check(t, is.Equal(info.Containers, info.ContainersRunning+info.ContainersPaused+info.ContainersStopped))
@@ -43,16 +45,20 @@ func TestInfoAPIWarnings(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 
+	t.Parallel()
+
 	ctx := testutil.StartSpan(baseContext, t)
 
 	d := daemon.New(t)
 	c := d.NewClientT(t)
 
-	d.Start(t, "-H=0.0.0.0:23756", "-H="+d.Sock())
+	d.Start(t, "-H=0.0.0.0:23756", "-H="+d.Sock(), "--iptables=false", "--ip6tables=false")
 	defer d.Stop(t)
 
-	info, err := c.Info(ctx)
+	result, err := c.Info(ctx, client.InfoOptions{})
 	assert.NilError(t, err)
+
+	info := result.Info
 
 	stringsToCheck := []string{
 		"Access to the remote API is equivalent to root access",
@@ -69,10 +75,12 @@ func TestInfoDebug(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME: test starts daemon with -H unix://.....")
 
+	t.Parallel()
+
 	_ = testutil.StartSpan(baseContext, t)
 
 	d := daemon.New(t)
-	d.Start(t, "--debug")
+	d.Start(t, "--debug", "--iptables=false", "--ip6tables=false")
 	defer d.Stop(t)
 
 	info := d.Info(t)
@@ -91,22 +99,26 @@ func TestInfoInsecureRegistries(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME: test starts daemon with -H unix://.....")
 
+	t.Parallel()
+
 	const (
 		registryCIDR = "192.168.1.0/24"
 		registryHost = "insecurehost.com:5000"
 	)
 
 	d := daemon.New(t)
-	d.Start(t, "--insecure-registry="+registryCIDR, "--insecure-registry="+registryHost)
+	d.Start(t, "--insecure-registry="+registryCIDR, "--insecure-registry="+registryHost, "--iptables=false", "--ip6tables=false")
 	defer d.Stop(t)
 
 	info := d.Info(t)
-	assert.Assert(t, is.Len(info.RegistryConfig.InsecureRegistryCIDRs, 2))
+	assert.Assert(t, is.Len(info.RegistryConfig.InsecureRegistryCIDRs, 3))
 	cidrs := []string{
 		info.RegistryConfig.InsecureRegistryCIDRs[0].String(),
 		info.RegistryConfig.InsecureRegistryCIDRs[1].String(),
+		info.RegistryConfig.InsecureRegistryCIDRs[2].String(),
 	}
 	assert.Assert(t, is.Contains(cidrs, registryCIDR))
+	assert.Assert(t, is.Contains(cidrs, "::1/128"))
 	assert.Assert(t, is.Contains(cidrs, "127.0.0.0/8"))
 	assert.DeepEqual(t, *info.RegistryConfig.IndexConfigs["docker.io"], registry.IndexInfo{Name: "docker.io", Mirrors: []string{}, Secure: true, Official: true})
 	assert.DeepEqual(t, *info.RegistryConfig.IndexConfigs[registryHost], registry.IndexInfo{Name: registryHost, Mirrors: []string{}, Secure: false, Official: false})
@@ -116,16 +128,18 @@ func TestInfoRegistryMirrors(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME: test starts daemon with -H unix://.....")
 
+	t.Parallel()
+
 	const (
 		registryMirror1 = "https://192.168.1.2"
 		registryMirror2 = "http://registry-mirror.example.com:5000"
 	)
 
 	d := daemon.New(t)
-	d.Start(t, "--registry-mirror="+registryMirror1, "--registry-mirror="+registryMirror2)
+	d.Start(t, "--registry-mirror="+registryMirror1, "--registry-mirror="+registryMirror2, "--iptables=false", "--ip6tables=false")
 	defer d.Stop(t)
 
 	info := d.Info(t)
-	sort.Strings(info.RegistryConfig.Mirrors)
+	slices.Sort(info.RegistryConfig.Mirrors)
 	assert.DeepEqual(t, info.RegistryConfig.Mirrors, []string{registryMirror2 + "/", registryMirror1 + "/"})
 }

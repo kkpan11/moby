@@ -2,52 +2,77 @@ package containerd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
-	"os"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/pkg/snapshotters"
-	"github.com/containerd/containerd/remotes/docker"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/snapshotters"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
-	"github.com/docker/docker/api/types/events"
-	registrytypes "github.com/docker/docker/api/types/registry"
-	dimages "github.com/docker/docker/daemon/images"
-	"github.com/docker/docker/distribution"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/progress"
-	"github.com/docker/docker/pkg/streamformatter"
-	"github.com/docker/docker/pkg/stringid"
+	slsa02 "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/v0.2"
+	slsa1 "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/v1"
+	"github.com/moby/buildkit/util/attestation"
+	"github.com/moby/moby/api/types/events"
+	registrytypes "github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/v2/daemon/internal/distribution"
+	"github.com/moby/moby/v2/daemon/internal/metrics"
+	"github.com/moby/moby/v2/daemon/internal/progress"
+	"github.com/moby/moby/v2/daemon/internal/streamformatter"
+	"github.com/moby/moby/v2/daemon/internal/stringid"
+	"github.com/moby/moby/v2/daemon/server/imagebackend"
+	"github.com/moby/moby/v2/errdefs"
+	policyimage "github.com/moby/policy-helpers/image"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
 // PullImage initiates a pull operation. baseRef is the image to pull.
 // If reference is not tagged, all tags are pulled.
-func (i *ImageService) PullImage(ctx context.Context, baseRef reference.Named, platform *ocispec.Platform, metaHeaders map[string][]string, authConfig *registrytypes.AuthConfig, outStream io.Writer) (retErr error) {
+func (i *ImageService) PullImage(ctx context.Context, baseRef reference.Named, options imagebackend.PullOptions) (retErr error) {
+	if len(options.Platforms) > 1 {
+		// TODO(thaJeztah): add support for pulling multiple platforms
+		return cerrdefs.ErrInvalidArgument.WithMessage("multiple platforms is not supported")
+	}
 	start := time.Now()
 	defer func() {
 		if retErr == nil {
-			dimages.ImageActions.WithValues("pull").UpdateSince(start)
+			metrics.ImageActions.WithValues("pull").UpdateSince(start)
 		}
 	}()
-	out := streamformatter.NewJSONProgressOutput(outStream, false)
+	out := streamformatter.NewJSONProgressOutput(options.OutStream, false)
+
+	ctx, done, err := i.withLease(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer done()
+
+	var platform *ocispec.Platform
+	if len(options.Platforms) > 0 {
+		p := options.Platforms[0]
+		platform = &p
+	}
 
 	if !reference.IsNameOnly(baseRef) {
-		return i.pullTag(ctx, baseRef, platform, metaHeaders, authConfig, out)
+		return i.pullTag(ctx, baseRef, platform, options.MetaHeaders, options.AuthConfig, out)
 	}
 
 	tags, err := distribution.Tags(ctx, baseRef, &distribution.Config{
 		RegistryService: i.registryService,
-		MetaHeaders:     metaHeaders,
-		AuthConfig:      authConfig,
+		MetaHeaders:     options.MetaHeaders,
+		AuthConfig:      options.AuthConfig,
 	})
 	if err != nil {
 		return err
@@ -63,7 +88,7 @@ func (i *ImageService) PullImage(ctx context.Context, baseRef reference.Named, p
 			continue
 		}
 
-		if err := i.pullTag(ctx, ref, platform, metaHeaders, authConfig, out); err != nil {
+		if err := i.pullTag(ctx, ref, platform, options.MetaHeaders, options.AuthConfig, out); err != nil {
 			return fmt.Errorf("error pulling %s: %w", ref, err)
 		}
 	}
@@ -72,16 +97,24 @@ func (i *ImageService) PullImage(ctx context.Context, baseRef reference.Named, p
 }
 
 func (i *ImageService) pullTag(ctx context.Context, ref reference.Named, platform *ocispec.Platform, metaHeaders map[string][]string, authConfig *registrytypes.AuthConfig, out progress.Output) error {
-	var opts []containerd.RemoteOpt
-	if platform != nil {
-		opts = append(opts, containerd.WithPlatform(platforms.Format(*platform)))
-	}
+	// Register media types used by Sigstore bundles and OCI referrers so that
+	// MakeRefKey can assign a proper ref-key prefix instead of logging
+	// "reference for unknown type" warnings.
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, ocispec.MediaTypeEmptyJSON, "empty")
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, policyimage.ArtifactTypeCosignSignature, "cosign-signature")
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, policyimage.ArtifactTypeSigstoreBundle, "sigstore-bundle")
 
-	resolver, _ := i.newResolverFromAuthConfig(ctx, authConfig, ref)
+	pullPlatform := i.hostPlatformSpec()
+	if platform != nil {
+		pullPlatform = *platform
+	}
+	opts := []containerd.RemoteOpt{containerd.WithPlatform(platforms.FormatAll(pullPlatform))}
+
+	resolver, _ := i.newResolverFromAuthConfig(ctx, authConfig, ref, metaHeaders)
 	opts = append(opts, containerd.WithResolver(resolver))
 
 	oldImage, err := i.resolveImage(ctx, ref.String())
-	if err != nil && !errdefs.IsNotFound(err) {
+	if err != nil && !cerrdefs.IsNotFound(err) {
 		return err
 	}
 
@@ -89,14 +122,7 @@ func (i *ImageService) pullTag(ctx context.Context, ref reference.Named, platfor
 	var outNewImg containerd.Image
 
 	if oldImage.Target.Digest != "" {
-		// Lease the old image content to prevent it from being garbage collected until we keep it as dangling image.
-		lm := i.client.LeasesService()
-		lease, err := lm.Create(ctx, leases.WithRandomID())
-		if err != nil {
-			return errdefs.System(fmt.Errorf("failed to create lease: %w", err))
-		}
-
-		err = leaseContent(ctx, i.content, lm, lease, oldImage.Target)
+		err = i.leaseContent(ctx, i.content, oldImage.Target)
 		if err != nil {
 			return errdefs.System(fmt.Errorf("failed to lease content: %w", err))
 		}
@@ -110,28 +136,25 @@ func (i *ImageService) pullTag(ctx context.Context, ref reference.Named, platfor
 					}
 				}
 			}
-			if err := lm.Delete(ctx, lease); err != nil {
-				log.G(ctx).WithError(err).Warn("failed to delete lease")
-			}
 		}()
 	}
 
-	p := platforms.Default()
-	if platform != nil {
-		p = platforms.Only(*platform)
-	}
+	p := platforms.Only(pullPlatform)
 
-	jobs := newJobs()
-	h := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-		if images.IsLayerType(desc.MediaType) {
-			jobs.Add(desc)
+	pullJobs := newJobs()
+	opts = append(opts, containerd.WithImageHandler(c8dimages.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		if showBlobProgress(desc) {
+			pullJobs.Add(desc)
 		}
 		return nil, nil
-	})
-	opts = append(opts, containerd.WithImageHandler(h))
+	})))
 
-	pp := pullProgress{store: i.content, showExists: true}
-	finishProgress := jobs.showProgress(ctx, out, pp)
+	pp := &pullProgress{
+		store:       i.content,
+		snapshotter: i.snapshotterService(i.snapshotter),
+		showExists:  true,
+	}
+	finishProgress := pullJobs.showProgress(ctx, out, pp)
 
 	defer func() {
 		finishProgress()
@@ -153,23 +176,27 @@ func (i *ImageService) pullTag(ctx context.Context, ref reference.Named, platfor
 		}
 	}()
 
-	var sentPullingFrom, sentSchema1Deprecation bool
-	ah := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-		if desc.MediaType == images.MediaTypeDockerSchema1Manifest && !sentSchema1Deprecation {
-			err := distribution.DeprecatedSchema1ImageError(ref)
-			if os.Getenv("DOCKER_ENABLE_DEPRECATED_PULL_SCHEMA_1_IMAGE") == "" {
-				log.G(context.TODO()).Warn(err.Error())
-				return nil, err
-			}
-			progress.Message(out, "", err.Error())
-			sentSchema1Deprecation = true
+	var sentPullingFrom, sentModelNotSupported atomic.Bool
+	ah := c8dimages.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		if desc.MediaType == c8dimages.MediaTypeDockerSchema1Manifest {
+			return nil, distribution.DeprecatedSchema1ImageError(ref)
 		}
-		if images.IsLayerType(desc.MediaType) {
+
+		ociAiArtifactManifest := c8dimages.IsManifestType(desc.MediaType) && isModelMediaType(desc.ArtifactType)
+		aiMediaType := isModelMediaType(desc.MediaType)
+
+		if ociAiArtifactManifest || aiMediaType {
+			if !sentModelNotSupported.Load() {
+				sentModelNotSupported.Store(true)
+				progress.Message(out, "", `WARNING: AI models are not supported by the Engine yet, did you mean to use "docker model pull/run" instead?`)
+			}
+		}
+		if c8dimages.IsLayerType(desc.MediaType) {
 			id := stringid.TruncateID(desc.Digest.String())
 			progress.Update(out, id, "Pulling fs layer")
 		}
-		if images.IsManifestType(desc.MediaType) {
-			if !sentPullingFrom {
+		if c8dimages.IsManifestType(desc.MediaType) {
+			if !sentPullingFrom.Load() {
 				var tagOrDigest string
 				if tagged, ok := ref.(reference.Tagged); ok {
 					tagOrDigest = tagged.Tag()
@@ -177,10 +204,10 @@ func (i *ImageService) pullTag(ctx context.Context, ref reference.Named, platfor
 					tagOrDigest = ref.String()
 				}
 				progress.Message(out, tagOrDigest, "Pulling from "+reference.Path(ref))
-				sentPullingFrom = true
+				sentPullingFrom.Store(true)
 			}
 
-			available, _, _, missing, err := images.Check(ctx, i.content, desc, p)
+			available, _, _, missing, err := c8dimages.Check(ctx, i.content, desc, p)
 			if err != nil {
 				return nil, err
 			}
@@ -200,18 +227,27 @@ func (i *ImageService) pullTag(ctx context.Context, ref reference.Named, platfor
 
 	// AppendInfoHandlerWrapper will annotate the image with basic information like manifest and layer digests as labels;
 	// this information is used to enable remote snapshotters like nydus and stargz to query a registry.
+	// This is also needed for the pull progress to detect the `Extracting` status.
 	infoHandler := snapshotters.AppendInfoHandlerWrapper(ref.String())
-	opts = append(opts, containerd.WithImageHandlerWrapper(infoHandler))
 
-	// Allow pulling application/vnd.docker.distribution.manifest.v1+prettyjws images
-	// by converting them to OCI manifests.
-	opts = append(opts, containerd.WithSchema1Conversion) //nolint:staticcheck // Ignore SA1019: containerd.WithSchema1Conversion is deprecated: use Schema 2 or OCI images.
+	referrers := newReferrersForPull(ref.String(), resolver, i.client.ContentStore())
 
+	opts = append(opts, containerd.WithImageHandlerWrapper(joinHandlerWrappers(infoHandler, referrers.Handler)))
+	opts = append(opts, containerd.WithReferrersProvider(referrers))
+
+	i.transferLimitMu.Lock()
+	maxConcurrentDownloads := i.maxConcurrentDownloads
+	downloadLimiter := i.downloadLimiter
+	i.transferLimitMu.Unlock()
+	if maxConcurrentDownloads > 0 {
+		opts = append(opts, containerd.WithMaxConcurrentDownloads(maxConcurrentDownloads))
+	}
+	opts = append(opts, containerd.WithDownloadLimiter(downloadLimiter))
 	img, err := i.client.Pull(ctx, ref.String(), opts...)
 	if err != nil {
 		if errors.Is(err, docker.ErrInvalidAuthorization) {
 			// Match error returned by containerd.
-			// https://github.com/containerd/containerd/blob/v1.7.8/remotes/docker/authorizer.go#L189-L191
+			// https://github.com/containerd/containerd/blob/v2.1.1/core/remotes/docker/authorizer.go#L201-L203
 			if strings.Contains(err.Error(), "no basic auth credentials") {
 				return err
 			}
@@ -222,14 +258,11 @@ func (i *ImageService) pullTag(ctx context.Context, ref reference.Named, platfor
 			// the same message as the graphdrivers backend.
 			// The one returned by containerd doesn't contain the platform and is much less informative.
 			if strings.Contains(err.Error(), "platform") {
-				platformStr := platforms.DefaultString()
-				if platform != nil {
-					platformStr = platforms.Format(*platform)
-				}
+				platformStr := platforms.FormatAll(pullPlatform)
 				return errdefs.NotFound(fmt.Errorf("no matching manifest for %s in the manifest list entries: %w", platformStr, err))
 			}
 		}
-		return err
+		return translateRegistryError(ctx, err)
 	}
 
 	logger := log.G(ctx).WithFields(log.Fields{
@@ -246,9 +279,197 @@ func (i *ImageService) pullTag(ctx context.Context, ref reference.Named, platfor
 		logger.WithError(err).Warn("unexpected error while removing outdated dangling image reference")
 	}
 
-	i.LogImageEvent(reference.FamiliarString(ref), reference.FamiliarName(ref), events.ActionPull)
+	i.LogImageEvent(ctx, reference.FamiliarString(ref), reference.FamiliarName(ref), events.ActionPull)
+	i.warmImageIdentityCache(ctx, img.Metadata())
 	outNewImg = img
+
 	return nil
+}
+
+func joinHandlerWrappers(funcs ...func(c8dimages.Handler) c8dimages.Handler) func(c8dimages.Handler) c8dimages.Handler {
+	return func(h c8dimages.Handler) c8dimages.Handler {
+		for _, f := range funcs {
+			h = f(h)
+		}
+		return h
+	}
+}
+
+type referrersForPull struct {
+	mu                    sync.Mutex
+	ref                   string
+	store                 content.Store
+	candidates            *referrersList
+	isAttestationManifest map[digest.Digest]struct{}
+	resolver              remotes.Resolver
+}
+
+func newReferrersForPull(ref string, resolver remotes.Resolver, st content.Store) *referrersForPull {
+	return &referrersForPull{
+		ref:                   ref,
+		candidates:            newReferrersList(),
+		isAttestationManifest: make(map[digest.Digest]struct{}),
+		store:                 st,
+		resolver:              resolver,
+	}
+}
+
+func (h *referrersForPull) Referrers(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if m, ok := h.candidates.Get(desc.Digest); ok {
+		for i, att := range m {
+			if att.Annotations[attestation.DockerAnnotationReferenceType] == attestation.DockerAnnotationReferenceTypeDefault {
+				att.Platform = nil
+				h.isAttestationManifest[att.Digest] = struct{}{}
+				m[i] = att
+			}
+		}
+		return m, nil
+	} else if _, ok := h.isAttestationManifest[desc.Digest]; ok {
+		f, err := h.resolver.Fetcher(ctx, h.ref)
+		if err != nil {
+			return nil, err
+		}
+		referrers, ok := f.(remotes.ReferrersFetcher)
+		if !ok {
+			return nil, errors.New("resolver does not support fetching referrers")
+		}
+
+		// we are currently intentionally not passing filter to FetchReferrers here because
+		// of known issue in AWS registry that return empty result when multiple filters are applied
+		descs, err := referrers.FetchReferrers(ctx, desc.Digest)
+		if err != nil {
+			return nil, err
+		}
+		// manual filtering to work around the issue mentioned above
+		filtered := make([]ocispec.Descriptor, 0, len(descs))
+		for _, att := range descs {
+			switch att.ArtifactType {
+			case policyimage.ArtifactTypeCosignSignature, policyimage.ArtifactTypeSigstoreBundle:
+				filtered = append(filtered, att)
+			}
+		}
+		return filtered, nil
+	}
+	return nil, nil
+}
+
+func (h *referrersForPull) Handler(f c8dimages.Handler) c8dimages.Handler {
+	return c8dimages.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		children, err := f.Handle(ctx, desc)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := h.candidates.readFrom(ctx, h.store, desc); err != nil {
+			return nil, err
+		}
+
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if c8dimages.IsManifestType(desc.MediaType) {
+			if _, ok := h.isAttestationManifest[desc.Digest]; ok {
+				// for matched attestation manifest, we only need provenance attestation
+				dt, err := content.ReadBlob(ctx, h.store, desc)
+				if err != nil {
+					return nil, err
+				}
+
+				var mfst ocispec.Manifest
+				if err := json.Unmarshal(dt, &mfst); err != nil {
+					return nil, err
+				}
+				var provenance []ocispec.Descriptor
+				for _, desc := range mfst.Layers {
+					pType, ok := desc.Annotations["in-toto.io/predicate-type"]
+					if !ok {
+						continue
+					}
+					switch pType {
+					case slsa1.PredicateSLSAProvenance, slsa02.PredicateSLSAProvenance:
+						provenance = append(provenance, desc)
+					default:
+					}
+				}
+				_ = provenance // TODO: filter out non-provenance attestation
+			}
+		}
+		return children, nil
+	})
+}
+
+type referrersList struct {
+	mu sync.RWMutex
+	m  map[digest.Digest][]ocispec.Descriptor
+}
+
+func newReferrersList() *referrersList {
+	return &referrersList{
+		m: make(map[digest.Digest][]ocispec.Descriptor),
+	}
+}
+
+func (rl *referrersList) Get(dgst digest.Digest) ([]ocispec.Descriptor, bool) {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+	descs, ok := rl.m[dgst]
+	return descs, ok
+}
+
+func (rl *referrersList) readFrom(ctx context.Context, st content.Store, desc ocispec.Descriptor) error {
+	if !c8dimages.IsIndexType(desc.MediaType) {
+		return nil
+	}
+
+	p, err := content.ReadBlob(ctx, st, desc)
+	if err != nil {
+		return err
+	}
+	var index ocispec.Index
+	if err := json.Unmarshal(p, &index); err != nil {
+		return err
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if rl.m == nil {
+		rl.m = make(map[digest.Digest][]ocispec.Descriptor)
+	}
+	for _, desc := range index.Manifests {
+		if !c8dimages.IsManifestType(desc.MediaType) {
+			continue
+		}
+		subject, err := parseSubject(desc)
+		if err != nil || subject == "" {
+			continue
+		}
+		rl.m[subject] = slices.DeleteFunc(rl.m[subject], func(d ocispec.Descriptor) bool {
+			if d.Digest == desc.Digest {
+				return true
+			}
+			if _, ok := desc.Annotations[attestation.DockerAnnotationReferenceType]; ok {
+				// for inline attestation, last ref wins
+				return true
+			}
+			return false
+		})
+		rl.m[subject] = append(rl.m[subject], desc)
+	}
+	return nil
+}
+
+func parseSubject(desc ocispec.Descriptor) (digest.Digest, error) {
+	var dgstStr string
+	if refType, ok := desc.Annotations[attestation.DockerAnnotationReferenceType]; ok && refType == attestation.DockerAnnotationReferenceTypeDefault {
+		dgstStr, ok = desc.Annotations[attestation.DockerAnnotationReferenceDigest]
+		if !ok {
+			return "", errors.New("invalid referrer manifest: missing subject digest")
+		}
+	} else if subject, ok := desc.Annotations[c8dimages.AnnotationManifestSubject]; ok {
+		dgstStr = subject
+	}
+	return digest.Parse(dgstStr)
 }
 
 // writeStatus writes a status message to out. If newerDownloaded is true, the
@@ -261,4 +482,8 @@ func writeStatus(out progress.Output, requestedTag string, newerDownloaded bool)
 	} else {
 		progress.Message(out, "", "Status: Image is up to date for "+requestedTag)
 	}
+}
+
+func isModelMediaType(mediaType string) bool {
+	return strings.HasPrefix(strings.ToLower(mediaType), "application/vnd.docker.ai.")
 }

@@ -1,20 +1,19 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/api/types/backend"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/strslice"
-	"github.com/docker/docker/container"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/metrics"
+	"github.com/moby/moby/v2/daemon/server/backend"
 )
 
 const (
@@ -68,18 +67,19 @@ type cmdProbe struct {
 // Returns the exit code and probe output (if any)
 func (p *cmdProbe) run(ctx context.Context, d *Daemon, cntr *container.Container) (*containertypes.HealthcheckResult, error) {
 	startTime := time.Now()
-	cmdSlice := strslice.StrSlice(cntr.Config.Healthcheck.Test)[1:]
-	if p.shell {
-		cmdSlice = append(getShell(cntr), cmdSlice...)
+	cmd := cntr.Config.Healthcheck.Test[1:]
+	if len(cmd) == 0 {
+		return nil, fmt.Errorf("healthcheck for container %s has no command", cntr.ID)
 	}
-	entrypoint, args := d.getEntrypointAndArgs(strslice.StrSlice{}, cmdSlice)
+	if p.shell {
+		cmd = append(getShell(cntr), cmd...)
+	}
 	execConfig := container.NewExecConfig(cntr)
 	execConfig.OpenStdin = false
 	execConfig.OpenStdout = true
 	execConfig.OpenStderr = true
 	execConfig.DetachKeys = []byte{}
-	execConfig.Entrypoint = entrypoint
-	execConfig.Args = args
+	execConfig.Entrypoint, execConfig.Args = cmd[0], cmd[1:]
 	execConfig.Tty = false
 	execConfig.Privileged = false
 	execConfig.User = cntr.Config.User
@@ -123,7 +123,7 @@ func (p *cmdProbe) run(ctx context.Context, d *Daemon, cntr *container.Container
 			return nil, err
 		}
 	case <-execConfig.Started:
-		healthCheckStartDuration.UpdateSince(startTime)
+		metrics.HealthCheckStartDuration.UpdateSince(startTime)
 	}
 
 	if !tm.Stop() {
@@ -140,7 +140,7 @@ func (p *cmdProbe) run(ctx context.Context, d *Daemon, cntr *container.Container
 		<-execErr
 
 		var msg string
-		if out := output.String(); len(out) > 0 {
+		if out := output.String(); out != "" {
 			msg = fmt.Sprintf("Health check exceeded timeout (%v): %s", probeTimeout, out)
 		} else {
 			msg = fmt.Sprintf("Health check exceeded timeout (%v)", probeTimeout)
@@ -200,14 +200,14 @@ func handleProbeResult(d *Daemon, c *container.Container, result *containertypes
 	h := c.State.Health
 	oldStatus := h.Status()
 
-	if len(h.Log) >= maxLogEntries {
-		h.Log = append(h.Log[len(h.Log)+1-maxLogEntries:], result)
+	if len(h.Health.Log) >= maxLogEntries {
+		h.Health.Log = append(h.Health.Log[len(h.Health.Log)+1-maxLogEntries:], result)
 	} else {
-		h.Log = append(h.Log, result)
+		h.Health.Log = append(h.Health.Log, result)
 	}
 
 	if result.ExitCode == exitStatusHealthy {
-		h.FailingStreak = 0
+		h.Health.FailingStreak = 0
 		h.SetStatus(containertypes.Healthy)
 	} else { // Failure (including invalid exit code)
 		shouldIncrementStreak := true
@@ -226,9 +226,9 @@ func handleProbeResult(d *Daemon, c *container.Container, result *containertypes
 		}
 
 		if shouldIncrementStreak {
-			h.FailingStreak++
+			h.Health.FailingStreak++
 
-			if h.FailingStreak >= retries {
+			if h.Health.FailingStreak >= retries {
 				h.SetStatus(containertypes.Unhealthy)
 			}
 		}
@@ -247,7 +247,7 @@ func handleProbeResult(d *Daemon, c *container.Container, result *containertypes
 
 	current := h.Status()
 	if oldStatus != current {
-		d.LogContainerEvent(c, events.Action(string(events.ActionHealthStatus)+": "+current))
+		d.LogContainerEvent(c, events.Action(string(events.ActionHealthStatus)+": "+string(current)))
 	}
 }
 
@@ -263,14 +263,22 @@ func monitor(d *Daemon, c *container.Container, stop chan struct{}, probe probe)
 	c.Unlock()
 
 	getInterval := func() time.Duration {
-		if time.Since(started) >= startPeriod {
+		sinceStart := time.Since(started)
+		if sinceStart >= startPeriod {
 			return probeInterval
 		}
 		c.Lock()
-		status := c.Health.Health.Status
+		status := c.State.Health.Health.Status
 		c.Unlock()
 
 		if status == containertypes.Starting {
+			// Cap the interval so we don't sleep past the end of the
+			// start period. Without this, a large StartInterval would
+			// delay the transition to the regular probe cadence.
+			remaining := startPeriod - sinceStart
+			if startInterval > remaining {
+				return remaining
+			}
 			return startInterval
 		}
 		return probeInterval
@@ -290,10 +298,10 @@ func monitor(d *Daemon, c *container.Container, stop chan struct{}, probe probe)
 			ctx, cancelProbe := context.WithCancel(context.Background())
 			results := make(chan *containertypes.HealthcheckResult, 1)
 			go func() {
-				healthChecksCounter.Inc()
+				metrics.HealthChecksCounter.Inc()
 				result, err := probe.run(ctx, d, c)
 				if err != nil {
-					healthChecksFailedCounter.Inc()
+					metrics.HealthChecksFailedCounter.Inc()
 					log.G(ctx).Warnf("Health check for container %s error: %v", c.ID, err)
 					results <- &containertypes.HealthcheckResult{
 						ExitCode: -1,
@@ -354,11 +362,11 @@ func (daemon *Daemon) updateHealthMonitor(c *container.Container) {
 		return // No healthcheck configured
 	}
 
-	probe := getProbe(c)
-	wantRunning := c.Running && !c.Paused && probe != nil
+	healthProbe := getProbe(c)
+	wantRunning := c.State.Running && !c.State.Paused && healthProbe != nil
 	if wantRunning {
 		if stop := h.OpenMonitorChannel(); stop != nil {
-			go monitor(daemon, c, stop, probe)
+			go monitor(daemon, c, stop, healthProbe)
 		}
 	} else {
 		h.CloseMonitorChannel()
@@ -380,7 +388,7 @@ func (daemon *Daemon) initHealthMonitor(c *container.Container) {
 
 	if h := c.State.Health; h != nil {
 		h.SetStatus(containertypes.Starting)
-		h.FailingStreak = 0
+		h.Health.FailingStreak = 0
 	} else {
 		h := &container.Health{}
 		h.SetStatus(containertypes.Starting)
@@ -413,7 +421,7 @@ func (b *limitedBuffer) Write(data []byte) (int, error) {
 
 	bufLen := b.buf.Len()
 	dataLen := len(data)
-	keep := minInt(maxOutputLen-bufLen, dataLen)
+	keep := min(maxOutputLen-bufLen, dataLen)
 	if keep > 0 {
 		b.buf.Write(data[:keep])
 	}
@@ -443,22 +451,12 @@ func timeoutWithDefault(configuredValue time.Duration, defaultValue time.Duratio
 	return configuredValue
 }
 
-func minInt(x, y int) int {
-	if x < y {
-		return x
-	}
-	return y
-}
-
 func getShell(cntr *container.Container) []string {
 	if len(cntr.Config.Shell) != 0 {
 		return cntr.Config.Shell
 	}
-	if runtime.GOOS != "windows" {
-		return []string{"/bin/sh", "-c"}
+	if cntr.ImagePlatform.OS == "windows" {
+		return []string{"cmd", "/S", "/C"}
 	}
-	if cntr.OS != runtime.GOOS {
-		return []string{"/bin/sh", "-c"}
-	}
-	return []string{"cmd", "/S", "/C"}
+	return []string{"/bin/sh", "-c"}
 }

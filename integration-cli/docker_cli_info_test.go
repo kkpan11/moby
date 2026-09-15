@@ -7,20 +7,21 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 type DockerCLIInfoSuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerCLIInfoSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIInfoSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIInfoSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIInfoSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 // ensure docker info succeeds
@@ -74,10 +75,10 @@ func (s *DockerCLIInfoSuite) TestInfoDisplaysRunningContainers(c *testing.T) {
 
 	cli.DockerCmd(c, "run", "-d", "busybox", "top")
 	out := cli.DockerCmd(c, "info").Stdout()
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf("Containers: %d\n", existing["Containers"]+1)))
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf(" Running: %d\n", existing["ContainersRunning"]+1)))
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf(" Paused: %d\n", existing["ContainersPaused"])))
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf(" Stopped: %d\n", existing["ContainersStopped"])))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf("Containers: %d\n", existing["Containers"]+1)))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf(" Running: %d\n", existing["ContainersRunning"]+1)))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf(" Paused: %d\n", existing["ContainersPaused"])))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf(" Stopped: %d\n", existing["ContainersStopped"])))
 }
 
 func (s *DockerCLIInfoSuite) TestInfoDisplaysPausedContainers(c *testing.T) {
@@ -90,10 +91,10 @@ func (s *DockerCLIInfoSuite) TestInfoDisplaysPausedContainers(c *testing.T) {
 	cli.DockerCmd(c, "pause", id)
 
 	out := cli.DockerCmd(c, "info").Stdout()
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf("Containers: %d\n", existing["Containers"]+1)))
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf(" Running: %d\n", existing["ContainersRunning"])))
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf(" Paused: %d\n", existing["ContainersPaused"]+1)))
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf(" Stopped: %d\n", existing["ContainersStopped"])))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf("Containers: %d\n", existing["Containers"]+1)))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf(" Running: %d\n", existing["ContainersRunning"])))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf(" Paused: %d\n", existing["ContainersPaused"]+1)))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf(" Stopped: %d\n", existing["ContainersStopped"])))
 }
 
 func (s *DockerCLIInfoSuite) TestInfoDisplaysStoppedContainers(c *testing.T) {
@@ -107,17 +108,17 @@ func (s *DockerCLIInfoSuite) TestInfoDisplaysStoppedContainers(c *testing.T) {
 	cli.DockerCmd(c, "stop", cleanedContainerID)
 
 	out = cli.DockerCmd(c, "info").Stdout()
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf("Containers: %d\n", existing["Containers"]+1)))
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf(" Running: %d\n", existing["ContainersRunning"])))
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf(" Paused: %d\n", existing["ContainersPaused"])))
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf(" Stopped: %d\n", existing["ContainersStopped"]+1)))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf("Containers: %d\n", existing["Containers"]+1)))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf(" Running: %d\n", existing["ContainersRunning"])))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf(" Paused: %d\n", existing["ContainersPaused"])))
+	assert.Assert(c, is.Contains(out, fmt.Sprintf(" Stopped: %d\n", existing["ContainersStopped"]+1)))
 }
 
-func existingContainerStates(c *testing.T) map[string]int {
-	out := cli.DockerCmd(c, "info", "--format", "{{json .}}").Stdout()
-	var m map[string]interface{}
+func existingContainerStates(t *testing.T) map[string]int {
+	out := cli.DockerCmd(t, "info", "--format", "{{json .}}").Stdout()
+	var m map[string]any
 	err := json.Unmarshal([]byte(out), &m)
-	assert.NilError(c, err)
+	assert.NilError(t, err)
 	res := map[string]int{}
 	res["Containers"] = int(m["Containers"].(float64))
 	res["ContainersRunning"] = int(m["ContainersRunning"].(float64))

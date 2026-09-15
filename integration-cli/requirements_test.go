@@ -2,21 +2,22 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/plugin"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/requirement"
-	"github.com/docker/docker/testutil/registry"
+	"github.com/containerd/containerd/v2/plugins"
+	"github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/internal/testutil/registry"
 )
 
 func DaemonIsWindows() bool {
@@ -28,27 +29,23 @@ func DaemonIsLinux() bool {
 }
 
 func OnlyDefaultNetworks(ctx context.Context) bool {
-	apiClient, err := client.NewClientWithOpts(client.FromEnv)
+	apiClient, err := client.New(client.FromEnv)
 	if err != nil {
 		return false
 	}
-	networks, err := apiClient.NetworkList(ctx, network.ListOptions{})
-	if err != nil || len(networks) > 0 {
+	res, err := apiClient.NetworkList(ctx, client.NetworkListOptions{})
+	if err != nil || len(res.Items) > 0 {
 		return false
 	}
 	return true
 }
 
 func IsAmd64() bool {
-	return testEnv.DaemonVersion.Arch == "amd64"
-}
-
-func NotArm64() bool {
-	return testEnv.DaemonVersion.Arch != "arm64"
+	return testEnv.DaemonInfo.Architecture == "amd64"
 }
 
 func NotPpc64le() bool {
-	return testEnv.DaemonVersion.Arch != "ppc64le"
+	return testEnv.DaemonInfo.Architecture != "ppc64le"
 }
 
 func UnixCli() bool {
@@ -69,8 +66,8 @@ func Network() bool {
 	}
 
 	resp, err := c.Get(url)
-	if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
-		panic(fmt.Sprintf("Timeout for GET request on %s", url))
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		panic("Timeout for GET request on " + url)
 	}
 	if resp != nil {
 		resp.Body.Close()
@@ -79,9 +76,6 @@ func Network() bool {
 }
 
 func Apparmor() bool {
-	if strings.HasPrefix(testEnv.DaemonInfo.OperatingSystem, "SUSE Linux Enterprise Server ") {
-		return false
-	}
 	buf, err := os.ReadFile("/sys/module/apparmor/parameters/enabled")
 	return err == nil && len(buf) > 1 && buf[0] == 'Y'
 }
@@ -91,7 +85,7 @@ func Apparmor() bool {
 func containerdSnapshotterEnabled() bool {
 	for _, v := range testEnv.DaemonInfo.DriverStatus {
 		if v[0] == "driver-type" {
-			return v[1] == string(plugin.SnapshotPlugin)
+			return v[1] == string(plugins.SnapshotPlugin)
 		}
 	}
 	return false
@@ -149,8 +143,14 @@ func RegistryHosting() bool {
 	return err == nil
 }
 
+// RuntimeIsWindowsContainerd returns whether the containerd runtime is used on
+// Windows.
+// It is true when either the legacy DOCKER_WINDOWS_CONTAINERD_RUNTIME=1 env
+// var is set, or when the embedded-containerd feature is enabled via
+// TEST_INTEGRATION_CONTAINERD_EMBEDDED (which also uses containerd).
 func RuntimeIsWindowsContainerd() bool {
-	return os.Getenv("DOCKER_WINDOWS_CONTAINERD_RUNTIME") == "1"
+	return os.Getenv("DOCKER_WINDOWS_CONTAINERD_RUNTIME") == "1" ||
+		(runtime.GOOS == "windows" && os.Getenv("TEST_INTEGRATION_CONTAINERD_EMBEDDED") != "")
 }
 
 func SwarmInactive() bool {
@@ -161,18 +161,15 @@ func TODOBuildkit() bool {
 	return os.Getenv("DOCKER_BUILDKIT") == ""
 }
 
-func DockerCLIVersion(t testing.TB) string {
-	out := cli.DockerCmd(t, "--version").Stdout()
-	version := strings.Fields(out)
-	if len(version) < 3 {
-		t.Fatal("unknown version output", version)
-	}
-	return version[2]
-}
-
 // testRequires checks if the environment satisfies the requirements
 // for the test to run or skips the tests.
-func testRequires(t *testing.T, requirements ...requirement.Test) {
+func testRequires(t *testing.T, requirements ...func() bool) {
 	t.Helper()
-	requirement.Is(t, requirements...)
+	for _, check := range requirements {
+		if !check() {
+			requirementFunc := runtime.FuncForPC(reflect.ValueOf(check).Pointer()).Name()
+			_, req, _ := strings.Cut(path.Base(requirementFunc), ".")
+			t.Skipf("unmatched requirement %s", req)
+		}
+	}
 }

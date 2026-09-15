@@ -1,9 +1,8 @@
-package convert // import "github.com/docker/docker/daemon/cluster/convert"
+package convert
 
 import (
-	swarmtypes "github.com/docker/docker/api/types/swarm"
-	types "github.com/docker/docker/api/types/swarm"
 	gogotypes "github.com/gogo/protobuf/types"
+	swarmtypes "github.com/moby/moby/api/types/swarm"
 	swarmapi "github.com/moby/swarmkit/v2/api"
 )
 
@@ -24,7 +23,7 @@ func SecretFromGRPC(s *swarmapi.Secret) swarmtypes.Secret {
 	secret.UpdatedAt, _ = gogotypes.TimestampFromProto(s.Meta.UpdatedAt)
 
 	if s.Spec.Templating != nil {
-		secret.Spec.Templating = &types.Driver{
+		secret.Spec.Templating = &swarmtypes.Driver{
 			Name:    s.Spec.Templating.Name,
 			Options: s.Spec.Templating.Options,
 		}

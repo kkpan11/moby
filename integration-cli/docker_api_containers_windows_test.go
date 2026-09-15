@@ -9,11 +9,12 @@ import (
 	"strings"
 	"testing"
 
-	winio "github.com/Microsoft/go-winio"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/testutil"
-	"github.com/pkg/errors"
+	"github.com/Microsoft/go-winio"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/internal/testutil"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -48,32 +49,32 @@ func (s *DockerAPISuite) TestContainersAPICreateMountsBindNamedPipe(c *testing.T
 	name := "test-bind-npipe"
 
 	ctx := testutil.GetContext(c)
-	client := testEnv.APIClient()
-	_, err = client.ContainerCreate(ctx,
-		&container.Config{
-			Image: testEnv.PlatformDefaults.BaseImage,
-			Cmd:   []string{"cmd", "/c", cmd},
-		}, &container.HostConfig{
-			Mounts: []mount.Mount{
-				{
-					Type:   "npipe",
-					Source: hostPipeName,
-					Target: containerPipeName,
+	apiClient := testEnv.APIClient()
+	_, err = apiClient.ContainerCreate(ctx,
+		client.ContainerCreateOptions{
+			Config: &container.Config{
+				Image: testEnv.PlatformDefaults.BaseImage,
+				Cmd:   []string{"cmd", "/c", cmd},
+			},
+			HostConfig: &container.HostConfig{
+				Mounts: []mount.Mount{
+					{
+						Type:   "npipe",
+						Source: hostPipeName,
+						Target: containerPipeName,
+					},
 				},
 			},
+			NetworkingConfig: &network.NetworkingConfig{},
+			Name:             name,
 		},
-		nil, nil, name)
+	)
 	assert.NilError(c, err)
 
-	err = client.ContainerStart(ctx, name, container.StartOptions{})
+	_, err = apiClient.ContainerStart(ctx, name, client.ContainerStartOptions{})
 	assert.NilError(c, err)
 
 	err = <-ch
 	assert.NilError(c, err)
 	assert.Check(c, is.Equal(text, strings.TrimSpace(string(b))))
-}
-
-func mountWrapper(t *testing.T, device, target, mType, options string) error {
-	// This should never be called.
-	return errors.Errorf("there is no implementation of Mount on this platform")
 }

@@ -1,21 +1,12 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package otlpmetrichttp // import "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+package otlpmetrichttp
 
 import (
 	"crypto/tls"
+	"net/http"
+	"net/url"
 	"time"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp/internal/oconf"
@@ -26,6 +17,11 @@ import (
 // Compression describes the compression used for payloads sent to the
 // collector.
 type Compression oconf.Compression
+
+// HTTPTransportProxyFunc is a function that resolves which URL to use as proxy for a given request.
+// This type is compatible with http.Transport.Proxy and can be used to set a custom proxy function
+// to the OTLP HTTP client.
+type HTTPTransportProxyFunc func(*http.Request) (*url.URL, error)
 
 const (
 	// NoCompression tells the driver to send payloads without
@@ -67,13 +63,40 @@ func (w wrappedOption) applyHTTPOption(cfg oconf.Config) oconf.Config {
 //
 // If the OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
 // environment variable is set, and this option is not passed, that variable
-// value will be used. If both are set, OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-// will take precedence.
+// value will be used. If both environment variables are set,
+// OTEL_EXPORTER_OTLP_METRICS_ENDPOINT will take precedence. If an environment
+// variable is set, and this option is passed, this option will take precedence.
 //
 // By default, if an environment variable is not set, and this option is not
 // passed, "localhost:4318" will be used.
 func WithEndpoint(endpoint string) Option {
 	return wrappedOption{oconf.WithEndpoint(endpoint)}
+}
+
+// WithEndpointURL sets the target endpoint URL the Exporter will connect to.
+//
+// If the OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+// environment variable is set, and this option is not passed, that variable
+// value will be used. If both environment variables are set,
+// OTEL_EXPORTER_OTLP_METRICS_ENDPOINT will take precedence. If an environment
+// variable is set, and this option is passed, this option will take precedence.
+//
+// If both this option and WithEndpoint are used, the last used option will
+// take precedence.
+//
+// If an invalid URL is provided, the default value will be kept.
+//
+// The path of the provided URL is used as-is; with one exception: if the URL has
+// no path, it is normalized to the root path ("/"). The default metrics path
+// ("/v1/metrics") is not appended automatically. Use WithEndpoint if you want
+// that behavior, or pass a URL that includes that path.
+//
+// By default, if an environment variable is not set, and this option is not
+// passed, "localhost:4318" will be used.
+//
+// This option has no effect if WithGRPCConn is used.
+func WithEndpointURL(u string) Option {
+	return wrappedOption{oconf.WithEndpointURL(u)}
 }
 
 // WithCompression sets the compression strategy the Exporter will use to
@@ -167,6 +190,16 @@ func WithTimeout(duration time.Duration) Option {
 	return wrappedOption{oconf.WithTimeout(duration)}
 }
 
+// WithMaxRequestSize sets the maximum size, in bytes, of a serialized export
+// request, before compression, that the exporter will send.
+//
+// If size is less than or equal to zero, no request-size limit is applied.
+// Disabling the limit is not recommended because it can lead to excessive
+// resource consumption or abuse.
+func WithMaxRequestSize(size int) Option {
+	return wrappedOption{oconf.WithMaxRequestSize(size)}
+}
+
 // WithRetry sets the retry policy for transient retryable errors that are
 // returned by the target endpoint.
 //
@@ -196,4 +229,27 @@ func WithTemporalitySelector(selector metric.TemporalitySelector) Option {
 // explicitly passed for a view matching an instrument.
 func WithAggregationSelector(selector metric.AggregationSelector) Option {
 	return wrappedOption{oconf.WithAggregationSelector(selector)}
+}
+
+// WithProxy sets the Proxy function the client will use to determine the
+// proxy to use for an HTTP request. If this option is not used, the client
+// will use [http.ProxyFromEnvironment].
+func WithProxy(pf HTTPTransportProxyFunc) Option {
+	return wrappedOption{oconf.WithProxy(oconf.HTTPTransportProxyFunc(pf))}
+}
+
+// WithHTTPClient sets the HTTP client to used by the exporter.
+//
+// This option will take precedence over [WithProxy], [WithTimeout],
+// [WithTLSClientConfig] options as well as OTEL_EXPORTER_OTLP_CERTIFICATE,
+// OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE, OTEL_EXPORTER_OTLP_TIMEOUT,
+// OTEL_EXPORTER_OTLP_METRICS_TIMEOUT environment variables.
+//
+// Timeout and all other fields of the passed [http.Client] are left intact.
+//
+// Be aware that passing an HTTP client with transport like
+// [go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp.NewTransport] can
+// cause the client to be instrumented twice and cause infinite recursion.
+func WithHTTPClient(c *http.Client) Option {
+	return wrappedOption{oconf.WithHTTPClient(c)}
 }

@@ -1,6 +1,6 @@
 // Package tailfile provides helper functions to read the nth lines of any
 // ReadSeeker.
-package tailfile // import "github.com/docker/docker/pkg/tailfile"
+package tailfile
 
 import (
 	"bufio"
@@ -32,10 +32,10 @@ func TailFile(f *os.File, n int) ([][]byte, error) {
 	}
 
 	buf := make([][]byte, 0, nLines)
-	scanner := bufio.NewScanner(r)
+	s := bufio.NewScanner(r)
 
-	for scanner.Scan() {
-		buf = append(buf, scanner.Bytes())
+	for s.Scan() {
+		buf = append(buf, s.Bytes())
 	}
 	return buf, nil
 }
@@ -74,22 +74,22 @@ func NewTailReaderWithDelimiter(ctx context.Context, r SizeReaderAt, reqLines in
 		return io.NewSectionReader(bytes.NewReader(nil), 0, 0), 0, nil
 	}
 
-	scanner := newScanner(r, delimiter)
-	for scanner.Scan(ctx) {
-		if err := scanner.Err(); err != nil {
-			return nil, 0, scanner.Err()
+	s := newScanner(r, delimiter)
+	for s.Scan(ctx) {
+		if err := s.Err(); err != nil {
+			return nil, 0, s.Err()
 		}
 
 		found++
 		if found == 1 {
-			tailEnd = scanner.End()
+			tailEnd = s.End()
 		}
 		if found == reqLines {
 			break
 		}
 	}
 
-	tailStart = scanner.Start(ctx)
+	tailStart = s.Start(ctx)
 
 	if found == 0 {
 		return io.NewSectionReader(bytes.NewReader(nil), 0, 0), 0, nil
@@ -103,10 +103,7 @@ func NewTailReaderWithDelimiter(ctx context.Context, r SizeReaderAt, reqLines in
 
 func newScanner(r SizeReaderAt, delim []byte) *scanner {
 	size := r.Size()
-	readSize := blockSize
-	if readSize > int(size) {
-		readSize = int(size)
-	}
+	readSize := min(blockSize, int(size))
 	// silly case...
 	if len(delim) >= readSize/2 {
 		readSize = len(delim)*2 + 2
@@ -178,10 +175,7 @@ func (s *scanner) Scan(ctx context.Context) bool {
 
 		idx := s.idx - len(s.delim)
 		if idx < 0 {
-			readSize := int(s.pos)
-			if readSize > len(s.buf) {
-				readSize = len(s.buf)
-			}
+			readSize := min(int(s.pos), len(s.buf))
 
 			if readSize < len(s.delim) {
 				return false
@@ -189,7 +183,7 @@ func (s *scanner) Scan(ctx context.Context) bool {
 
 			offset := s.pos - int64(readSize)
 			n, err := s.r.ReadAt(s.buf[:readSize], offset)
-			if err != nil && err != io.EOF {
+			if err != nil && !errors.Is(err, io.EOF) {
 				s.err = err
 				return false
 			}

@@ -3,15 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/cli/build"
-	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/go-units"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/moby/moby/client/pkg/stringid"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli/build"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
@@ -22,12 +22,12 @@ type DockerCLIPsSuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerCLIPsSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIPsSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIPsSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIPsSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 func (s *DockerCLIPsSuite) TestPsListContainersBase(c *testing.T) {
@@ -53,79 +53,79 @@ func (s *DockerCLIPsSuite) TestPsListContainersBase(c *testing.T) {
 
 	// all
 	out = cli.DockerCmd(c, "ps", "-a").Stdout()
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), []string{fourthID, thirdID, secondID, firstID}), true, fmt.Sprintf("ALL: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), []string{fourthID, thirdID, secondID, firstID}), true, "ALL: Container list is not in the correct order: \n"+out)
 
 	// running
 	out = cli.DockerCmd(c, "ps").Stdout()
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), []string{fourthID, secondID, firstID}), true, fmt.Sprintf("RUNNING: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), []string{fourthID, secondID, firstID}), true, "RUNNING: Container list is not in the correct order: \n"+out)
 
 	// limit
 	out = cli.DockerCmd(c, "ps", "-n=2", "-a").Stdout()
 	expected := []string{fourthID, thirdID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("LIMIT & ALL: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "LIMIT & ALL: Container list is not in the correct order: \n"+out)
 
 	out = cli.DockerCmd(c, "ps", "-n=2").Stdout()
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("LIMIT: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "LIMIT: Container list is not in the correct order: \n"+out)
 
 	// filter since
 	out = cli.DockerCmd(c, "ps", "-f", "since="+firstID, "-a").Stdout()
 	expected = []string{fourthID, thirdID, secondID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter & ALL: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter & ALL: Container list is not in the correct order: \n"+out)
 
 	out = cli.DockerCmd(c, "ps", "-f", "since="+firstID).Stdout()
 	expected = []string{fourthID, secondID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter: Container list is not in the correct order: \n"+out)
 
 	out = cli.DockerCmd(c, "ps", "-f", "since="+thirdID).Stdout()
 	expected = []string{fourthID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter: Container list is not in the correct order: \n"+out)
 
 	// filter before
 	out = cli.DockerCmd(c, "ps", "-f", "before="+fourthID, "-a").Stdout()
 	expected = []string{thirdID, secondID, firstID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("BEFORE filter & ALL: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "BEFORE filter & ALL: Container list is not in the correct order: \n"+out)
 
 	out = cli.DockerCmd(c, "ps", "-f", "before="+fourthID).Stdout()
 	expected = []string{secondID, firstID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("BEFORE filter: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "BEFORE filter: Container list is not in the correct order: \n"+out)
 
 	out = cli.DockerCmd(c, "ps", "-f", "before="+thirdID).Stdout()
 	expected = []string{secondID, firstID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter: Container list is not in the correct order: \n"+out)
 
 	// filter since & before
 	out = cli.DockerCmd(c, "ps", "-f", "since="+firstID, "-f", "before="+fourthID, "-a").Stdout()
 	expected = []string{thirdID, secondID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter, BEFORE filter & ALL: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter, BEFORE filter & ALL: Container list is not in the correct order: \n"+out)
 
 	out = cli.DockerCmd(c, "ps", "-f", "since="+firstID, "-f", "before="+fourthID).Stdout()
 	expected = []string{secondID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter, BEFORE filter: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter, BEFORE filter: Container list is not in the correct order: \n"+out)
 
 	// filter since & limit
 	out = cli.DockerCmd(c, "ps", "-f", "since="+firstID, "-n=2", "-a").Stdout()
 	expected = []string{fourthID, thirdID}
 
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter, LIMIT & ALL: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter, LIMIT & ALL: Container list is not in the correct order: \n"+out)
 
 	out = cli.DockerCmd(c, "ps", "-f", "since="+firstID, "-n=2").Stdout()
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter, LIMIT: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter, LIMIT: Container list is not in the correct order: \n"+out)
 
 	// filter before & limit
 	out = cli.DockerCmd(c, "ps", "-f", "before="+fourthID, "-n=1", "-a").Stdout()
 	expected = []string{thirdID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("BEFORE filter, LIMIT & ALL: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "BEFORE filter, LIMIT & ALL: Container list is not in the correct order: \n"+out)
 
 	out = cli.DockerCmd(c, "ps", "-f", "before="+fourthID, "-n=1").Stdout()
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("BEFORE filter, LIMIT: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "BEFORE filter, LIMIT: Container list is not in the correct order: \n"+out)
 
 	// filter since & filter before & limit
 	out = cli.DockerCmd(c, "ps", "-f", "since="+firstID, "-f", "before="+fourthID, "-n=1", "-a").Stdout()
 	expected = []string{thirdID}
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter, BEFORE filter, LIMIT & ALL: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter, BEFORE filter, LIMIT & ALL: Container list is not in the correct order: \n"+out)
 
 	out = cli.DockerCmd(c, "ps", "-f", "since="+firstID, "-f", "before="+fourthID, "-n=1").Stdout()
-	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, fmt.Sprintf("SINCE filter, BEFORE filter, LIMIT: Container list is not in the correct order: \n%s", out))
+	assert.Equal(c, assertContainerList(RemoveOutputForExistingElements(out, existingContainers), expected), true, "SINCE filter, BEFORE filter, LIMIT: Container list is not in the correct order: \n"+out)
 }
 
 func assertContainerList(out string, expected []string) bool {
@@ -136,7 +136,7 @@ func assertContainerList(out string, expected []string) bool {
 	}
 
 	containerIDIndex := strings.Index(lines[0], "CONTAINER ID")
-	for i := 0; i < len(expected); i++ {
+	for i := range expected {
 		foundID := lines[i+1][containerIDIndex : containerIDIndex+12]
 		if foundID != expected[i][:12] {
 			return false
@@ -319,21 +319,22 @@ func (s *DockerCLIPsSuite) TestPsListContainersFilterName(c *testing.T) {
 // - Run containers for each of those image (busybox, images_ps_filter_test1, images_ps_filter_test2)
 // - Filter them out :P
 func (s *DockerCLIPsSuite) TestPsListContainersFilterAncestorImage(c *testing.T) {
+	skip.If(c, TODOBuildkit) // order or digests are different with buildkit
 	existingContainers := ExistingContainerIDs(c)
 
 	// Build images
 	imageName1 := "images_ps_filter_test1"
-	buildImageSuccessfully(c, imageName1, build.WithDockerfile(`FROM busybox
+	cli.BuildCmd(c, imageName1, build.WithDockerfile(`FROM busybox
 		 LABEL match me 1`))
 	imageID1 := getIDByName(c, imageName1)
 
 	imageName1Tagged := "images_ps_filter_test1:tag"
-	buildImageSuccessfully(c, imageName1Tagged, build.WithDockerfile(`FROM busybox
+	cli.BuildCmd(c, imageName1Tagged, build.WithDockerfile(`FROM busybox
 		 LABEL match me 1 tagged`))
 	imageID1Tagged := getIDByName(c, imageName1Tagged)
 
 	imageName2 := "images_ps_filter_test2"
-	buildImageSuccessfully(c, imageName2, build.WithDockerfile(fmt.Sprintf(`FROM %s
+	cli.BuildCmd(c, imageName2, build.WithDockerfile(fmt.Sprintf(`FROM %s
 		 LABEL match me 2`, imageName1)))
 	imageID2 := getIDByName(c, imageName2)
 
@@ -369,7 +370,7 @@ func (s *DockerCLIPsSuite) TestPsListContainersFilterAncestorImage(c *testing.T)
 		{imageName1, []string{thirdID, fifthID}},
 		{imageName2, []string{fifthID}},
 		// image:tag
-		{fmt.Sprintf("%s:latest", imageName1), []string{thirdID, fifthID}},
+		{imageName1 + ":latest", []string{thirdID, fifthID}},
 		{imageName1Tagged, []string{fourthID}},
 		// short-id
 		{stringid.TruncateID(imageID1), []string{thirdID, fifthID}},
@@ -391,26 +392,13 @@ func (s *DockerCLIPsSuite) TestPsListContainersFilterAncestorImage(c *testing.T)
 	checkPsAncestorFilterOutput(c, RemoveOutputForExistingElements(out, existingContainers), imageName2+","+imageName1Tagged, []string{fourthID, fifthID})
 }
 
-func checkPsAncestorFilterOutput(c *testing.T, out string, filterName string, expectedIDs []string) {
-	var actualIDs []string
-	if out != "" {
-		actualIDs = strings.Split(out[:len(out)-1], "\n")
-	}
-	sort.Strings(actualIDs)
-	sort.Strings(expectedIDs)
+func checkPsAncestorFilterOutput(t *testing.T, out, filterName string, expectedIDs []string) {
+	t.Helper()
 
-	assert.Equal(c, len(actualIDs), len(expectedIDs), fmt.Sprintf("Expected filtered container(s) for %s ancestor filter to be %v:%v, got %v:%v", filterName, len(expectedIDs), expectedIDs, len(actualIDs), actualIDs))
-	if len(expectedIDs) > 0 {
-		same := true
-		for i := range expectedIDs {
-			if actualIDs[i] != expectedIDs[i] {
-				c.Logf("%s, %s", actualIDs[i], expectedIDs[i])
-				same = false
-				break
-			}
-		}
-		assert.Equal(c, same, true, fmt.Sprintf("Expected filtered container(s) for %s ancestor filter to be %v, got %v", filterName, expectedIDs, actualIDs))
-	}
+	actualIDs := strings.Fields(out)
+	assert.Assert(t, is.DeepEqual(actualIDs, expectedIDs, cmpopts.SortSlices(func(a, b string) bool {
+		return a < b
+	})), "unexpected containers for %s ancestor filter", filterName)
 }
 
 func (s *DockerCLIPsSuite) TestPsListContainersFilterLabel(c *testing.T) {
@@ -444,8 +432,8 @@ func (s *DockerCLIPsSuite) TestPsListContainersFilterLabel(c *testing.T) {
 	// filter containers by exact key
 	out = cli.DockerCmd(c, "ps", "-a", "-q", "--no-trunc", "--filter=label=match").Stdout()
 	containerOut = strings.TrimSpace(out)
-	assert.Assert(c, strings.Contains(containerOut, firstID))
-	assert.Assert(c, strings.Contains(containerOut, secondID))
+	assert.Assert(c, is.Contains(containerOut, firstID))
+	assert.Assert(c, is.Contains(containerOut, secondID))
 	assert.Assert(c, !strings.Contains(containerOut, thirdID))
 }
 
@@ -469,13 +457,13 @@ func (s *DockerCLIPsSuite) TestPsListContainersFilterExited(c *testing.T) {
 
 	// filter containers by exited=0
 	out = cli.DockerCmd(c, "ps", "-a", "-q", "--no-trunc", "--filter=exited=0").Stdout()
-	assert.Assert(c, strings.Contains(out, strings.TrimSpace(firstZero)))
-	assert.Assert(c, strings.Contains(out, strings.TrimSpace(secondZero)))
+	assert.Assert(c, is.Contains(out, strings.TrimSpace(firstZero)))
+	assert.Assert(c, is.Contains(out, strings.TrimSpace(secondZero)))
 	assert.Assert(c, !strings.Contains(out, strings.TrimSpace(firstNonZero)))
 	assert.Assert(c, !strings.Contains(out, strings.TrimSpace(secondNonZero)))
 	out = cli.DockerCmd(c, "ps", "-a", "-q", "--no-trunc", "--filter=exited=1").Stdout()
-	assert.Assert(c, strings.Contains(out, strings.TrimSpace(firstNonZero)))
-	assert.Assert(c, strings.Contains(out, strings.TrimSpace(secondNonZero)))
+	assert.Assert(c, is.Contains(out, strings.TrimSpace(firstNonZero)))
+	assert.Assert(c, is.Contains(out, strings.TrimSpace(secondNonZero)))
 	assert.Assert(c, !strings.Contains(out, strings.TrimSpace(firstZero)))
 	assert.Assert(c, !strings.Contains(out, strings.TrimSpace(secondZero)))
 }
@@ -530,7 +518,7 @@ func (s *DockerCLIPsSuite) TestPsListContainersFilterCreated(c *testing.T) {
 	out = cli.DockerCmd(c, "ps", "-a").Stdout()
 
 	hits := 0
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if !strings.Contains(line, shortCID) {
 			continue
 		}
@@ -612,9 +600,7 @@ func (s *DockerCLIPsSuite) TestPsNotShowPortsOfStoppedContainer(c *testing.T) {
 func (s *DockerCLIPsSuite) TestPsShowMounts(c *testing.T) {
 	existingContainers := ExistingContainerNames(c)
 
-	prefix, slash := getPrefixAndSlashFromDaemonPlatform()
-
-	mp := prefix + slash + "test"
+	mp := dPath("/test")
 
 	cli.DockerCmd(c, "volume", "create", "ps-volume-test")
 	// volume mount containers
@@ -705,7 +691,7 @@ func (s *DockerCLIPsSuite) TestPsShowMounts(c *testing.T) {
 	assert.Equal(c, fields[1], bindMountSource)
 
 	// empty results filtering by unknown mount point
-	out = cli.DockerCmd(c, "ps", "--format", "{{.Names}} {{.Mounts}}", "--filter", "volume="+prefix+slash+"this-path-was-never-mounted").Stdout()
+	out = cli.DockerCmd(c, "ps", "--format", "{{.Names}} {{.Mounts}}", "--filter", "volume="+dPath("/this-path-was-never-mounted")).Stdout()
 	assert.Equal(c, len(strings.TrimSpace(out)), 0)
 }
 
@@ -816,9 +802,9 @@ func (s *DockerCLIPsSuite) TestPsListContainersFilterPorts(c *testing.T) {
 	id3 := strings.TrimSpace(out)
 
 	out = cli.DockerCmd(c, "ps", "--no-trunc", "-q").Stdout()
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id1))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id2))
-	assert.Assert(c, strings.Contains(strings.TrimSpace(out), id3))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id1))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id2))
+	assert.Assert(c, is.Contains(strings.TrimSpace(out), id3))
 
 	out = cli.DockerCmd(c, "ps", "--no-trunc", "-q", "--filter", "publish=80-8080/udp").Stdout()
 	assert.Assert(c, strings.TrimSpace(out) != id1)

@@ -108,6 +108,14 @@ init() {
 		XDG_RUNTIME_DIR_CREATED=1
 	fi
 
+	: "${CONTAINERD_ROOTLESS_ROOTLESSKIT_STATE_DIR:=$XDG_RUNTIME_DIR/containerd-rootless}"
+	if [ -e "$CONTAINERD_ROOTLESS_ROOTLESSKIT_STATE_DIR" ]; then
+		# https://github.com/moby/moby/issues/52171
+		# Hard requirement, not bypassable with --force
+		ERROR "dockerd-rootless.sh conflicts with containerd-rootless.sh. Stop containerd-rootless.sh if it's running, and remove $CONTAINERD_ROOTLESS_ROOTLESSKIT_STATE_DIR if it still exists."
+		exit 1
+	fi
+
 	instructions=""
 	# instruction: uidmap dependency check
 	if ! command -v newuidmap > /dev/null 2>&1; then
@@ -143,7 +151,16 @@ init() {
 
 	# instruction: iptables dependency check
 	faced_iptables_error=""
-	if ! command -v iptables > /dev/null 2>&1 && [ ! -f /sbin/iptables ] && [ ! -f /usr/sbin/iptables ]; then
+	# Many OSs now use iptables-nft by default so, check for module nf_tables by default. But,
+	# if "iptables --version" worked and reported "legacy", check for module ip_tables instead.
+	iptables_module="nf_tables"
+	iptables_command=$(PATH=$PATH:/sbin:/usr/sbin command -v iptables 2> /dev/null) || :
+	if [ -n "$iptables_command" ]; then
+		iptables_version=$($iptables_command --version 2> /dev/null) || :
+		case $iptables_version in
+			*legacy*) iptables_module="ip_tables" ;;
+		esac
+	else
 		faced_iptables_error=1
 		if [ -z "$OPT_SKIP_IPTABLES" ]; then
 			if command -v apt-get > /dev/null 2>&1; then
@@ -178,14 +195,14 @@ init() {
 	fi
 
 	# instruction: ip_tables module dependency check
-	if ! grep -q ip_tables /proc/modules 2> /dev/null && ! grep -q ip_tables /lib/modules/$(uname -r)/modules.builtin 2> /dev/null; then
+	if ! grep -q $iptables_module /proc/modules 2> /dev/null && ! grep -q $iptables_module /lib/modules/$(uname -r)/modules.builtin 2> /dev/null; then
 		faced_iptables_error=1
 		if [ -z "$OPT_SKIP_IPTABLES" ]; then
 			instructions=$(
 				cat <<- EOI
 					${instructions}
-					# Load ip_tables module
-					modprobe ip_tables
+					# Load $iptables_module module
+					modprobe $iptables_module
 				EOI
 			)
 		fi
@@ -228,8 +245,14 @@ init() {
 		fi
 	fi
 
-	# instructions: validate subuid/subgid files for current user
-	if ! grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subuid 2> /dev/null; then
+	# instructions: validate subuid for current user
+	error_subid=
+	if command -v "getsubids" > /dev/null 2>&1; then
+		getsubids "$USERNAME" > /dev/null 2>&1 || getsubids "$(id -u)" > /dev/null 2>&1 || error_subid=1
+	else
+		grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subuid 2> /dev/null || error_subid=1
+	fi
+	if [ "$error_subid" = "1" ]; then
 		instructions=$(
 			cat <<- EOI
 				${instructions}
@@ -238,7 +261,15 @@ init() {
 			EOI
 		)
 	fi
-	if ! grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subgid 2> /dev/null; then
+
+	# instructions: validate subgid for current user
+	error_subid=
+	if command -v "getsubids" > /dev/null 2>&1; then
+		getsubids -g "$USERNAME" > /dev/null 2>&1 || getsubids -g "$(id -u)" > /dev/null 2>&1 || error_subid=1
+	else
+		grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subgid 2> /dev/null || error_subid=1
+	fi
+	if [ "$error_subid" = "1" ]; then
 		instructions=$(
 			cat <<- EOI
 				${instructions}
@@ -267,7 +298,6 @@ init() {
 	# TODO: support printing non-essential but recommended instructions:
 	# - sysctl: "net.ipv4.ping_group_range"
 	# - sysctl: "net.ipv4.ip_unprivileged_port_start"
-	# - external binary: slirp4netns
 	# - external binary: fuse-overlayfs
 }
 
@@ -282,7 +312,12 @@ cmd_entrypoint_check() {
 cmd_entrypoint_nsenter() {
 	# No need to call init()
 	pid=$(cat "$XDG_RUNTIME_DIR/dockerd-rootless/child_pid")
-	exec nsenter --no-fork --wd="$(pwd)" --preserve-credentials -m -n -U -t "$pid" -- "$@"
+	n=""
+	# If RootlessKit is running with `--detach-netns` mode, we do NOT enter the detached netns here
+	if [ ! -e "$XDG_RUNTIME_DIR/dockerd-rootless/netns" ]; then
+		n="-n"
+	fi
+	exec nsenter --no-fork --wd="$(pwd)" --preserve-credentials -m $n -U -t "$pid" -- "$@"
 }
 
 show_systemd_error() {
@@ -399,8 +434,12 @@ cmd_entrypoint_install() {
 	# check RootlessKit functionality. RootlessKit will print hints if something is still unsatisfied.
 	# (e.g., `kernel.apparmor_restrict_unprivileged_userns` constraint)
 	if ! rootlesskit true; then
-		ERROR "RootlessKit failed, see the error messages and https://rootlesscontaine.rs/getting-started/common/ ."
-		exit 1
+		if [ -z "$OPT_FORCE" ]; then
+			ERROR "RootlessKit failed, see the error messages and https://rootlesscontaine.rs/getting-started/common/ . Set --force to ignore."
+			exit 1
+		else
+			WARNING "RootlessKit failed, see the error messages and https://rootlesscontaine.rs/getting-started/common/ ."
+		fi
 	fi
 
 	if [ -z "$SYSTEMD" ]; then
@@ -529,4 +568,5 @@ if ! command -v "cmd_entrypoint_${command}" > /dev/null 2>&1; then
 fi
 
 # main
+shift
 "cmd_entrypoint_${command}" "$@"

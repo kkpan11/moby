@@ -52,17 +52,21 @@ func (o outlineCapture) clone() outlineCapture {
 	}
 }
 
-func (o outlineCapture) markAllUsed(in map[string]struct{}) {
+func (o outlineCapture) markAllUsed(in map[string]struct{}, visited map[string]struct{}) {
 	for k := range in {
+		if _, ok := visited[k]; ok {
+			continue
+		}
+		visited[k] = struct{}{}
 		if a, ok := o.allArgs[k]; ok {
-			o.markAllUsed(a.deps)
+			o.markAllUsed(a.deps, visited)
 		}
 		o.usedArgs[k] = struct{}{}
 	}
 }
 
 func (ds *dispatchState) args(visited map[string]struct{}) []outline.Arg {
-	ds.outline.markAllUsed(ds.outline.usedArgs)
+	ds.outline.markAllUsed(ds.outline.usedArgs, map[string]struct{}{})
 
 	args := make([]outline.Arg, 0, len(ds.outline.usedArgs))
 	for k := range ds.outline.usedArgs {
@@ -71,7 +75,7 @@ func (ds *dispatchState) args(visited map[string]struct{}) []outline.Arg {
 				args = append(args, outline.Arg{
 					Name:        a.definition.Key,
 					Value:       a.value,
-					Description: a.definition.Comment,
+					Description: a.definition.DocComment,
 					Location:    toSourceLocation(a.location),
 				})
 				visited[k] = struct{}{}
@@ -149,7 +153,7 @@ func (ds *dispatchState) Outline(dt []byte) outline.Outline {
 
 	out := outline.Outline{
 		Name:        ds.stage.Name,
-		Description: ds.stage.Comment,
+		Description: ds.stage.DocComment,
 		Sources:     [][]byte{dt},
 		Args:        args,
 		Secrets:     secrets,
@@ -166,11 +170,11 @@ func toSourceLocation(r []parser.Range) *pb.Location {
 	arr := make([]*pb.Range, len(r))
 	for i, r := range r {
 		arr[i] = &pb.Range{
-			Start: pb.Position{
+			Start: &pb.Position{
 				Line:      int32(r.Start.Line),
 				Character: int32(r.Start.Character),
 			},
-			End: pb.Position{
+			End: &pb.Position{
 				Line:      int32(r.End.Line),
 				Character: int32(r.End.Character),
 			},

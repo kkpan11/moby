@@ -1,4 +1,4 @@
-package ioutils // import "github.com/docker/docker/pkg/ioutils"
+package ioutils
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"testing/iotest"
 	"time"
 )
 
@@ -31,38 +30,9 @@ func TestReadCloserWrapperClose(t *testing.T) {
 	}
 }
 
-func TestReaderErrWrapperReadOnError(t *testing.T) {
-	called := false
-	expectedErr := errors.New("error reader always fail")
-	wrapper := NewReaderErrWrapper(iotest.ErrReader(expectedErr), func() {
-		called = true
-	})
-	_, err := wrapper.Read([]byte{})
-	if !errors.Is(err, expectedErr) {
-		t.Errorf("expected %v, got: %v", expectedErr, err)
-	}
-	if !called {
-		t.Fatalf("readErrWrapper should have called the anonymous function on failure")
-	}
-}
-
-func TestReaderErrWrapperRead(t *testing.T) {
-	const text = "hello world"
-	wrapper := NewReaderErrWrapper(strings.NewReader(text), func() {
-		t.Fatalf("readErrWrapper should not have called the anonymous function")
-	})
-	num, err := wrapper.Read(make([]byte, len(text)+10))
-	if err != nil {
-		t.Error(err)
-	}
-	if expected := len(text); num != expected {
-		t.Errorf("readerErrWrapper should have read %d byte, but read %d", expected, num)
-	}
-}
-
 type perpetualReader struct{}
 
-func (p *perpetualReader) Read(buf []byte) (n int, err error) {
+func (p *perpetualReader) Read(buf []byte) (int, error) {
 	for i := 0; i != len(buf); i++ {
 		buf[i] = 'a'
 	}
@@ -76,7 +46,7 @@ func TestCancelReadCloser(t *testing.T) {
 	for {
 		var buf [128]byte
 		_, err := crc.Read(buf[:])
-		if err == context.DeadlineExceeded {
+		if errors.Is(err, context.DeadlineExceeded) {
 			break
 		} else if err != nil {
 			t.Fatalf("got unexpected error: %v", err)

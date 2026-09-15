@@ -1,19 +1,21 @@
-package cluster // import "github.com/docker/docker/daemon/cluster"
+package cluster
 
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/containerd/log"
-	types "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/daemon/cluster/convert"
-	"github.com/docker/docker/daemon/cluster/executor/container"
-	lncluster "github.com/docker/docker/libnetwork/cluster"
-	"github.com/docker/docker/libnetwork/cnmallocator"
+	types "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/daemon/cluster/convert"
+	"github.com/moby/moby/v2/daemon/cluster/executor/container"
+	lncluster "github.com/moby/moby/v2/daemon/libnetwork/cluster"
+	"github.com/moby/moby/v2/daemon/libnetwork/cnmallocator"
+	"github.com/moby/moby/v2/internal/sliceutil"
 	swarmapi "github.com/moby/swarmkit/v2/api"
 	"github.com/moby/swarmkit/v2/manager/allocator/networkallocator"
 	swarmnode "github.com/moby/swarmkit/v2/node"
@@ -34,7 +36,7 @@ type nodeRunner struct {
 
 	repeatedRun     bool
 	cancelReconnect func()
-	stopping        bool
+	stopped         bool
 	cluster         *Cluster // only for accessing config helpers, never call any methods. TODO: change to config struct
 }
 
@@ -55,7 +57,7 @@ type nodeStartConfig struct {
 	// DataPathAddr is the address that has to be used for the data path
 	DataPathAddr string
 	// DefaultAddressPool contains list of subnets
-	DefaultAddressPool []string
+	DefaultAddressPool []netip.Prefix
 	// SubnetSize contains subnet size of DefaultAddressPool
 	SubnetSize uint32
 	// DataPathPort contains Data path port (VXLAN UDP port) number that is used for data traffic.
@@ -126,12 +128,12 @@ func (n *nodeRunner) start(conf nodeStartConfig) error {
 		ListenRemoteAPI:    conf.ListenAddr,
 		AdvertiseRemoteAPI: conf.AdvertiseAddr,
 		NetworkConfig: &networkallocator.Config{
-			DefaultAddrPool: conf.DefaultAddressPool,
+			DefaultAddrPool: sliceutil.Map(conf.DefaultAddressPool, (netip.Prefix).String),
 			SubnetSize:      conf.SubnetSize,
 			VXLANUDPPort:    conf.DataPathPort,
 		},
 		JoinAddr:  joinAddr,
-		StateDir:  n.cluster.root,
+		StateDir:  n.cluster.stateDir,
 		JoinToken: conf.joinToken,
 		Executor: container.NewExecutor(
 			n.cluster.config.Backend,
@@ -171,7 +173,7 @@ func (n *nodeRunner) start(conf nodeStartConfig) error {
 		conf.JoinInProgress = true
 	}
 	n.config = conf
-	savePersistentState(n.cluster.root, conf)
+	savePersistentState(n.cluster.stateDir, conf)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -262,7 +264,7 @@ func (n *nodeRunner) handleReadyEvent(ctx context.Context, node *swarmnode.Node,
 		n.err = nil
 		if n.config.JoinInProgress {
 			n.config.JoinInProgress = false
-			savePersistentState(n.cluster.root, n.config)
+			savePersistentState(n.cluster.stateDir, n.config)
 		}
 		n.mu.Unlock()
 		close(ready)
@@ -308,6 +310,7 @@ func (n *nodeRunner) handleNodeExit(node *swarmnode.Node) {
 // Stop stops the current swarm node if it is running.
 func (n *nodeRunner) Stop() error {
 	n.mu.Lock()
+	n.stopped = true
 	if n.cancelReconnect != nil { // between restarts
 		n.cancelReconnect()
 		n.cancelReconnect = nil
@@ -321,15 +324,18 @@ func (n *nodeRunner) Stop() error {
 		n.mu.Unlock()
 		return nil
 	}
-	n.stopping = true
+	swarmNode := n.swarmNode
+	done := n.done
+	n.mu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	n.mu.Unlock()
-	if err := n.swarmNode.Stop(ctx); err != nil && !strings.Contains(err.Error(), "context canceled") {
+
+	if err := swarmNode.Stop(ctx); err != nil && !strings.Contains(err.Error(), "context canceled") {
 		return err
 	}
 	n.cluster.SendClusterEvent(lncluster.EventNodeLeave)
-	<-n.done
+	<-done
 	return nil
 }
 
@@ -361,7 +367,7 @@ func (n *nodeRunner) State() nodeState {
 }
 
 func (n *nodeRunner) enableReconnectWatcher() {
-	if n.stopping {
+	if n.stopped {
 		return
 	}
 	n.reconnectDelay *= 2
@@ -379,7 +385,7 @@ func (n *nodeRunner) enableReconnectWatcher() {
 		}
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if n.stopping {
+		if n.stopped {
 			return
 		}
 

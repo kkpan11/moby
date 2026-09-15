@@ -1,4 +1,4 @@
-package logger // import "github.com/docker/docker/daemon/logger"
+package logger
 
 import (
 	"fmt"
@@ -6,11 +6,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/docker/docker/api/types/plugins/logdriver"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/plugingetter"
-	"github.com/docker/docker/pkg/plugins"
-	"github.com/docker/docker/pkg/stringid"
+	"github.com/moby/moby/v2/daemon/internal/stringid"
+	"github.com/moby/moby/v2/daemon/logger/internal/logdriver"
+	"github.com/moby/moby/v2/errdefs"
+	"github.com/moby/moby/v2/pkg/plugingetter"
+	"github.com/moby/moby/v2/pkg/plugins"
 	"github.com/pkg/errors"
 )
 
@@ -22,7 +22,7 @@ const extName = "LogDriver"
 type logPlugin interface {
 	StartLogging(streamPath string, info Info) (err error)
 	StopLogging(streamPath string) (err error)
-	Capabilities() (cap Capability, err error)
+	Capabilities() (capability Capability, err error)
 	ReadLogs(info Info, config ReadConfig) (stream io.ReadCloser, err error)
 }
 
@@ -68,10 +68,10 @@ func makePluginClient(p plugingetter.CompatPlugin) (logPlugin, error) {
 }
 
 func makePluginCreator(name string, l logPlugin, scopePath func(s string) string) Creator {
-	return func(logCtx Info) (logger Logger, err error) {
+	return func(logCtx Info) (logger Logger, retErr error) {
 		defer func() {
-			if err != nil {
-				pluginGetter.Get(name, extName, plugingetter.Release)
+			if retErr != nil {
+				_, _ = pluginGetter.Get(name, extName, plugingetter.Release)
 			}
 		}()
 
@@ -90,9 +90,9 @@ func makePluginCreator(name string, l logPlugin, scopePath func(s string) string
 			logInfo:    logCtx,
 		}
 
-		cap, err := a.plugin.Capabilities()
+		caps, err := a.plugin.Capabilities()
 		if err == nil {
-			a.capabilities = cap
+			a.capabilities = caps
 		}
 
 		stream, err := openPluginStream(a)
@@ -107,7 +107,7 @@ func makePluginCreator(name string, l logPlugin, scopePath func(s string) string
 			return nil, errors.Wrapf(err, "error creating logger")
 		}
 
-		if cap.ReadLogs {
+		if caps.ReadLogs {
 			return &pluginAdapterWithRead{a}, nil
 		}
 

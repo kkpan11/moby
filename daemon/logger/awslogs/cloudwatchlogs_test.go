@@ -1,9 +1,10 @@
-package awslogs // import "github.com/docker/docker/daemon/logger/awslogs"
+package awslogs
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -19,9 +20,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/loggerutils"
-	"github.com/docker/docker/dockerversion"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/loggerutils"
+	"github.com/moby/moby/v2/dockerversion"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -37,12 +39,12 @@ const (
 
 // Generates i multi-line events each with j lines
 func (l *logStream) logGenerator(lineCount int, multilineCount int) {
-	for i := 0; i < multilineCount; i++ {
+	for range multilineCount {
 		l.Log(&logger.Message{
 			Line:      []byte(multilineLogline),
 			Timestamp: time.Time{},
 		})
-		for j := 0; j < lineCount; j++ {
+		for range lineCount {
 			l.Log(&logger.Message{
 				Line:      []byte(logline),
 				Timestamp: time.Time{},
@@ -120,17 +122,21 @@ func TestNewStreamConfig(t *testing.T) {
 }
 
 func TestNewAWSLogsClientUserAgentHandler(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		userAgent := r.Header.Get("User-Agent")
-		assert.Check(t, is.Contains(userAgent, "Docker/"+dockerversion.Version))
-		fmt.Fprintln(w, "{}")
-	}))
-	defer ts.Close()
+	var userAgent string
+	httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+		userAgent = r.Header.Get("User-Agent")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("{}")),
+			Request:    r,
+		}, nil
+	})
 
 	info := logger.Info{
 		Config: map[string]string{
 			regionKey:   "us-east-1",
-			endpointKey: ts.URL,
+			endpointKey: "http://cloudwatchlogs.test",
 		},
 	}
 
@@ -139,11 +145,13 @@ func TestNewAWSLogsClientUserAgentHandler(t *testing.T) {
 		config.WithCredentialsProvider(credentials.StaticCredentialsProvider{
 			Value: aws.Credentials{AccessKeyID: "AKID", SecretAccessKey: "SECRET", SessionToken: "SESSION"},
 		}),
+		config.WithHTTPClient(httpClient),
 	)
 	assert.NilError(t, err)
 
-	_, err = client.CreateLogGroup(context.TODO(), &cloudwatchlogs.CreateLogGroupInput{LogGroupName: aws.String("foo")})
+	_, err = client.CreateLogGroup(t.Context(), &cloudwatchlogs.CreateLogGroupInput{LogGroupName: aws.String("foo")})
 	assert.NilError(t, err)
+	assert.Check(t, is.Contains(userAgent, "Docker/"+dockerversion.Version))
 }
 
 func TestNewAWSLogsClientLogFormatHeaderHandler(t *testing.T) {
@@ -185,7 +193,7 @@ func TestNewAWSLogsClientLogFormatHeaderHandler(t *testing.T) {
 			)
 			assert.NilError(t, err)
 
-			_, err = client.CreateLogGroup(context.TODO(), &cloudwatchlogs.CreateLogGroupInput{LogGroupName: aws.String("foo")})
+			_, err = client.CreateLogGroup(t.Context(), &cloudwatchlogs.CreateLogGroupInput{LogGroupName: aws.String("foo")})
 			assert.NilError(t, err)
 		})
 	}
@@ -216,7 +224,7 @@ func TestNewAWSLogsClientAWSLogsEndpoint(t *testing.T) {
 	)
 	assert.NilError(t, err)
 
-	_, err = client.CreateLogGroup(context.TODO(), &cloudwatchlogs.CreateLogGroupInput{LogGroupName: aws.String("foo")})
+	_, err = client.CreateLogGroup(t.Context(), &cloudwatchlogs.CreateLogGroupInput{LogGroupName: aws.String("foo")})
 	assert.NilError(t, err)
 
 	// make sure the endpoint was actually hit
@@ -356,9 +364,10 @@ func TestCreateAlreadyExists(t *testing.T) {
 func TestLogClosed(t *testing.T) {
 	mockClient := &mockClient{}
 	stream := &logStream{
-		client: mockClient,
-		closed: true,
+		client:   mockClient,
+		messages: loggerutils.NewMessageQueue(0),
 	}
+	stream.Close()
 	err := stream.Log(&logger.Message{})
 	assert.Check(t, err != nil)
 }
@@ -370,7 +379,7 @@ func TestLogBlocking(t *testing.T) {
 	mockClient := &mockClient{}
 	stream := &logStream{
 		client:   mockClient,
-		messages: make(chan *logger.Message),
+		messages: loggerutils.NewMessageQueue(0),
 	}
 
 	errorCh := make(chan error, 1)
@@ -387,14 +396,11 @@ func TestLogBlocking(t *testing.T) {
 		t.Fatal("Expected stream.Log to block: ", err)
 	default:
 	}
+
 	// assuming it is blocked, we can now try to drain the internal channel and
 	// unblock it
-	select {
-	case <-time.After(10 * time.Millisecond):
-		// if we're unable to drain the channel within 10ms, something seems broken
-		t.Fatal("Expected to be able to read from stream.messages but was unable to")
-	case <-stream.messages:
-	}
+	<-stream.messages.Receiver()
+
 	select {
 	case err := <-errorCh:
 		assert.NilError(t, err)
@@ -408,7 +414,7 @@ func TestLogBufferEmpty(t *testing.T) {
 	mockClient := &mockClient{}
 	stream := &logStream{
 		client:   mockClient,
-		messages: make(chan *logger.Message, 1),
+		messages: loggerutils.NewMessageQueue(1),
 	}
 	err := stream.Log(&logger.Message{})
 	assert.NilError(t, err)
@@ -556,7 +562,7 @@ func TestCollectBatchSimple(t *testing.T) {
 		logGroupName:  groupName,
 		logStreamName: streamName,
 		sequenceToken: aws.String(sequenceToken),
-		messages:      make(chan *logger.Message),
+		messages:      loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	mockClient.putLogEventsFunc = func(ctx context.Context, input *cloudwatchlogs.PutLogEventsInput, opts ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.PutLogEventsOutput, error) {
@@ -575,14 +581,19 @@ func TestCollectBatchSimple(t *testing.T) {
 	close(d)
 	go stream.collectBatch(d)
 
-	stream.Log(&logger.Message{
+	err := stream.Log(&logger.Message{
 		Line:      []byte(logline),
 		Timestamp: time.Time{},
 	})
+	assert.NilError(t, err)
 
 	ticks <- time.Time{}
 	ticks <- time.Time{}
 	stream.Close()
+
+	for len(calls) != 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	assert.Assert(t, len(calls) == 1)
 	argument := calls[0]
@@ -598,7 +609,7 @@ func TestCollectBatchTicker(t *testing.T) {
 		logGroupName:  groupName,
 		logStreamName: streamName,
 		sequenceToken: aws.String(sequenceToken),
-		messages:      make(chan *logger.Message),
+		messages:      loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -666,7 +677,7 @@ func TestCollectBatchMultilinePattern(t *testing.T) {
 		logStreamName:    streamName,
 		multilinePattern: multilinePattern,
 		sequenceToken:    aws.String(sequenceToken),
-		messages:         make(chan *logger.Message),
+		messages:         loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -725,14 +736,14 @@ func TestCollectBatchMultilinePattern(t *testing.T) {
 }
 
 func BenchmarkCollectBatch(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		mockClient := &mockClient{}
 		stream := &logStream{
 			client:        mockClient,
 			logGroupName:  groupName,
 			logStreamName: streamName,
 			sequenceToken: aws.String(sequenceToken),
-			messages:      make(chan *logger.Message),
+			messages:      loggerutils.NewMessageQueue(0),
 		}
 		mockClient.putLogEventsFunc = func(ctx context.Context, input *cloudwatchlogs.PutLogEventsInput, opts ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.PutLogEventsOutput, error) {
 			return &cloudwatchlogs.PutLogEventsOutput{
@@ -756,7 +767,7 @@ func BenchmarkCollectBatch(b *testing.B) {
 }
 
 func BenchmarkCollectBatchMultilinePattern(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		mockClient := &mockClient{}
 		multilinePattern := regexp.MustCompile(`\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[1,2][0-9]|3[0,1]) (?:[0,1][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]`)
 		stream := &logStream{
@@ -765,7 +776,7 @@ func BenchmarkCollectBatchMultilinePattern(b *testing.B) {
 			logStreamName:    streamName,
 			multilinePattern: multilinePattern,
 			sequenceToken:    aws.String(sequenceToken),
-			messages:         make(chan *logger.Message),
+			messages:         loggerutils.NewMessageQueue(0),
 		}
 		mockClient.putLogEventsFunc = func(ctx context.Context, input *cloudwatchlogs.PutLogEventsInput, opts ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.PutLogEventsOutput, error) {
 			return &cloudwatchlogs.PutLogEventsOutput{
@@ -796,7 +807,7 @@ func TestCollectBatchMultilinePatternMaxEventAge(t *testing.T) {
 		logStreamName:    streamName,
 		multilinePattern: multilinePattern,
 		sequenceToken:    aws.String(sequenceToken),
-		messages:         make(chan *logger.Message),
+		messages:         loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -870,7 +881,7 @@ func TestCollectBatchMultilinePatternNegativeEventAge(t *testing.T) {
 		logStreamName:    streamName,
 		multilinePattern: multilinePattern,
 		sequenceToken:    aws.String(sequenceToken),
-		messages:         make(chan *logger.Message),
+		messages:         loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -927,7 +938,7 @@ func TestCollectBatchMultilinePatternMaxEventSize(t *testing.T) {
 		logStreamName:    streamName,
 		multilinePattern: multilinePattern,
 		sequenceToken:    aws.String(sequenceToken),
-		messages:         make(chan *logger.Message),
+		messages:         loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -987,7 +998,7 @@ func TestCollectBatchClose(t *testing.T) {
 		logGroupName:  groupName,
 		logStreamName: streamName,
 		sequenceToken: aws.String(sequenceToken),
-		messages:      make(chan *logger.Message),
+		messages:      loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -1089,7 +1100,7 @@ func TestCollectBatchLineSplit(t *testing.T) {
 		logGroupName:  groupName,
 		logStreamName: streamName,
 		sequenceToken: aws.String(sequenceToken),
-		messages:      make(chan *logger.Message),
+		messages:      loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -1137,7 +1148,7 @@ func TestCollectBatchLineSplitWithBinary(t *testing.T) {
 		logGroupName:  groupName,
 		logStreamName: streamName,
 		sequenceToken: aws.String(sequenceToken),
-		messages:      make(chan *logger.Message),
+		messages:      loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -1185,7 +1196,7 @@ func TestCollectBatchMaxEvents(t *testing.T) {
 		logGroupName:  groupName,
 		logStreamName: streamName,
 		sequenceToken: aws.String(sequenceToken),
-		messages:      make(chan *logger.Message),
+		messages:      loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -1239,7 +1250,7 @@ func TestCollectBatchMaxTotalBytes(t *testing.T) {
 		logGroupName:  groupName,
 		logStreamName: streamName,
 		sequenceToken: aws.String(sequenceToken),
-		messages:      make(chan *logger.Message),
+		messages:      loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -1285,7 +1296,7 @@ func TestCollectBatchMaxTotalBytes(t *testing.T) {
 	// no ticks, guarantee batch by size (and chan close)
 	stream.Close()
 
-	for i := 0; i < expectedPuts; i++ {
+	for range expectedPuts {
 		<-called
 	}
 	assert.Assert(t, len(calls) == expectedPuts)
@@ -1320,7 +1331,7 @@ func TestCollectBatchMaxTotalBytesWithBinary(t *testing.T) {
 		logGroupName:  groupName,
 		logStreamName: streamName,
 		sequenceToken: aws.String(sequenceToken),
-		messages:      make(chan *logger.Message),
+		messages:      loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -1361,7 +1372,7 @@ func TestCollectBatchMaxTotalBytesWithBinary(t *testing.T) {
 	// no ticks, guarantee batch by size (and chan close)
 	stream.Close()
 
-	for i := 0; i < expectedPuts; i++ {
+	for range expectedPuts {
 		<-called
 	}
 	assert.Assert(t, len(calls) == expectedPuts)
@@ -1394,7 +1405,7 @@ func TestCollectBatchWithDuplicateTimestamps(t *testing.T) {
 		logGroupName:  groupName,
 		logStreamName: streamName,
 		sequenceToken: aws.String(sequenceToken),
-		messages:      make(chan *logger.Message),
+		messages:      loggerutils.NewMessageQueue(0),
 	}
 	calls := make([]*cloudwatchlogs.PutLogEventsInput, 0)
 	called := make(chan struct{}, 50)
@@ -1419,7 +1430,7 @@ func TestCollectBatchWithDuplicateTimestamps(t *testing.T) {
 	var expectedEvents []types.InputLogEvent
 	times := maximumLogEventsPerPut
 	timestamp := time.Now()
-	for i := 0; i < times; i++ {
+	for i := range times {
 		line := strconv.Itoa(i)
 		if i%2 == 0 {
 			timestamp = timestamp.Add(1 * time.Nanosecond)
@@ -1443,7 +1454,7 @@ func TestCollectBatchWithDuplicateTimestamps(t *testing.T) {
 	close(called)
 	assert.Assert(t, argument != nil)
 	assert.Assert(t, len(argument.LogEvents) == times)
-	for i := 0; i < times; i++ {
+	for i := range times {
 		if !reflect.DeepEqual(argument.LogEvents[i], expectedEvents[i]) {
 			t.Errorf("Expected event to be %v but was %v", expectedEvents[i], argument.LogEvents[i])
 		}
@@ -1597,12 +1608,37 @@ func TestValidateLogOptionsFormat(t *testing.T) {
 	}
 }
 
+func TestValidateLogOptionsCreateLogStream(t *testing.T) {
+	for _, tc := range []struct {
+		createLogStream string
+		shouldErr       bool
+	}{
+		{"true", false},
+		{"false", false},
+		{"", false},
+		{"invalid", true},
+	} {
+		t.Run(tc.createLogStream, func(t *testing.T) {
+			cfg := map[string]string{
+				logGroupKey:        groupName,
+				logCreateStreamKey: tc.createLogStream,
+			}
+
+			if err := ValidateLogOpt(cfg); tc.shouldErr {
+				assert.ErrorContains(t, err, "must specify valid value for log opt 'awslogs-create-stream'")
+			} else {
+				assert.NilError(t, err)
+			}
+		})
+	}
+}
+
 func TestCreateTagSuccess(t *testing.T) {
 	mockClient := &mockClient{}
 	info := logger.Info{
 		ContainerName: "/test-container",
 		ContainerID:   "container-abcdefghijklmnopqrstuvwxyz01234567890",
-		Config:        map[string]string{"tag": "{{.Name}}/{{.FullID}}"},
+		Config:        map[string]string{logger.AttrLogTag: "{{.Name}}/{{.FullID}}"},
 	}
 	logStreamName, e := loggerutils.ParseLogTag(info, loggerutils.DefaultTemplate)
 	if e != nil {
@@ -1631,24 +1667,347 @@ func TestCreateTagSuccess(t *testing.T) {
 
 func BenchmarkUnwrapEvents(b *testing.B) {
 	events := make([]wrappedEvent, maximumLogEventsPerPut)
-	for i := 0; i < maximumLogEventsPerPut; i++ {
+	for i := range maximumLogEventsPerPut {
 		mes := strings.Repeat("0", maximumBytesPerEvent)
 		events[i].inputLogEvent = types.InputLogEvent{
 			Message: &mes,
 		}
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		res := unwrapEvents(events)
 		assert.Check(b, is.Len(res, maximumLogEventsPerPut))
 	}
+}
+
+func TestNewStreamConfigEntity(t *testing.T) {
+	tests := []struct {
+		testName      string
+		containerName string
+		config        map[string]string
+		shouldErr     bool
+		wantNil       bool
+		wantKeyAttr   map[string]string
+		wantAttr      map[string]string
+	}{
+		{
+			testName: "no entity options",
+			config:   map[string]string{logGroupKey: groupName},
+			wantNil:  true,
+		},
+		{
+			testName: "service name and environment",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+				entityEnvironmentKey: "prod",
+			},
+			wantKeyAttr: map[string]string{"Type": "Service", "Name": "my-service", "Environment": "prod"},
+		},
+		{
+			testName:      "templated service name",
+			containerName: "/test-container",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "{{.Name}}",
+				entityEnvironmentKey: "prod",
+			},
+			wantKeyAttr: map[string]string{"Type": "Service", "Name": "test-container", "Environment": "prod"},
+		},
+		{
+			testName: "with attributes",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+				entityEnvironmentKey: "prod",
+				entityAttributesKey:  "PlatformType=Generic, Host=worker-7 ,K8s.Cluster=foo=bar",
+			},
+			wantKeyAttr: map[string]string{"Type": "Service", "Name": "my-service", "Environment": "prod"},
+			wantAttr:    map[string]string{"PlatformType": "Generic", "Host": "worker-7", "K8s.Cluster": "foo=bar"},
+		},
+		{
+			testName: "attributes containing commas",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+				entityEnvironmentKey: "prod",
+				entityAttributesKey:  `"Telemetry.SDK=opentelemetry,1.32.0-aws-SNAPSHOT,java,Auto","Telemetry.Source=ClientSpan, JMX"`,
+			},
+			wantKeyAttr: map[string]string{"Type": "Service", "Name": "my-service", "Environment": "prod"},
+			wantAttr: map[string]string{
+				"Telemetry.SDK":    "opentelemetry,1.32.0-aws-SNAPSHOT,java,Auto",
+				"Telemetry.Source": "ClientSpan, JMX",
+			},
+		},
+		{
+			testName: "multi-byte service name within character limit",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: strings.Repeat("界", maxEntityValue),
+				entityEnvironmentKey: "prod",
+			},
+			wantKeyAttr: map[string]string{"Type": "Service", "Name": strings.Repeat("界", maxEntityValue), "Environment": "prod"},
+		},
+		{
+			testName: "trailing comma in attributes is tolerated",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+				entityEnvironmentKey: "prod",
+				entityAttributesKey:  "Host=worker-7,",
+			},
+			wantKeyAttr: map[string]string{"Type": "Service", "Name": "my-service", "Environment": "prod"},
+			wantAttr:    map[string]string{"Host": "worker-7"},
+		},
+		{
+			testName: "service name without environment",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+			},
+			shouldErr: true,
+		},
+		{
+			testName: "malformed attribute pair",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+				entityEnvironmentKey: "prod",
+				entityAttributesKey:  "PlatformType",
+			},
+			shouldErr: true,
+		},
+		{
+			testName: "invalid template field in service name",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "{{.Nope}}",
+				entityEnvironmentKey: "prod",
+			},
+			shouldErr: true,
+		},
+		{
+			testName: "invalid template field in environment",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+				entityEnvironmentKey: "{{.Nope}}",
+			},
+			shouldErr: true,
+		},
+		{
+			testName: "malformed template syntax",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "{{.Name",
+				entityEnvironmentKey: "prod",
+			},
+			shouldErr: true,
+		},
+		{
+			testName: "service name resolves to empty value",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "{{.Name}}",
+				entityEnvironmentKey: "prod",
+			},
+			// containerName is left empty, so {{.Name}} resolves to ""
+			shouldErr: true,
+		},
+		{
+			testName: "service name exceeds length limit",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: strings.Repeat("x", maxEntityValue+1),
+				entityEnvironmentKey: "prod",
+			},
+			shouldErr: true,
+		},
+		{
+			testName: "environment exceeds length limit",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+				entityEnvironmentKey: strings.Repeat("x", maxEntityValue+1),
+			},
+			shouldErr: true,
+		},
+		{
+			testName: "blank-only attributes resolve to no attributes",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+				entityEnvironmentKey: "prod",
+				entityAttributesKey:  ", ,",
+			},
+			wantKeyAttr: map[string]string{"Type": "Service", "Name": "my-service", "Environment": "prod"},
+			wantAttr:    nil,
+		},
+		{
+			testName: "duplicate attribute key",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "my-service",
+				entityEnvironmentKey: "prod",
+				entityAttributesKey:  "Host=a,Host=b",
+			},
+			shouldErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.testName, func(t *testing.T) {
+			info := logger.Info{
+				ContainerName: tc.containerName,
+				Config:        tc.config,
+			}
+			streamConfig, err := newStreamConfig(info)
+			if tc.shouldErr {
+				assert.Check(t, err != nil, "Expected an error")
+				return
+			}
+			assert.NilError(t, err)
+			if tc.wantNil {
+				assert.Check(t, is.Nil(streamConfig.entity))
+				return
+			}
+			assert.Assert(t, streamConfig.entity != nil)
+			assert.DeepEqual(t, tc.wantKeyAttr, streamConfig.entity.KeyAttributes)
+			assert.DeepEqual(t, tc.wantAttr, streamConfig.entity.Attributes)
+		})
+	}
+}
+
+func TestValidateLogOptEntity(t *testing.T) {
+	tests := []struct {
+		testName  string
+		config    map[string]string
+		shouldErr bool
+	}{
+		{
+			testName: "both key attributes set",
+			config:   map[string]string{logGroupKey: groupName, entityServiceNameKey: "svc", entityEnvironmentKey: "prod"},
+		},
+		{
+			testName:  "only service name set",
+			config:    map[string]string{logGroupKey: groupName, entityServiceNameKey: "svc"},
+			shouldErr: true,
+		},
+		{
+			testName:  "only environment set",
+			config:    map[string]string{logGroupKey: groupName, entityEnvironmentKey: "prod"},
+			shouldErr: true,
+		},
+		{
+			testName: "valid attributes",
+			config:   map[string]string{logGroupKey: groupName, entityServiceNameKey: "svc", entityEnvironmentKey: "prod", entityAttributesKey: "a=1,b=2"},
+		},
+		{
+			testName:  "malformed attributes",
+			config:    map[string]string{logGroupKey: groupName, entityServiceNameKey: "svc", entityEnvironmentKey: "prod", entityAttributesKey: "a"},
+			shouldErr: true,
+		},
+		{
+			testName:  "too many attributes",
+			config:    map[string]string{logGroupKey: groupName, entityServiceNameKey: "svc", entityEnvironmentKey: "prod", entityAttributesKey: "a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8,i=9,j=10,k=11"},
+			shouldErr: true,
+		},
+		{
+			testName:  "attribute value too long",
+			config:    map[string]string{logGroupKey: groupName, entityServiceNameKey: "svc", entityEnvironmentKey: "prod", entityAttributesKey: "a=" + strings.Repeat("x", maxEntityValue+1)},
+			shouldErr: true,
+		},
+		{
+			testName: "multi-byte attribute key and value within character limits",
+			config: map[string]string{
+				logGroupKey:          groupName,
+				entityServiceNameKey: "svc",
+				entityEnvironmentKey: "prod",
+				entityAttributesKey:  strings.Repeat("界", maxAttributeKey) + "=" + strings.Repeat("界", maxEntityValue),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.testName, func(t *testing.T) {
+			err := ValidateLogOpt(tc.config)
+			if tc.shouldErr {
+				assert.Check(t, err != nil, "Expected an error")
+			} else {
+				assert.NilError(t, err)
+			}
+		})
+	}
+}
+
+func TestPublishBatchEntity(t *testing.T) {
+	mockClient := &mockClient{}
+	entity := &types.Entity{
+		KeyAttributes: map[string]string{"Type": "Service", "Name": "my-service", "Environment": "prod"},
+		Attributes:    map[string]string{"PlatformType": "Generic"},
+	}
+	stream := &logStream{
+		client:        mockClient,
+		logGroupName:  groupName,
+		logStreamName: streamName,
+		sequenceToken: aws.String(sequenceToken),
+		entity:        entity,
+	}
+	var input *cloudwatchlogs.PutLogEventsInput
+	mockClient.putLogEventsFunc = func(ctx context.Context, i *cloudwatchlogs.PutLogEventsInput, opts ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.PutLogEventsOutput, error) {
+		input = i
+		return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: aws.String(nextSequenceToken)}, nil
+	}
+	events := []wrappedEvent{
+		{inputLogEvent: types.InputLogEvent{Message: aws.String(logline)}},
+	}
+
+	stream.publishBatch(testEventBatch(events))
+	assert.Assert(t, input != nil)
+	assert.Assert(t, input.Entity != nil)
+	assert.DeepEqual(t, entity.KeyAttributes, input.Entity.KeyAttributes)
+	assert.DeepEqual(t, entity.Attributes, input.Entity.Attributes)
+}
+
+func TestPublishBatchEntityRejected(t *testing.T) {
+	mockClient := &mockClient{}
+	stream := &logStream{
+		client:        mockClient,
+		logGroupName:  groupName,
+		logStreamName: streamName,
+		sequenceToken: aws.String(sequenceToken),
+		entity: &types.Entity{
+			KeyAttributes: map[string]string{"Type": "Service", "Name": "my-service", "Environment": "prod"},
+		},
+	}
+	var inputs []*cloudwatchlogs.PutLogEventsInput
+	mockClient.putLogEventsFunc = func(ctx context.Context, i *cloudwatchlogs.PutLogEventsInput, opts ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.PutLogEventsOutput, error) {
+		inputs = append(inputs, i)
+		output := &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: aws.String(nextSequenceToken)}
+		if i.Entity != nil {
+			output.RejectedEntityInfo = &types.RejectedEntityInfo{ErrorType: types.EntityRejectionErrorTypeInvalidEntity}
+		}
+		return output, nil
+	}
+	events := []wrappedEvent{
+		{inputLogEvent: types.InputLogEvent{Message: aws.String(logline)}},
+	}
+
+	batch := testEventBatch(events)
+	stream.publishBatch(batch)
+	stream.publishBatch(batch)
+
+	assert.Equal(t, nextSequenceToken, aws.ToString(stream.sequenceToken), "sequenceToken")
+	assert.Equal(t, len(inputs), 2)
+	assert.Assert(t, inputs[0].Entity != nil)
+	assert.Check(t, is.Nil(inputs[1].Entity))
 }
 
 func TestNewAWSLogsClientCredentialEndpointDetect(t *testing.T) {
 	// required for the cloudwatchlogs client
 	t.Setenv("AWS_REGION", "us-west-2")
 
+	// #nosec G101 -- ignore potential hardcoded credentials
 	credsResp := `{
 		"AccessKeyId" :    "test-access-key-id",
 		"SecretAccessKey": "test-secret-access-key"
@@ -1684,7 +2043,7 @@ func TestNewAWSLogsClientCredentialEndpointDetect(t *testing.T) {
 	client, err := newAWSLogsClient(info)
 	assert.Check(t, err)
 
-	_, err = client.CreateLogGroup(context.TODO(), &cloudwatchlogs.CreateLogGroupInput{LogGroupName: aws.String("foo")})
+	_, err = client.CreateLogGroup(t.Context(), &cloudwatchlogs.CreateLogGroupInput{LogGroupName: aws.String("foo")})
 	assert.NilError(t, err)
 
 	assert.Check(t, credsRetrieved)

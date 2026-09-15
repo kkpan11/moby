@@ -8,29 +8,29 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/cli/build"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli/build"
 	"gotest.tools/v3/assert"
-	"gotest.tools/v3/assert/cmp"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 type DockerCLIHistorySuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerCLIHistorySuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIHistorySuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIHistorySuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIHistorySuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 // This is a heisen-test.  Because the created timestamp of images and the behavior of
 // sort is not predictable it doesn't always fail.
 func (s *DockerCLIHistorySuite) TestBuildHistory(c *testing.T) {
 	const name = "testbuildhistory"
-	buildImageSuccessfully(c, name, build.WithDockerfile(`FROM `+minimalBaseImage()+`
+	cli.BuildCmd(c, name, build.WithDockerfile(`FROM `+minimalBaseImage()+`
 LABEL label.A="A"
 LABEL label.B="B"
 LABEL label.C="C"
@@ -62,10 +62,10 @@ LABEL label.Z="Z"`))
 	actualValues := strings.Split(out, "\n")[1:27]
 	expectedValues := [26]string{"Z", "Y", "X", "W", "V", "U", "T", "S", "R", "Q", "P", "O", "N", "M", "L", "K", "J", "I", "H", "G", "F", "E", "D", "C", "B", "A"}
 
-	for i := 0; i < 26; i++ {
+	for i := range 26 {
 		echoValue := fmt.Sprintf("LABEL label.%s=%s", expectedValues[i], expectedValues[i])
 		actualValue := actualValues[i]
-		assert.Assert(c, strings.Contains(actualValue, echoValue))
+		assert.Assert(c, is.Contains(actualValue, echoValue))
 	}
 }
 
@@ -92,7 +92,7 @@ func (s *DockerCLIHistorySuite) TestHistoryImageWithComment(c *testing.T) {
 	out := cli.DockerCmd(c, "history", name).Combined()
 	outputTabs := strings.Fields(strings.Split(out, "\n")[1])
 	actualValue := outputTabs[len(outputTabs)-1]
-	assert.Assert(c, strings.Contains(actualValue, comment))
+	assert.Assert(c, is.Contains(actualValue, comment))
 }
 
 func (s *DockerCLIHistorySuite) TestHistoryHumanOptionFalse(c *testing.T) {
@@ -126,7 +126,7 @@ func (s *DockerCLIHistorySuite) TestHistoryHumanOptionTrue(c *testing.T) {
 			endIndex = len(lines[i])
 		}
 		sizeString := lines[i][startIndex:endIndex]
-		assert.Assert(c, cmp.Regexp("^"+humanSizeRegexRaw+"$",
+		assert.Assert(c, is.Regexp("^"+humanSizeRegexRaw+"$",
 			strings.TrimSpace(sizeString)), fmt.Sprintf("The size '%s' was not in human format", sizeString))
 	}
 }

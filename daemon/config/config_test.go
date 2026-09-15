@@ -1,20 +1,22 @@
-package config // import "github.com/docker/docker/daemon/config"
+package config
 
 import (
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
 	"dario.cat/mergo"
-	"github.com/docker/docker/api"
-	"github.com/docker/docker/libnetwork/ipamutils"
-	"github.com/docker/docker/opts"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/moby/moby/v2/daemon/libnetwork/ipamutils"
+	"github.com/moby/moby/v2/daemon/pkg/opts"
+	"github.com/moby/moby/v2/daemon/pkg/registry"
 	"github.com/spf13/pflag"
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/unicode"
@@ -36,11 +38,85 @@ func TestDaemonConfigurationNotFound(t *testing.T) {
 	assert.Check(t, os.IsNotExist(err), "got: %[1]T: %[1]v", err)
 }
 
-func TestDaemonBrokenConfiguration(t *testing.T) {
-	configFile := makeConfigFile(t, `{"Debug": tru`)
+func TestDaemonConfigurationMalformedJSON(t *testing.T) {
+	configFile := makeConfigFile(t, `{"debug": tru`)
 
 	_, err := MergeDaemonConfigurations(&Config{}, nil, configFile)
-	assert.ErrorContains(t, err, `invalid character ' ' in literal true`)
+	assert.Check(t, is.ErrorContains(err, "invalid JSON"))
+	var syntaxErr *json.SyntaxError
+	assert.Check(t, errors.As(err, &syntaxErr), `got: %[1]T: %[1]v`, err)
+}
+
+func TestDaemonConfigurationExtensionConfig(t *testing.T) {
+	configFile := makeConfigFile(t, `{
+		"extension-config": {
+			"org.example.foo.v1": {"plugin_path": "/opt/foo", "enabled": true},
+			"com.docker.compose.v1": {"workers": 4}
+		}
+	}`)
+	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	cfg, err := MergeDaemonConfigurations(&Config{}, flags, configFile)
+	assert.NilError(t, err)
+	assert.DeepEqual(t, cfg.ExtensionConfig, ExtensionConfigs{
+		{ID: "org.example.foo.v1", Config: map[string]any{
+			"plugin_path": "/opt/foo",
+			"enabled":     true,
+		}},
+		{ID: "com.docker.compose.v1", Config: map[string]any{
+			"workers": float64(4),
+		}},
+	})
+}
+
+func TestExtensionConfigsMarshalOrder(t *testing.T) {
+	configs := ExtensionConfigs{
+		{ID: "org.example.first.v1", Config: map[string]any{"name": "first"}},
+		{ID: "org.example.second.v1", Config: map[string]any{"name": "second"}},
+	}
+
+	encoded, err := json.Marshal(configs)
+	assert.NilError(t, err)
+	assert.Equal(t, string(encoded), `{"org.example.first.v1":{"name":"first"},"org.example.second.v1":{"name":"second"}}`)
+}
+
+func TestExtensionConfigsNullAndEmpty(t *testing.T) {
+	var configs ExtensionConfigs
+	assert.NilError(t, json.Unmarshal([]byte(`null`), &configs))
+	assert.Assert(t, configs == nil)
+
+	assert.NilError(t, json.Unmarshal([]byte(`{}`), &configs))
+	assert.Assert(t, configs != nil)
+	assert.Equal(t, len(configs), 0)
+
+	encoded, err := json.Marshal(configs)
+	assert.NilError(t, err)
+	assert.Equal(t, string(encoded), `{}`)
+
+	configs = nil
+	encoded, err = json.Marshal(configs)
+	assert.NilError(t, err)
+	assert.Equal(t, string(encoded), `null`)
+}
+
+func TestDaemonConfigurationInvalidExtensionConfigID(t *testing.T) {
+	configFile := makeConfigFile(t, `{
+		"extension-config": {
+			"org.example.foo": {"enabled": true}
+		}
+	}`)
+
+	_, err := MergeDaemonConfigurations(&Config{}, nil, configFile)
+	assert.ErrorContains(t, err, `invalid extension-config key "org.example.foo"`)
+}
+
+func TestDaemonConfigurationExtensionDirs(t *testing.T) {
+	configFile := makeConfigFile(t, `{
+		"extension-dirs": ["/opt/extensions/one", "/opt/extensions/two"]
+	}`)
+
+	cfg, err := MergeDaemonConfigurations(&Config{}, nil, configFile)
+	assert.NilError(t, err)
+	assert.DeepEqual(t, cfg.ExtensionDirs, []string{"/opt/extensions/one", "/opt/extensions/two"})
 }
 
 // TestDaemonConfigurationUnicodeVariations feeds various variations of Unicode into the JSON parser, ensuring that we
@@ -93,7 +169,7 @@ func TestDaemonConfigurationInvalidUnicode(t *testing.T) {
 }
 
 func TestFindConfigurationConflicts(t *testing.T) {
-	config := map[string]interface{}{"authorization-plugins": "foobar"}
+	config := map[string]any{"authorization-plugins": "foobar"}
 	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
 
 	flags.String("authorization-plugins", "", "")
@@ -102,7 +178,7 @@ func TestFindConfigurationConflicts(t *testing.T) {
 }
 
 func TestFindConfigurationConflictsWithNamedOptions(t *testing.T) {
-	config := map[string]interface{}{"hosts": []string{"qwer"}}
+	config := map[string]any{"hosts": []string{"qwer"}}
 	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
 
 	var hosts []string
@@ -140,6 +216,42 @@ func TestDaemonConfigurationMergeConcurrentError(t *testing.T) {
 
 	_, err := MergeDaemonConfigurations(&Config{}, nil, configFile)
 	assert.ErrorContains(t, err, `invalid max concurrent downloads: -1`)
+}
+
+func TestDefaultStopTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		config   string
+		expected int
+	}{
+		{
+			name:     "positive",
+			config:   `{"default-stop-timeout": 42}`,
+			expected: 42,
+		},
+		{
+			name:     "zero",
+			config:   `{"default-stop-timeout": 0}`,
+			expected: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configFile := makeConfigFile(t, tc.config)
+			flagsConfig := &Config{
+				CommonConfig: CommonConfig{
+					ContainerDefaults: ContainerDefaults{
+						DefaultStopTimeout: 20,
+					},
+				},
+			}
+			flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			flags.IntVar(&flagsConfig.DefaultStopTimeout, "default-stop-timeout", flagsConfig.DefaultStopTimeout, "")
+
+			merged, err := MergeDaemonConfigurations(flagsConfig, flags, configFile)
+			assert.NilError(t, err)
+			assert.Equal(t, merged.DefaultStopTimeout, tc.expected)
+		})
+	}
 }
 
 func TestDaemonConfigurationMergeConflictsWithInnerStructs(t *testing.T) {
@@ -194,7 +306,7 @@ func TestDaemonConfigurationMergeDefaultAddressPools(t *testing.T) {
 }
 
 func TestFindConfigurationConflictsWithUnknownKeys(t *testing.T) {
-	config := map[string]interface{}{"tls-verify": "true"}
+	config := map[string]any{"tls-verify": "true"}
 	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
 
 	flags.Bool("tlsverify", false, "")
@@ -204,7 +316,7 @@ func TestFindConfigurationConflictsWithUnknownKeys(t *testing.T) {
 
 func TestFindConfigurationConflictsWithMergedValues(t *testing.T) {
 	var hosts []string
-	config := map[string]interface{}{"hosts": "tcp://127.0.0.1:2345"}
+	config := map[string]any{"hosts": "tcp://127.0.0.1:2345"}
 	flags := pflag.NewFlagSet("base", pflag.ContinueOnError)
 	flags.VarP(opts.NewNamedListOptsRef("hosts", &hosts, nil), "host", "H", "")
 
@@ -221,6 +333,7 @@ func TestValidateConfigurationErrors(t *testing.T) {
 		name        string
 		field       string
 		config      *Config
+		platform    string
 		expectedErr string
 	}{
 		{
@@ -231,6 +344,16 @@ func TestValidateConfigurationErrors(t *testing.T) {
 				},
 			},
 			expectedErr: "bad attribute format: one",
+		},
+		{
+			name: "embedded-containerd with cri-containerd",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					Features:      map[string]bool{"embedded-containerd": true},
+					CriContainerd: true,
+				},
+			},
+			expectedErr: errEmbeddedContainerdWithCRI.Error(),
 		},
 		{
 			name: "multiple label without value",
@@ -303,6 +426,17 @@ func TestValidateConfigurationErrors(t *testing.T) {
 			},
 			expectedErr: "invalid max download attempts: -10",
 		},
+		{
+			name: "invalid default-stop-timeout",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ContainerDefaults: ContainerDefaults{
+						DefaultStopTimeout: -1,
+					},
+				},
+			},
+			expectedErr: "invalid default stop timeout: -1",
+		},
 		// TODO(thaJeztah) temporarily excluding this test as it assumes defaults are set before validating and applying updated configs
 		/*
 			{
@@ -316,6 +450,24 @@ func TestValidateConfigurationErrors(t *testing.T) {
 				expectedErr: "invalid max download attempts: 0",
 			},
 		*/
+		{
+			name: "negative network-diagnostic-port",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					NetworkDiagnosticPort: -1,
+				},
+			},
+			expectedErr: "invalid network-diagnostic-port (-1): value must be between 0 and 65535",
+		},
+		{
+			name: "network-diagnostic-port out of range",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					NetworkDiagnosticPort: 65536,
+				},
+			},
+			expectedErr: "invalid network-diagnostic-port (65536): value must be between 0 and 65535",
+		},
 		{
 			name: "generic resource without =",
 			config: &Config{
@@ -347,10 +499,77 @@ func TestValidateConfigurationErrors(t *testing.T) {
 			name: "with invalid log-level",
 			config: &Config{
 				CommonConfig: CommonConfig{
-					LogLevel: "foobar",
+					DaemonLogConfig: DaemonLogConfig{LogLevel: "foobar"},
 				},
 			},
 			expectedErr: "invalid logging level: foobar",
+		},
+		{
+			name: "exec-opt without value",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"no-value"},
+				},
+			},
+			expectedErr: "invalid exec-opt (no-value): must be formatted 'opt=value'",
+		},
+		{
+			name: "exec-opt with empty value",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"empty-value="},
+				},
+			},
+			expectedErr: "invalid exec-opt (empty-value=): must be formatted 'opt=value'",
+		},
+		{
+			name: "exec-opt without key",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"=empty-key"},
+				},
+			},
+			expectedErr: "invalid exec-opt (=empty-key): must be formatted 'opt=value'",
+		},
+		{
+			name: "exec-opt unknown option",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"unknown-option=any-value"},
+				},
+			},
+			expectedErr: "invalid exec-opt (unknown-option=any-value): unknown option: 'unknown-option'",
+		},
+		{
+			name: "exec-opt invalid on linux",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"isolation=default"},
+				},
+			},
+			platform:    "linux",
+			expectedErr: "invalid exec-opt (isolation=default): option 'isolation' is only supported on windows",
+		},
+		{
+			name: "exec-opt invalid on windows",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"native.cgroupdriver=systemd"},
+				},
+			},
+			platform:    "windows",
+			expectedErr: "invalid exec-opt (native.cgroupdriver=systemd): option 'native.cgroupdriver' is only supported on linux",
+		},
+		{
+			name: "invalid mirror",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ServiceOptions: registry.ServiceOptions{
+						Mirrors: []string{"ftp://example.com"},
+					},
+				},
+			},
+			expectedErr: `invalid mirror: unsupported scheme "ftp" in "ftp://example.com": must use either 'https://' or 'http://'`,
 		},
 	}
 	for _, tc := range testCases {
@@ -363,9 +582,24 @@ func TestValidateConfigurationErrors(t *testing.T) {
 				assert.Check(t, mergo.Merge(cfg, tc.config, mergo.WithOverride))
 			}
 			err = Validate(cfg)
-			assert.Error(t, err, tc.expectedErr)
+			if tc.platform != "" && tc.platform != runtime.GOOS {
+				assert.NilError(t, err)
+			} else {
+				assert.Error(t, err, tc.expectedErr)
+			}
 		})
 	}
+}
+
+func TestValidateEmbeddedContainerdAllowsExplicitAddr(t *testing.T) {
+	cfg := &Config{
+		CommonConfig: CommonConfig{
+			Features:       map[string]bool{"embedded-containerd": true},
+			ContainerdAddr: "/run/containerd/containerd.sock",
+		},
+	}
+
+	assert.NilError(t, Validate(cfg))
 }
 
 func withForceOverwrite(fieldName string) func(config *mergo.Config) {
@@ -377,7 +611,7 @@ type overwriteTransformer struct {
 }
 
 func (tf overwriteTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
-	if typ == reflect.TypeOf(CommonConfig{}) {
+	if typ == reflect.TypeFor[CommonConfig]() {
 		return func(dst, src reflect.Value) error {
 			dst.FieldByName(tf.fieldName).Set(src.FieldByName(tf.fieldName))
 			return nil
@@ -484,7 +718,7 @@ func TestValidateConfiguration(t *testing.T) {
 			field: "LogLevel",
 			config: &Config{
 				CommonConfig: CommonConfig{
-					LogLevel: "warn",
+					DaemonLogConfig: DaemonLogConfig{LogLevel: "warn"},
 				},
 			},
 		},
@@ -542,12 +776,11 @@ func TestValidateMinAPIVersion(t *testing.T) {
 		},
 		{
 			doc:   "current version",
-			input: api.DefaultVersion,
+			input: MaxAPIVersion,
 		},
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			err := ValidateMinAPIVersion(tc.input)
 			if tc.expectedErr != "" {
@@ -555,6 +788,26 @@ func TestValidateMinAPIVersion(t *testing.T) {
 			} else {
 				assert.Check(t, err)
 			}
+		})
+	}
+}
+
+func TestConfigDNS(t *testing.T) {
+	tests := []struct {
+		doc   string
+		input string
+	}{
+		{
+			doc:   "IPv6s with scope IDs",
+			input: `{"dns": ["::1%eth0", "::1%2"]}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.doc, func(t *testing.T) {
+			var cfg Config
+			err := json.Unmarshal([]byte(tc.input), &cfg)
+			assert.Check(t, err == nil, "type: %T", err)
 		})
 	}
 }
@@ -568,27 +821,31 @@ func TestConfigInvalidDNS(t *testing.T) {
 		{
 			doc:         "single DNS, invalid IP-address",
 			input:       `{"dns": ["1.1.1.1o"]}`,
-			expectedErr: `invalid IP address: 1.1.1.1o`,
+			expectedErr: `ParseAddr("1.1.1.1o"): unexpected character (at "o")`,
 		},
 		{
 			doc:         "multiple DNS, invalid IP-address",
 			input:       `{"dns": ["2.2.2.2", "1.1.1.1o"]}`,
-			expectedErr: `invalid IP address: 1.1.1.1o`,
+			expectedErr: `ParseAddr("1.1.1.1o"): unexpected character (at "o")`,
+		},
+		{
+			doc:         "IPv4 with scope ID",
+			input:       `{"dns": ["1.1.1.1%eth0"]}`,
+			expectedErr: `ParseAddr("1.1.1.1%eth0"): unexpected character (at "%eth0")`,
 		},
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			var cfg Config
 			err := json.Unmarshal([]byte(tc.input), &cfg)
-			assert.Check(t, is.Error(err, tc.expectedErr))
+			assert.Check(t, is.Error(err, tc.expectedErr), "type: %T", err)
 		})
 	}
 }
 
 func field(field string) cmp.Option {
-	tmp := reflect.TypeOf(Config{})
+	tmp := reflect.TypeFor[Config]()
 	ignoreFields := make([]string, 0, tmp.NumField())
 	for i := 0; i < tmp.NumField(); i++ {
 		if tmp.Field(i).Name != field {
@@ -715,4 +972,44 @@ func TestMaskURLCredentials(t *testing.T) {
 		maskedURL := MaskCredentials(test.rawURL)
 		assert.Equal(t, maskedURL, test.maskedURL)
 	}
+}
+
+func TestSanitize(t *testing.T) {
+	const (
+		userPass        = "myuser:mypassword@"
+		proxyRawURL     = "https://" + userPass + "example.org"
+		proxyURL        = "https://xxxxx:xxxxx@example.org"
+		extensionID     = "org.example.test.v1"
+		extensionSecret = "unique-extension-secret"
+	)
+	cfg := Config{
+		CommonConfig: CommonConfig{
+			Proxies: Proxies{
+				HTTPProxy:  proxyRawURL,
+				HTTPSProxy: proxyRawURL,
+				NoProxy:    proxyRawURL,
+			},
+			ExtensionConfig: ExtensionConfigs{{
+				ID: extensionID,
+				Config: map[string]any{
+					"secret": extensionSecret,
+				},
+			}},
+		},
+	}
+	sanitizedCfg := Sanitize(cfg)
+	expectedProxies := Proxies{
+		HTTPProxy:  proxyURL,
+		HTTPSProxy: proxyURL,
+		NoProxy:    proxyURL,
+	}
+	assert.Check(t, is.DeepEqual(sanitizedCfg.Proxies, expectedProxies))
+
+	sanitizedJSON, err := json.Marshal(sanitizedCfg)
+	assert.NilError(t, err)
+	assert.Assert(t, !strings.Contains(string(sanitizedJSON), extensionSecret))
+	assert.Assert(t, !strings.Contains(string(sanitizedJSON), `"extension-config"`))
+	assert.Check(t, is.DeepEqual(cfg.ExtensionConfig[0].Config, map[string]any{
+		"secret": extensionSecret,
+	}))
 }

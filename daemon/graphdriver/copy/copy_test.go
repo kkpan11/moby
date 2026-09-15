@@ -1,6 +1,6 @@
 //go:build linux
 
-package copy // import "github.com/docker/docker/daemon/graphdriver/copy"
+package copy
 
 import (
 	"fmt"
@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/pkg/system"
+	"github.com/moby/moby/v2/daemon/internal/system"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -77,7 +77,7 @@ func TestCopyDir(t *testing.T) {
 }
 
 func randomMode(baseMode int) os.FileMode {
-	for i := 0; i < 7; i++ {
+	for i := range 7 {
 		baseMode = baseMode | (1&rand.Intn(2))<<uint(i)
 	}
 	return os.FileMode(baseMode)
@@ -90,7 +90,7 @@ func populateSrcDir(t *testing.T, srcDir string, remainingDepth int) {
 	aTime := time.Unix(rand.Int63(), 0)
 	mTime := time.Unix(rand.Int63(), 0)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		dirName := filepath.Join(srcDir, fmt.Sprintf("srcdir-%d", i))
 		// Owner all bits set
 		assert.NilError(t, os.Mkdir(dirName, randomMode(0o700)))
@@ -98,7 +98,7 @@ func populateSrcDir(t *testing.T, srcDir string, remainingDepth int) {
 		assert.NilError(t, system.Chtimes(dirName, aTime, mTime))
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		fileName := filepath.Join(srcDir, fmt.Sprintf("srcfile-%d", i))
 		// Owner read bit set
 		assert.NilError(t, os.WriteFile(fileName, []byte{}, randomMode(0o400)))

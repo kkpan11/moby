@@ -3,12 +3,13 @@ package client
 import (
 	pb "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/solver/result"
+	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 )
 
 func AttestationToPB[T any](a *result.Attestation[T]) (*pb.Attestation, error) {
 	if a.ContentFunc != nil {
-		return nil, errors.Errorf("attestation callback cannot be sent through gateway")
+		return nil, errors.New("attestation callback cannot be sent through gateway")
 	}
 
 	subjects := make([]*pb.InTotoSubject, len(a.InToto.Subjects))
@@ -16,7 +17,7 @@ func AttestationToPB[T any](a *result.Attestation[T]) (*pb.Attestation, error) {
 		subjects[i] = &pb.InTotoSubject{
 			Kind:   subject.Kind,
 			Name:   subject.Name,
-			Digest: subject.Digest,
+			Digest: digestSliceToPB(subject.Digest),
 		}
 	}
 
@@ -31,17 +32,17 @@ func AttestationToPB[T any](a *result.Attestation[T]) (*pb.Attestation, error) {
 
 func AttestationFromPB[T any](a *pb.Attestation) (*result.Attestation[T], error) {
 	if a == nil {
-		return nil, errors.Errorf("invalid nil attestation")
+		return nil, errors.New("invalid nil attestation")
 	}
 	subjects := make([]result.InTotoSubject, len(a.InTotoSubjects))
 	for i, subject := range a.InTotoSubjects {
 		if subject == nil {
-			return nil, errors.Errorf("invalid nil attestation subject")
+			return nil, errors.New("invalid nil attestation subject")
 		}
 		subjects[i] = result.InTotoSubject{
 			Kind:   subject.Kind,
 			Name:   subject.Name,
-			Digest: subject.Digest,
+			Digest: digestSliceFromPB(subject.Digest),
 		}
 	}
 
@@ -54,4 +55,20 @@ func AttestationFromPB[T any](a *pb.Attestation) (*result.Attestation[T], error)
 			Subjects:      subjects,
 		},
 	}, nil
+}
+
+func digestSliceToPB(elems []digest.Digest) []string {
+	clone := make([]string, len(elems))
+	for i, e := range elems {
+		clone[i] = string(e)
+	}
+	return clone
+}
+
+func digestSliceFromPB(elems []string) []digest.Digest {
+	clone := make([]digest.Digest, len(elems))
+	for i, e := range elems {
+		clone[i] = digest.Digest(e)
+	}
+	return clone
 }

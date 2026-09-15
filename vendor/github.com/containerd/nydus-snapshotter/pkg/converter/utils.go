@@ -16,7 +16,7 @@ import (
 	"io"
 	"path/filepath"
 
-	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -63,16 +63,16 @@ type seekReader struct {
 }
 
 func (ra *seekReader) Read(p []byte) (int, error) {
-	n, err := ra.ReaderAt.ReadAt(p, ra.pos)
+	n, err := ra.ReadAt(p, ra.pos)
 	ra.pos += int64(n)
 	return n, err
 }
 
 func (ra *seekReader) Seek(offset int64, whence int) (int64, error) {
-	switch {
-	case whence == io.SeekCurrent:
+	switch whence {
+	case io.SeekCurrent:
 		ra.pos += offset
-	case whence == io.SeekStart:
+	case io.SeekStart:
 		ra.pos = offset
 	default:
 		return 0, fmt.Errorf("unsupported whence %d", whence)

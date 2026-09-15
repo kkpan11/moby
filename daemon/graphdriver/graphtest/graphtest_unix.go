@@ -1,18 +1,21 @@
 //go:build linux || freebsd
 
-package graphtest // import "github.com/docker/docker/daemon/graphdriver/graphtest"
+package graphtest
 
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"os"
 	"path"
 	"testing"
 
-	"github.com/docker/docker/daemon/graphdriver"
-	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/quota"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/moby/go-archive"
+	"github.com/moby/moby/v2/daemon/graphdriver"
+	"github.com/moby/moby/v2/daemon/internal/quota"
+	"github.com/moby/moby/v2/daemon/internal/stringid"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -84,7 +87,11 @@ func DriverTestCreateEmpty(t testing.TB, drivername string, driverOptions ...str
 	driver := GetDriver(t, drivername, driverOptions...)
 	defer PutDriver(t)
 
+	// The daemon clears its umask, so drivers must set modes explicitly instead
+	// of relying on the umask to strip the group/other-write bits.
+	oldmask := unix.Umask(0)
 	err := driver.Create("empty", "", nil)
+	unix.Umask(oldmask)
 	assert.NilError(t, err)
 
 	defer func() {
@@ -288,9 +295,12 @@ func DriverTestChanges(t testing.TB, drivername string, driverOptions ...string)
 		t.Fatal(err)
 	}
 
-	if err = checkChanges(expectedChanges, changes); err != nil {
-		t.Fatal(err)
-	}
+	assert.DeepEqual(t, changes, expectedChanges, cmpopts.SortSlices(func(a, b archive.Change) bool {
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		return a.Kind < b.Kind
+	}))
 }
 
 func writeRandomFile(path string, size uint64) error {
@@ -312,7 +322,7 @@ func DriverTestSetQuota(t *testing.T, drivername string, required bool) {
 	createOpts.StorageOpt = make(map[string]string, 1)
 	createOpts.StorageOpt["size"] = "50M"
 	layerName := drivername + "Test"
-	if err := driver.CreateReadWrite(layerName, "Base", createOpts); err == quota.ErrQuotaNotSupported && !required {
+	if err := driver.CreateReadWrite(layerName, "Base", createOpts); errors.Is(err, quota.ErrQuotaNotSupported) && !required {
 		t.Skipf("Quota not supported on underlying filesystem: %v", err)
 	} else if err != nil {
 		t.Fatal(err)
@@ -337,7 +347,7 @@ func DriverTestSetQuota(t *testing.T, drivername string, required bool) {
 	if err == nil {
 		t.Fatalf("expected write to fail(), instead had success")
 	}
-	if pathError, ok := err.(*os.PathError); ok && pathError.Err != unix.EDQUOT && pathError.Err != unix.ENOSPC {
+	if pathError, ok := err.(*os.PathError); ok && !errors.Is(pathError.Err, unix.EDQUOT) && !errors.Is(pathError.Err, unix.ENOSPC) {
 		os.Remove(path.Join(mountPath, "bigfile"))
 		t.Fatalf("expect write() to fail with %v or %v, got %v", unix.EDQUOT, unix.ENOSPC, pathError.Err)
 	}

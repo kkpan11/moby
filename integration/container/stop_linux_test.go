@@ -1,78 +1,17 @@
-package container // import "github.com/docker/docker/integration/container"
+package container
 
 import (
-	"bytes"
 	"context"
-	"io"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/docker/docker/testutil"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/container"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
 )
-
-// TestStopContainerWithTimeout checks that ContainerStop with
-// a timeout works as documented, i.e. in case of negative timeout
-// waiting is not limited (issue #35311).
-func TestStopContainerWithTimeout(t *testing.T) {
-	ctx := setupTest(t)
-
-	apiClient := testEnv.APIClient()
-
-	testCmd := container.WithCmd("sh", "-c", "sleep 2 && exit 42")
-	testData := []struct {
-		doc              string
-		timeout          int
-		expectedExitCode int
-	}{
-		// In case container is forcefully killed, 137 is returned,
-		// otherwise the exit code from the above script
-		{
-			"zero timeout: expect forceful container kill",
-			0, 137,
-		},
-		{
-			"too small timeout: expect forceful container kill",
-			1, 137,
-		},
-		{
-			"big enough timeout: expect graceful container stop",
-			3, 42,
-		},
-		{
-			"unlimited timeout: expect graceful container stop",
-			-1, 42,
-		},
-	}
-
-	for _, d := range testData {
-		d := d
-		t.Run(strconv.Itoa(d.timeout), func(t *testing.T) {
-			t.Parallel()
-			ctx := testutil.StartSpan(ctx, t)
-			id := container.Run(ctx, t, apiClient, testCmd)
-
-			err := apiClient.ContainerStop(ctx, id, containertypes.StopOptions{Timeout: &d.timeout})
-			assert.NilError(t, err)
-
-			poll.WaitOn(t, container.IsStopped(ctx, apiClient, id),
-				poll.WithDelay(100*time.Millisecond))
-
-			inspect, err := apiClient.ContainerInspect(ctx, id)
-			assert.NilError(t, err)
-			assert.Equal(t, inspect.State.ExitCode, d.expectedExitCode)
-		})
-	}
-}
 
 // TestStopContainerWithTimeoutCancel checks that ContainerStop is not cancelled
 // if the request is cancelled.
@@ -85,8 +24,9 @@ func TestStopContainerWithTimeoutCancel(t *testing.T) {
 	t.Parallel()
 
 	id := container.Run(ctx, t, apiClient,
-		container.WithCmd("sh", "-c", "trap 'echo received TERM' TERM; while true; do usleep 10; done"),
+		container.WithCmd("sh", "-c", "trap 'echo received TERM' TERM; echo ready; while true; do usleep 10; done"),
 	)
+	poll.WaitOn(t, logsContains(ctx, apiClient, id, "ready"))
 
 	ctxCancel, cancel := context.WithCancel(ctx)
 	t.Cleanup(cancel)
@@ -95,7 +35,8 @@ func TestStopContainerWithTimeoutCancel(t *testing.T) {
 	stoppedCh := make(chan error)
 	go func() {
 		sto := stopTimeout
-		stoppedCh <- apiClient.ContainerStop(ctxCancel, id, containertypes.StopOptions{Timeout: &sto})
+		_, err := apiClient.ContainerStop(ctxCancel, id, client.ContainerStopOptions{Timeout: &sto})
+		stoppedCh <- err
 	}()
 
 	poll.WaitOn(t, logsContains(ctx, apiClient, id, "received TERM"))
@@ -106,13 +47,13 @@ func TestStopContainerWithTimeoutCancel(t *testing.T) {
 
 	select {
 	case stoppedErr := <-stoppedCh:
-		assert.Check(t, is.ErrorType(stoppedErr, errdefs.IsCancelled))
+		assert.Check(t, is.ErrorType(stoppedErr, cerrdefs.IsCanceled))
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for stop request to be cancelled")
 	}
-	inspect, err := apiClient.ContainerInspect(ctx, id)
+	inspect, err := apiClient.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 	assert.Check(t, err)
-	assert.Check(t, inspect.State.Running)
+	assert.Check(t, inspect.Container.State.Running)
 
 	// container should be stopped after stopTimeout is reached. The daemon.containerStop
 	// code is rather convoluted, and waits another 2 seconds for the container to
@@ -122,27 +63,4 @@ func TestStopContainerWithTimeoutCancel(t *testing.T) {
 	// Adding 3 seconds to the specified stopTimeout to take this into account,
 	// and add another second margin to try to avoid flakiness.
 	poll.WaitOn(t, container.IsStopped(ctx, apiClient, id), poll.WithTimeout((3+stopTimeout)*time.Second))
-}
-
-// logsContains verifies the container contains the given text in the log's stdout.
-func logsContains(ctx context.Context, client client.APIClient, containerID string, logString string) func(log poll.LogT) poll.Result {
-	return func(log poll.LogT) poll.Result {
-		logs, err := client.ContainerLogs(ctx, containerID, containertypes.LogsOptions{
-			ShowStdout: true,
-		})
-		if err != nil {
-			return poll.Error(err)
-		}
-		defer logs.Close()
-
-		var stdout bytes.Buffer
-		_, err = stdcopy.StdCopy(&stdout, io.Discard, logs)
-		if err != nil {
-			return poll.Error(err)
-		}
-		if strings.Contains(stdout.String(), logString) {
-			return poll.Success()
-		}
-		return poll.Continue("waiting for logstring '%s' in container", logString)
-	}
 }

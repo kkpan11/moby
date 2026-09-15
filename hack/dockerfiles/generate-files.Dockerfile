@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.22.7
-ARG BASE_DEBIAN_DISTRO="bookworm"
+ARG GO_VERSION=1.26.8
+ARG BASE_DEBIAN_DISTRO=trixie
 ARG PROTOC_VERSION=3.11.4
 
 # protoc is dynamically linked to glibc so can't use alpine base
@@ -17,7 +17,7 @@ RUN <<EOT
   wget -q https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${TARGETOS}-${arch}.zip
   unzip protoc-${PROTOC_VERSION}-${TARGETOS}-${arch}.zip -d /usr/local
 EOT
-WORKDIR /go/src/github.com/docker/docker
+WORKDIR /usr/src/moby
 
 FROM base AS src
 WORKDIR /out
@@ -35,18 +35,14 @@ FROM base AS tools
 RUN --mount=from=src,source=/out,target=.,rw \
     --mount=type=cache,target=/root/.cache/go-build <<EOT
   set -ex
-  ./hack/with-go-mod.sh go install -v -mod=vendor -modfile=vendor.mod \
-    github.com/gogo/protobuf/protoc-gen-gogo \
-    github.com/gogo/protobuf/protoc-gen-gogofaster \
-    github.com/gogo/protobuf/protoc-gen-gogoslick \
-    github.com/golang/protobuf/protoc-gen-go
-  ./hack/with-go-mod.sh go build -v -mod=vendor -modfile=vendor.mod \
+  # install all tools defined in go.mod
+  go install -v tool
+  go build -v \
     -o /usr/bin/pluginrpc-gen \
     ./pkg/plugins/pluginrpc-gen
 EOT
 
 FROM tools AS generated
-ENV GO111MODULE=off
 RUN --mount=from=src,source=/out,target=.,rw <<EOT
   set -ex
   go generate -v ./...

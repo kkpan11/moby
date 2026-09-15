@@ -1,4 +1,4 @@
-package templates // import "github.com/docker/docker/daemon/logger/templates"
+package templates
 
 import (
 	"bytes"
@@ -10,11 +10,11 @@ import (
 // basicFunctions are the set of initial
 // functions provided to every template.
 var basicFunctions = template.FuncMap{
-	"json": func(v interface{}) string {
+	"json": func(v any) string {
 		buf := &bytes.Buffer{}
 		enc := json.NewEncoder(buf)
 		enc.SetEscapeHTML(false)
-		enc.Encode(v)
+		_ = enc.Encode(v) //nolint:errchkjson // ignore "Error return json.Encoder.Encode` is not checked"
 		// Remove the trailing new line added by the encoder
 		return strings.TrimSpace(buf.String())
 	},

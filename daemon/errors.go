@@ -1,11 +1,11 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"fmt"
 	"strings"
 	"syscall"
 
-	"github.com/docker/docker/errdefs"
+	"github.com/moby/moby/v2/errdefs"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc/status"
 )
@@ -51,11 +51,6 @@ func errExecNotFound(id string) error {
 
 func errExecPaused(id string) error {
 	cause := errors.Errorf("Container %s is paused, unpause the container before exec", id)
-	return errdefs.Conflict(cause)
-}
-
-func errNotPaused(id string) error {
-	cause := errors.Errorf("Container %s is already paused", id)
 	return errdefs.Conflict(cause)
 }
 
@@ -154,7 +149,7 @@ func setExitCodeFromError(setExitCode func(exitStatus), err error) error {
 		return startInvalidConfigError(errDesc)
 	}
 
-	// attempted to mount a file onto a directory, or a directory onto a file, maybe from user specified bind mounts
+	// attempted to mount a file onto a directory, or a directory onto a file, maybe from user-specified bind mounts
 	if contains(errDesc, syscall.ENOTDIR.Error()) {
 		errDesc += ": Are you trying to mount a directory onto a file (or vice-versa)? Check if the specified host path exists and is the expected type"
 		setExitCode(exitCmdNotFound)

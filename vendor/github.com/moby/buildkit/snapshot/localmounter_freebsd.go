@@ -2,14 +2,19 @@ package snapshot
 
 import (
 	"os"
+	"slices"
 
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/pkg/errors"
 )
 
 func (lm *localMounter) Mount() (string, error) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
+
+	if lm.target != "" {
+		return lm.target, nil
+	}
 
 	if lm.mounts == nil && lm.mountable != nil {
 		mounts, release, err := lm.mountable.Mount()
@@ -21,13 +26,7 @@ func (lm *localMounter) Mount() (string, error) {
 	}
 
 	if !lm.forceRemount && len(lm.mounts) == 1 && lm.mounts[0].Type == "nullfs" {
-		ro := false
-		for _, opt := range lm.mounts[0].Options {
-			if opt == "ro" {
-				ro = true
-				break
-			}
-		}
+		ro := slices.Contains(lm.mounts[0].Options, "ro")
 		if !ro {
 			return lm.mounts[0].Source, nil
 		}

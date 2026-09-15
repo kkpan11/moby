@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/pkg/idtools"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	"github.com/moby/buildkit/cache"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/exporter"
 	"github.com/moby/buildkit/exporter/attestation"
 	"github.com/moby/buildkit/exporter/util/epoch"
@@ -22,6 +22,7 @@ import (
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver/result"
 	"github.com/moby/buildkit/util/staticfs"
+	"github.com/moby/sys/user"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
@@ -33,17 +34,24 @@ const (
 	// keyPlatformSplit is an exporter option which can be used to split result
 	// in subfolders when multiple platform references are exported.
 	keyPlatformSplit = "platform-split"
+	keyMode          = "mode"
 )
 
 type CreateFSOpts struct {
-	Epoch             *time.Time
+	Epoch             *epoch.Epoch
 	AttestationPrefix string
-	PlatformSplit     bool
+	PlatformSplit     *bool
+}
+
+func (c *CreateFSOpts) UsePlatformSplit(isMap bool) bool {
+	if c.PlatformSplit == nil {
+		return isMap
+	}
+	return *c.PlatformSplit
 }
 
 func (c *CreateFSOpts) Load(opt map[string]string) (map[string]string, error) {
 	rest := make(map[string]string)
-	c.PlatformSplit = true
 
 	var err error
 	c.Epoch, opt, err = epoch.ParseExporterAttrs(opt)
@@ -60,7 +68,11 @@ func (c *CreateFSOpts) Load(opt map[string]string) (map[string]string, error) {
 			if err != nil {
 				return nil, errors.Wrapf(err, "non-bool value for %s: %s", keyPlatformSplit, v)
 			}
-			c.PlatformSplit = b
+			c.PlatformSplit = &b
+		case keyMode:
+			if _, err := client.ParseLocalExporterMode(v); err != nil {
+				return nil, err
+			}
 		default:
 			rest[k] = v
 		}
@@ -69,11 +81,11 @@ func (c *CreateFSOpts) Load(opt map[string]string) (map[string]string, error) {
 	return rest, nil
 }
 
-func CreateFS(ctx context.Context, sessionID string, k string, ref cache.ImmutableRef, attestations []exporter.Attestation, defaultTime time.Time, opt CreateFSOpts) (fsutil.FS, func() error, error) {
+func CreateFS(ctx context.Context, sessionID string, k string, ref cache.ImmutableRef, attestations []exporter.Attestation, defaultTime time.Time, isMap bool, opt CreateFSOpts) (fsutil.FS, func() error, error) {
 	var cleanup func() error
 	var src string
 	var err error
-	var idmap *idtools.IdentityMapping
+	var idmap *user.IdentityMapping
 	if ref == nil {
 		src, err = os.MkdirTemp("", "buildkit")
 		if err != nil {
@@ -108,10 +120,7 @@ func CreateFS(ctx context.Context, sessionID string, k string, ref cache.Immutab
 	var idMapFunc func(p string, st *fstypes.Stat) fsutil.MapResult
 	if idmap != nil {
 		idMapFunc = func(p string, st *fstypes.Stat) fsutil.MapResult {
-			uid, gid, err := idmap.ToContainer(idtools.Identity{
-				UID: int(st.Uid),
-				GID: int(st.Gid),
-			})
+			uid, gid, err := idmap.ToContainer(int(st.Uid), int(st.Gid))
 			if err != nil {
 				return fsutil.MapResultExclude
 			}
@@ -126,9 +135,9 @@ func CreateFS(ctx context.Context, sessionID string, k string, ref cache.Immutab
 			// apply host uid/gid
 			res = idMapFunc(p, st)
 		}
-		if opt.Epoch != nil {
+		if opt.Epoch != nil && opt.Epoch.Value != nil {
 			// apply used-specified epoch time
-			st.ModTime = opt.Epoch.UnixNano()
+			st.ModTime = opt.Epoch.Value.UnixNano()
 		}
 		return res
 	}
@@ -177,6 +186,7 @@ func CreateFS(ctx context.Context, sessionID string, k string, ref cache.Immutab
 			return nil, nil, err
 		}
 		stmtFS := staticfs.NewFS()
+		addPlatformToFilename := isMap && !opt.UsePlatformSplit(isMap)
 
 		names := map[string]struct{}{}
 		for i, stmt := range stmts {
@@ -186,23 +196,23 @@ func CreateFS(ctx context.Context, sessionID string, k string, ref cache.Immutab
 			}
 
 			name := opt.AttestationPrefix + path.Base(attestations[i].Path)
-			if !opt.PlatformSplit {
+			if addPlatformToFilename {
 				nameExt := path.Ext(name)
 				namBase := strings.TrimSuffix(name, nameExt)
-				name = fmt.Sprintf("%s.%s%s", namBase, strings.ReplaceAll(k, "/", "_"), nameExt)
+				name = fmt.Sprintf("%s.%s%s", namBase, PlatformIDToPath(k), nameExt)
 			}
 			if _, ok := names[name]; ok {
 				return nil, nil, errors.Errorf("duplicate attestation path name %s", name)
 			}
 			names[name] = struct{}{}
 
-			st := fstypes.Stat{
+			st := &fstypes.Stat{
 				Mode:    0600,
 				Path:    name,
 				ModTime: defaultTime.UnixNano(),
 			}
-			if opt.Epoch != nil {
-				st.ModTime = opt.Epoch.UnixNano()
+			if opt.Epoch != nil && opt.Epoch.Value != nil {
+				st.ModTime = opt.Epoch.Value.UnixNano()
 			}
 			stmtFS.Add(name, st, dt)
 		}

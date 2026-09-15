@@ -3,7 +3,7 @@ package detect
 import (
 	"context"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 
 	"github.com/pkg/errors"
@@ -45,7 +45,7 @@ func (fn TraceExporterDetector) DetectMetricExporter() (sdkmetric.Exporter, erro
 }
 
 func detectExporter[T any](envVar string, fn func(d ExporterDetector) (T, bool, error)) (exp T, err error) {
-	ignoreErrors, _ := strconv.ParseBool("OTEL_IGNORE_ERROR")
+	ignoreErrors, _ := strconv.ParseBool(os.Getenv("OTEL_IGNORE_ERROR"))
 
 	if n := os.Getenv(envVar); n != "" {
 		d, ok := detectors[n]
@@ -66,8 +66,8 @@ func detectExporter[T any](envVar string, fn func(d ExporterDetector) (T, bool, 
 	for _, d := range detectors {
 		arr = append(arr, d)
 	}
-	sort.Slice(arr, func(i, j int) bool {
-		return arr[i].priority < arr[j].priority
+	slices.SortFunc(arr, func(a, b detector) int {
+		return a.priority - b.priority
 	})
 
 	var ok bool

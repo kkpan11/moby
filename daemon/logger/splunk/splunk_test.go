@@ -1,4 +1,4 @@
-package splunk // import "github.com/docker/docker/daemon/logger/splunk"
+package splunk
 
 import (
 	"compress/gzip"
@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger"
 	"gotest.tools/v3/assert"
 )
 
@@ -29,10 +29,11 @@ func TestValidateLogOpt(t *testing.T) {
 		splunkVerifyConnectionKey:     "true",
 		splunkGzipCompressionKey:      "true",
 		splunkGzipCompressionLevelKey: "1",
-		envKey:                        "a",
-		envRegexKey:                   "^foo",
-		labelsKey:                     "b",
-		tagKey:                        "c",
+		logger.AttrEnv:                "a",
+		logger.AttrEnvRegex:           "^foo",
+		logger.AttrLabels:             "b",
+		logger.AttrLabelsRegex:        "^foo",
+		logger.AttrLogTag:             "c",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +104,7 @@ func TestNewWithProxy(t *testing.T) {
 	proxyFunc := splunkLogger.transport.Proxy
 	assert.Assert(t, proxyFunc != nil)
 
-	req, err := http.NewRequest(http.MethodGet, splunkURL, nil)
+	req, err := http.NewRequest(http.MethodGet, splunkURL, http.NoBody)
 	assert.NilError(t, err)
 
 	proxyURL, err := proxyFunc(req)
@@ -249,9 +250,10 @@ func TestInlineFormatWithNonDefaultOptions(t *testing.T) {
 			splunkIndexKey:           "myindex",
 			splunkFormatKey:          splunkFormatInline,
 			splunkGzipCompressionKey: "true",
-			tagKey:                   "{{.ImageName}}/{{.Name}}",
-			labelsKey:                "a",
-			envRegexKey:              "^foo",
+
+			logger.AttrLogTag:   "{{.ImageName}}/{{.Name}}",
+			logger.AttrLabels:   "a",
+			logger.AttrEnvRegex: "^foo",
 		},
 		ContainerID:        "containeriid",
 		ContainerName:      "/container_name",
@@ -330,8 +332,8 @@ func TestInlineFormatWithNonDefaultOptions(t *testing.T) {
 		if event["line"] != "1" ||
 			event["source"] != "stdout" ||
 			event["tag"] != "container_image_name/container_name" ||
-			event["attrs"].(map[string]interface{})["a"] != "b" ||
-			event["attrs"].(map[string]interface{})["foo_finder"] != "bar" ||
+			event["attrs"].(map[string]any)["a"] != "b" ||
+			event["attrs"].(map[string]any)["foo_finder"] != "bar" ||
 			len(event) != 4 {
 			t.Fatalf("Unexpected event in message %v", event)
 		}
@@ -427,7 +429,7 @@ func TestJsonFormat(t *testing.T) {
 	if event, err := message1.EventAsMap(); err != nil {
 		t.Fatal(err)
 	} else {
-		if event["line"].(map[string]interface{})["a"] != "b" ||
+		if event["line"].(map[string]any)["a"] != "b" ||
 			event["source"] != "stdout" ||
 			event["tag"] != "containeriid" ||
 			len(event) != 3 {
@@ -579,7 +581,8 @@ func TestRawFormatWithLabels(t *testing.T) {
 			splunkURLKey:    hec.URL(),
 			splunkTokenKey:  hec.token,
 			splunkFormatKey: splunkFormatRaw,
-			labelsKey:       "a",
+
+			logger.AttrLabels: "a",
 		},
 		ContainerID:        "containeriid",
 		ContainerName:      "/container_name",
@@ -694,7 +697,8 @@ func TestRawFormatWithoutTag(t *testing.T) {
 			splunkURLKey:    hec.URL(),
 			splunkTokenKey:  hec.token,
 			splunkFormatKey: splunkFormatRaw,
-			tagKey:          "",
+
+			logger.AttrLogTag: "",
 		},
 		ContainerID:        "containeriid",
 		ContainerName:      "/container_name",
@@ -827,7 +831,7 @@ func TestBatching(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < defaultStreamChannelSize*4; i++ {
+	for i := range defaultStreamChannelSize * 4 {
 		if err := loggerDriver.Log(&logger.Message{Line: []byte(strconv.Itoa(i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
@@ -887,7 +891,7 @@ func TestFrequency(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if err := loggerDriver.Log(&logger.Message{Line: []byte(strconv.Itoa(i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
@@ -958,7 +962,7 @@ func TestOneMessagePerRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if err := loggerDriver.Log(&logger.Message{Line: []byte(strconv.Itoa(i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
@@ -1050,7 +1054,7 @@ func TestSkipVerify(t *testing.T) {
 		t.Fatal("Connection should not be verified")
 	}
 
-	for i := 0; i < defaultStreamChannelSize*2; i++ {
+	for i := range defaultStreamChannelSize * 2 {
 		if err := loggerDriver.Log(&logger.Message{Line: []byte(strconv.Itoa(i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
@@ -1124,7 +1128,7 @@ func TestBufferMaximum(t *testing.T) {
 		t.Fatal("Connection should not be verified")
 	}
 
-	for i := 0; i < 11; i++ {
+	for i := range 11 {
 		if err := loggerDriver.Log(&logger.Message{Line: []byte(strconv.Itoa(i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
@@ -1150,7 +1154,7 @@ func TestBufferMaximum(t *testing.T) {
 		if event, err := message.EventAsMap(); err != nil {
 			t.Fatal(err)
 		} else {
-			if event["line"] != fmt.Sprintf("%d", i+2) {
+			if event["line"] != strconv.Itoa(i+2) {
 				t.Fatalf("Unexpected event in message %v", event)
 			}
 		}
@@ -1193,7 +1197,7 @@ func TestServerAlwaysDown(t *testing.T) {
 		t.Fatal("Connection should not be verified")
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if err := loggerDriver.Log(&logger.Message{Line: []byte(strconv.Itoa(i)), Source: "stdout", Timestamp: time.Now()}); err != nil {
 			t.Fatal(err)
 		}

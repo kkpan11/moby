@@ -30,10 +30,9 @@ func Unbundle(ctx context.Context, s session.Group, bundled []exporter.Attestati
 	unbundled := make([][]exporter.Attestation, len(bundled))
 
 	for i, att := range bundled {
-		i, att := i, att
 		eg.Go(func() error {
 			switch att.Kind {
-			case gatewaypb.AttestationKindInToto:
+			case gatewaypb.AttestationKind_InToto:
 				if strings.HasPrefix(att.InToto.PredicateType, "https://slsa.dev/provenance/") {
 					if att.ContentFunc == nil {
 						// provenance may only be set buildkit-side using ContentFunc
@@ -41,12 +40,12 @@ func Unbundle(ctx context.Context, s session.Group, bundled []exporter.Attestati
 					}
 				}
 				unbundled[i] = append(unbundled[i], att)
-			case gatewaypb.AttestationKindBundle:
+			case gatewaypb.AttestationKind_Bundle:
 				if att.ContentFunc != nil {
 					return errors.New("attestation bundle cannot have callback")
 				}
 				if att.Ref == nil {
-					return errors.Errorf("no ref provided for attestation bundle")
+					return errors.New("no ref provided for attestation bundle")
 				}
 
 				mount, err := att.Ref.Mount(ctx, true, s)
@@ -133,17 +132,15 @@ func unbundle(root string, bundle exporter.Attestation) ([]exporter.Attestation,
 		if err != nil {
 			return nil, err
 		}
-		f, err := os.Open(p)
+		f, err := openRegularFile(p)
 		if err != nil {
 			return nil, err
 		}
-		dec := json.NewDecoder(f)
 		var stmt intoto.Statement
-		if err := dec.Decode(&stmt); err != nil {
-			return nil, errors.Wrap(err, "cannot decode in-toto statement")
-		}
-		if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-			return nil, errors.New("in-toto statement is not a single JSON object")
+		stmt, err = decodeStatement(f, p)
+		f.Close()
+		if err != nil {
+			return nil, err
 		}
 		if bundle.InToto.PredicateType != "" && stmt.PredicateType != bundle.InToto.PredicateType {
 			return nil, errors.Errorf("bundle entry %s does not match required predicate type %s", stmt.PredicateType, bundle.InToto.PredicateType)
@@ -157,16 +154,16 @@ func unbundle(root string, bundle exporter.Attestation) ([]exporter.Attestation,
 		subjects := make([]result.InTotoSubject, len(stmt.Subject))
 		for i, subject := range stmt.Subject {
 			subjects[i] = result.InTotoSubject{
-				Kind:   gatewaypb.InTotoSubjectKindRaw,
+				Kind:   gatewaypb.InTotoSubjectKind_Raw,
 				Name:   subject.Name,
 				Digest: result.FromDigestMap(subject.Digest),
 			}
 		}
 		unbundled = append(unbundled, exporter.Attestation{
-			Kind:        gatewaypb.AttestationKindInToto,
+			Kind:        gatewaypb.AttestationKind_InToto,
 			Metadata:    bundle.Metadata,
 			Path:        path.Join(bundle.Path, entry.Name()),
-			ContentFunc: func() ([]byte, error) { return predicate, nil },
+			ContentFunc: func(context.Context) ([]byte, error) { return predicate, nil },
 			InToto: result.InTotoAttestation{
 				PredicateType: stmt.PredicateType,
 				Subjects:      subjects,
@@ -174,6 +171,29 @@ func unbundle(root string, bundle exporter.Attestation) ([]exporter.Attestation,
 		})
 	}
 	return unbundled, nil
+}
+
+func decodeStatement(r io.Reader, name string) (intoto.Statement, error) {
+	limited := &io.LimitedReader{R: r, N: maxAttestationBytes + 1}
+	dec := json.NewDecoder(limited)
+
+	var stmt intoto.Statement
+	if err := dec.Decode(&stmt); err != nil {
+		if limited.N == 0 {
+			return stmt, errors.Errorf("%s exceeds %d bytes", name, maxAttestationBytes)
+		}
+		return stmt, errors.Wrap(err, "cannot decode in-toto statement")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		if limited.N == 0 {
+			return stmt, errors.Errorf("%s exceeds %d bytes", name, maxAttestationBytes)
+		}
+		return stmt, errors.New("in-toto statement is not a single JSON object")
+	}
+	if limited.N == 0 {
+		return stmt, errors.Errorf("%s exceeds %d bytes", name, maxAttestationBytes)
+	}
+	return stmt, nil
 }
 
 func Validate(atts []exporter.Attestation) error {
@@ -186,7 +206,7 @@ func Validate(atts []exporter.Attestation) error {
 }
 
 func validate(att exporter.Attestation) error {
-	if att.Kind != gatewaypb.AttestationKindBundle && att.Path == "" {
+	if att.Kind != gatewaypb.AttestationKind_Bundle && att.Path == "" {
 		return errors.New("attestation does not have set path")
 	}
 	if att.Ref == nil && att.ContentFunc == nil {

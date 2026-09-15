@@ -1,3 +1,8 @@
 Dockerfile* linguist-language=Dockerfile
-vendor.mod linguist-language=Go-Module
-vendor.sum linguist-language=Go-Checksums
+
+*.c    diff=cpp
+*.h    diff=cpp
+*.go   diff=golang
+*.md   diff=markdown
+*.py   diff=python
+*.sh   diff=bash

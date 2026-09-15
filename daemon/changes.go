@@ -1,11 +1,12 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"errors"
 	"time"
 
-	"github.com/docker/docker/pkg/archive"
+	"github.com/moby/go-archive"
+	"github.com/moby/moby/v2/daemon/internal/metrics"
 )
 
 // ContainerChanges returns a list of container fs changes
@@ -17,7 +18,7 @@ func (daemon *Daemon) ContainerChanges(ctx context.Context, name string) ([]arch
 		return nil, err
 	}
 
-	if isWindows && container.IsRunning() {
+	if isWindows && container.State.IsRunning() {
 		return nil, errors.New("Windows does not support diff of a running container")
 	}
 
@@ -25,6 +26,6 @@ func (daemon *Daemon) ContainerChanges(ctx context.Context, name string) ([]arch
 	if err != nil {
 		return nil, err
 	}
-	containerActions.WithValues("changes").UpdateSince(start)
+	metrics.ContainerActions.WithValues("changes").UpdateSince(start)
 	return c, nil
 }

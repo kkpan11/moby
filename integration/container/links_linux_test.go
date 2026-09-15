@@ -1,12 +1,11 @@
-package container // import "github.com/docker/docker/integration/container"
+package container
 
 import (
 	"os"
 	"testing"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/integration/internal/container"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/container"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/skip"
@@ -14,7 +13,7 @@ import (
 
 func TestLinksEtcHostsContentMatch(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
-	skip.If(t, testEnv.IsRootless, "rootless mode has different view of /etc/hosts")
+	skip.If(t, testEnv.IsUserNamespace, "host network mode is incompatible with user namespaces")
 
 	hosts, err := os.ReadFile("/etc/hosts")
 	skip.If(t, os.IsNotExist(err))
@@ -43,10 +42,10 @@ func TestLinksContainerNames(t *testing.T) {
 	container.Run(ctx, t, apiClient, container.WithName(containerA))
 	container.Run(ctx, t, apiClient, container.WithName(containerB), container.WithLinks(containerA+":"+containerA))
 
-	containers, err := apiClient.ContainerList(ctx, containertypes.ListOptions{
-		Filters: filters.NewArgs(filters.Arg("name", containerA)),
+	list, err := apiClient.ContainerList(ctx, client.ContainerListOptions{
+		Filters: make(client.Filters).Add("name", containerA),
 	})
 	assert.NilError(t, err)
-	assert.Check(t, is.Equal(1, len(containers)))
-	assert.Check(t, is.DeepEqual([]string{"/" + containerA, "/" + containerB + "/" + containerA}, containers[0].Names))
+	assert.Check(t, is.Equal(1, len(list.Items)))
+	assert.Check(t, is.DeepEqual([]string{"/" + containerA, "/" + containerB + "/" + containerA}, list.Items[0].Names))
 }

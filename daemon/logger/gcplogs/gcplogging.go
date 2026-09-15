@@ -1,13 +1,14 @@
-package gcplogs // import "github.com/docker/docker/daemon/logger/gcplogs"
+package gcplogs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/docker/docker/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger"
 
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/logging"
@@ -18,15 +19,11 @@ import (
 const (
 	name = "gcplogs"
 
-	projectOptKey     = "gcp-project"
-	logLabelsKey      = "labels"
-	logLabelsRegexKey = "labels-regex"
-	logEnvKey         = "env"
-	logEnvRegexKey    = "env-regex"
-	logCmdKey         = "gcp-log-cmd"
-	logZoneKey        = "gcp-meta-zone"
-	logNameKey        = "gcp-meta-name"
-	logIDKey          = "gcp-meta-id"
+	projectOptKey = "gcp-project"
+	logCmdKey     = "gcp-log-cmd"
+	logZoneKey    = "gcp-meta-zone"
+	logNameKey    = "gcp-meta-name"
+	logIDKey      = "gcp-meta-id"
 )
 
 var (
@@ -41,16 +38,6 @@ var (
 	instanceName string
 	instanceID   string
 )
-
-func init() {
-	if err := logger.RegisterLogDriver(name, New); err != nil {
-		panic(err)
-	}
-
-	if err := logger.RegisterLogOptValidator(name, ValidateLogOpts); err != nil {
-		panic(err)
-	}
-}
 
 type gcplogs struct {
 	client    *logging.Client
@@ -76,7 +63,7 @@ type containerInfo struct {
 	ID        string            `json:"id,omitempty"`
 	ImageName string            `json:"imageName,omitempty"`
 	ImageID   string            `json:"imageId,omitempty"`
-	Created   time.Time         `json:"created,omitempty"`
+	Created   time.Time         `json:"created"`
 	Command   string            `json:"command,omitempty"`
 	Metadata  map[string]string `json:"metadata,omitempty"`
 }
@@ -91,10 +78,11 @@ func initGCP() {
 			// down or the client is compiled with an API version that
 			// has been removed. Since these are not vital, let's ignore
 			// them and make their fields in the dockerLogEntry ,omitempty
-			projectID, _ = metadata.ProjectID()
-			zone, _ = metadata.Zone()
-			instanceName, _ = metadata.InstanceName()
-			instanceID, _ = metadata.InstanceID()
+			ctx := context.Background()
+			projectID, _ = metadata.ProjectIDWithContext(ctx)
+			zone, _ = metadata.ZoneWithContext(ctx)
+			instanceName, _ = metadata.InstanceNameWithContext(ctx)
+			instanceID, _ = metadata.InstanceIDWithContext(ctx)
 		}
 	})
 }
@@ -114,7 +102,7 @@ func New(info logger.Info) (logger.Logger, error) {
 		project = projectID
 	}
 	if project == "" {
-		return nil, fmt.Errorf("No project was specified and couldn't read project from the metadata server. Please specify a project")
+		return nil, errors.New("No project was specified and couldn't read project from the metadata server. Please specify a project")
 	}
 
 	c, err := logging.NewClient(context.Background(), project)
@@ -155,7 +143,7 @@ func New(info logger.Info) (logger.Logger, error) {
 		return nil, fmt.Errorf("unable to connect or authenticate with Google Cloud Logging: %v", err)
 	}
 
-	extraAttributes, err := info.ExtraAttributes(nil)
+	extraAttrs, err := info.ExtraAttributes(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +157,7 @@ func New(info logger.Info) (logger.Logger, error) {
 			ImageName: info.ContainerImageName,
 			ImageID:   info.ContainerImageID,
 			Created:   info.ContainerCreated,
-			Metadata:  extraAttributes,
+			Metadata:  extraAttrs,
 		},
 	}
 
@@ -186,7 +174,7 @@ func New(info logger.Info) (logger.Logger, error) {
 	// without overly spamming /var/log/docker.log so we log the first time
 	// we overflow and every 1000th time after.
 	c.OnError = func(err error) {
-		if err == logging.ErrOverflow {
+		if errors.Is(err, logging.ErrOverflow) {
 			if i := droppedLogs.Add(1); i%1000 == 1 {
 				log.G(context.TODO()).Errorf("gcplogs driver has dropped %v logs", i)
 			}
@@ -201,11 +189,15 @@ func New(info logger.Info) (logger.Logger, error) {
 // ValidateLogOpts validates the opts passed to the gcplogs driver. Currently, the gcplogs
 // driver doesn't take any arguments.
 func ValidateLogOpts(cfg map[string]string) error {
-	for k := range cfg {
-		switch k {
-		case projectOptKey, logLabelsKey, logLabelsRegexKey, logEnvKey, logEnvRegexKey, logCmdKey, logZoneKey, logNameKey, logIDKey:
+	for key := range cfg {
+		switch key {
+		// TODO(thaJeztah); add support for "tag" (logger.AttrLogTag)
+		case logger.AttrEnv, logger.AttrEnvRegex, logger.AttrLabels, logger.AttrLabelsRegex:
+			// Common attributes handled through [logger.Info.ExtraAttributes].
+			continue
+		case projectOptKey, logCmdKey, logZoneKey, logNameKey, logIDKey:
 		default:
-			return fmt.Errorf("%q is not a valid option for the gcplogs driver", k)
+			return fmt.Errorf("%q is not a valid option for the gcplogs driver", key)
 		}
 	}
 	return nil

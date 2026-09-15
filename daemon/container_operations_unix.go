@@ -1,42 +1,45 @@
 //go:build linux || freebsd
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/daemon/links"
-	"github.com/docker/docker/daemon/network"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/libnetwork"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/process"
-	"github.com/docker/docker/pkg/stringid"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/netipstringer"
+	"github.com/moby/moby/v2/daemon/internal/stringid"
+	"github.com/moby/moby/v2/daemon/libnetwork"
+	"github.com/moby/moby/v2/daemon/libnetwork/drivers/bridge"
+	"github.com/moby/moby/v2/daemon/links"
+	"github.com/moby/moby/v2/daemon/network"
+	"github.com/moby/moby/v2/errdefs"
+	"github.com/moby/moby/v2/pkg/process"
 	"github.com/moby/sys/mount"
+	"github.com/moby/sys/user"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sys/unix"
 )
 
 func (daemon *Daemon) setupLinkedContainers(ctr *container.Container) ([]string, error) {
-	var env []string
-	children := daemon.children(ctr)
-
 	bridgeSettings := ctr.NetworkSettings.Networks[network.DefaultNetwork]
 	if bridgeSettings == nil || bridgeSettings.EndpointSettings == nil {
 		return nil, nil
 	}
 
-	for linkAlias, child := range children {
-		if !child.IsRunning() {
+	var env []string
+	for linkAlias, child := range daemon.linkIndex.children(ctr) {
+		if !child.State.IsRunning() {
 			return nil, fmt.Errorf("Cannot link to a non running container: %s AS %s", child.Name, linkAlias)
 		}
 
@@ -45,18 +48,105 @@ func (daemon *Daemon) setupLinkedContainers(ctr *container.Container) ([]string,
 			return nil, fmt.Errorf("container %s not attached to default bridge network", child.ID)
 		}
 
-		link := links.NewLink(
-			bridgeSettings.IPAddress,
-			childBridgeSettings.IPAddress,
-			linkAlias,
-			child.Config.Env,
-			child.Config.ExposedPorts,
-		)
-
-		env = append(env, link.ToEnv()...)
+		// Environment variables defined when using legacy links are deprecated and will be removed in a future release.
+		// Allow users to restore the old behavior through this escape hatch.
+		if os.Getenv("DOCKER_KEEP_DEPRECATED_LEGACY_LINKS_ENV_VARS") == "1" {
+			linkEnvVars := links.EnvVars(
+				netipstringer.Addr(bridgeSettings.IPAddress.Unmap()),
+				netipstringer.Addr(childBridgeSettings.IPAddress.Unmap()),
+				linkAlias,
+				child.Config.Env,
+				child.Config.ExposedPorts,
+			)
+			env = append(env, linkEnvVars...)
+		}
 	}
 
 	return env, nil
+}
+
+func (daemon *Daemon) addLegacyLinks(
+	ctx context.Context,
+	cfg *config.Config,
+	ctr *container.Container,
+	epConfig *network.EndpointSettings,
+	sb *libnetwork.Sandbox,
+) error {
+	ctx, span := otel.Tracer("").Start(ctx, "daemon.addLegacyLinks")
+	defer span.End()
+
+	if epConfig.EndpointID == "" {
+		return nil
+	}
+
+	children := daemon.linkIndex.children(ctr)
+	var parents map[string]*container.Container
+	if !cfg.DisableBridge && ctr.HostConfig.NetworkMode.IsPrivate() {
+		parents = daemon.linkIndex.parents(ctr)
+	}
+	if len(children) == 0 && len(parents) == 0 {
+		return nil
+	}
+	for _, child := range children {
+		if _, ok := child.NetworkSettings.Networks[network.DefaultNetwork]; !ok {
+			return fmt.Errorf("Cannot link to %s, as it does not belong to the default network", child.Name)
+		}
+	}
+
+	var (
+		childEndpoints []string
+		cEndpointID    string
+	)
+	for linkAlias, child := range children {
+		_, alias := path.Split(linkAlias)
+		// allow access to the linked container via the alias, real name, and container hostname
+		aliasList := alias + " " + child.Config.Hostname
+		// only add the name if alias isn't equal to the name
+		if alias != child.Name[1:] {
+			aliasList = aliasList + " " + child.Name[1:]
+		}
+		defaultNW := child.NetworkSettings.Networks[network.DefaultNetwork]
+		if defaultNW.IPAddress.IsValid() {
+			if err := sb.AddHostsEntry(ctx, aliasList, defaultNW.IPAddress.Unmap()); err != nil {
+				return errors.Wrapf(err, "failed to add address to /etc/hosts for link to %s", child.Name)
+			}
+		}
+		if defaultNW.GlobalIPv6Address.IsValid() {
+			if err := sb.AddHostsEntry(ctx, aliasList, defaultNW.GlobalIPv6Address); err != nil {
+				return errors.Wrapf(err, "failed to add IPv6 address to /etc/hosts for link to %s", child.Name)
+			}
+		}
+		cEndpointID = defaultNW.EndpointID
+		if cEndpointID != "" {
+			childEndpoints = append(childEndpoints, cEndpointID)
+		}
+	}
+
+	var parentEndpoints []string
+	for alias, parent := range parents {
+		_, alias = path.Split(alias)
+		// Update ctr's IP address in /etc/hosts files in containers with legacy-links to ctr.
+		log.G(context.TODO()).Debugf("Update /etc/hosts of %s for alias %s with ip %s", parent.ID, alias, epConfig.IPAddress)
+		if psb, _ := daemon.netController.GetSandbox(parent.ID); psb != nil {
+			if err := psb.UpdateHostsEntry(alias, epConfig.IPAddress); err != nil {
+				return errors.Wrapf(err, "failed to update /etc/hosts of %s for alias %s with IP %s",
+					parent.ID, alias, epConfig.IPAddress)
+			}
+			if epConfig.GlobalIPv6Address.IsValid() {
+				if err := psb.UpdateHostsEntry(alias, epConfig.GlobalIPv6Address); err != nil {
+					return errors.Wrapf(err, "failed to update /etc/hosts of %s for alias %s with IP %s",
+						parent.ID, alias, epConfig.GlobalIPv6Address)
+				}
+			}
+		}
+		if cEndpointID != "" {
+			parentEndpoints = append(parentEndpoints, cEndpointID)
+		}
+	}
+
+	sb.UpdateLabels(bridge.LegacyContainerLinkOptions(parentEndpoints, childEndpoints))
+
+	return nil
 }
 
 func (daemon *Daemon) getIPCContainer(id string) (*container.Container, error) {
@@ -65,10 +155,10 @@ func (daemon *Daemon) getIPCContainer(id string) (*container.Container, error) {
 	if err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
-	if !ctr.IsRunning() {
+	if !ctr.State.IsRunning() {
 		return nil, errNotRunning(id)
 	}
-	if ctr.IsRestarting() {
+	if ctr.State.IsRestarting() {
 		return nil, errContainerIsRestarting(id)
 	}
 
@@ -89,10 +179,10 @@ func (daemon *Daemon) getPIDContainer(id string) (*container.Container, error) {
 	if err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
-	if !ctr.IsRunning() {
+	if !ctr.State.IsRunning() {
 		return nil, errNotRunning(id)
 	}
-	if ctr.IsRestarting() {
+	if ctr.State.IsRestarting() {
 		return nil, errContainerIsRestarting(id)
 	}
 
@@ -151,7 +241,7 @@ func (daemon *Daemon) setupIPCDirs(ctr *container.Container) error {
 
 	case ipcMode.IsHost():
 		if _, err := os.Stat("/dev/shm"); err != nil {
-			return fmt.Errorf("/dev/shm is not mounted, but must be for --ipc=host")
+			return errors.New("/dev/shm is not mounted, but must be for --ipc=host")
 		}
 		ctr.ShmPath = "/dev/shm"
 
@@ -166,14 +256,14 @@ func (daemon *Daemon) setupIPCDirs(ctr *container.Container) error {
 		fallthrough
 
 	case ipcMode.IsShareable():
-		rootIDs := daemon.idMapping.RootPair()
+		uid, gid := daemon.idMapping.RootPair()
 		if !ctr.HasMountFor("/dev/shm") {
 			shmPath, err := ctr.ShmResourcePath()
 			if err != nil {
 				return err
 			}
 
-			if err := idtools.MkdirAllAndChown(shmPath, 0o700, rootIDs); err != nil {
+			if err := user.MkdirAllAndChown(shmPath, 0o700, uid, gid); err != nil {
 				return err
 			}
 
@@ -181,7 +271,7 @@ func (daemon *Daemon) setupIPCDirs(ctr *container.Container) error {
 			if err := unix.Mount("shm", shmPath, "tmpfs", uintptr(unix.MS_NOEXEC|unix.MS_NOSUID|unix.MS_NODEV), label.FormatMountLabel(shmproperty, ctr.GetMountLabel())); err != nil {
 				return fmt.Errorf("mounting shm tmpfs: %s", err)
 			}
-			if err := os.Chown(shmPath, rootIDs.UID, rootIDs.GID); err != nil {
+			if err := os.Chown(shmPath, uid, gid); err != nil {
 				return err
 			}
 			ctr.ShmPath = shmPath
@@ -209,11 +299,11 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 	}()
 
 	if ctr.DependencyStore == nil {
-		return fmt.Errorf("secret store is not initialized")
+		return errors.New("secret store is not initialized")
 	}
 
 	// retrieve possible remapped range start for root UID, GID
-	rootIDs := daemon.idMapping.RootPair()
+	ruid, rgid := daemon.idMapping.RootPair()
 
 	for _, s := range ctr.SecretReferences {
 		// TODO (ehazlett): use type switch when more are supported
@@ -228,7 +318,7 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 		if err != nil {
 			return errors.Wrap(err, "error getting secret file path")
 		}
-		if err := idtools.MkdirAllAndChown(filepath.Dir(fPath), 0o700, rootIDs); err != nil {
+		if err := user.MkdirAllAndChown(filepath.Dir(fPath), 0o700, ruid, rgid); err != nil {
 			return errors.Wrap(err, "error creating secret mount path")
 		}
 
@@ -253,7 +343,7 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 			return err
 		}
 
-		if err := os.Chown(fPath, rootIDs.UID+uid, rootIDs.GID+gid); err != nil {
+		if err := os.Chown(fPath, ruid+uid, rgid+gid); err != nil {
 			return errors.Wrap(err, "error setting ownership for secret")
 		}
 		if err := os.Chmod(fPath, s.File.Mode); err != nil {
@@ -279,7 +369,7 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 		if err != nil {
 			return errors.Wrap(err, "error getting config file path for container")
 		}
-		if err := idtools.MkdirAllAndChown(filepath.Dir(fPath), 0o700, rootIDs); err != nil {
+		if err := user.MkdirAllAndChown(filepath.Dir(fPath), 0o700, ruid, rgid); err != nil {
 			return errors.Wrap(err, "error creating config mount path")
 		}
 
@@ -304,7 +394,7 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 			return err
 		}
 
-		if err := os.Chown(fPath, rootIDs.UID+uid, rootIDs.GID+gid); err != nil {
+		if err := os.Chown(fPath, ruid+uid, rgid+gid); err != nil {
 			return errors.Wrap(err, "error setting ownership for config")
 		}
 		if err := os.Chmod(fPath, configRef.File.Mode); err != nil {
@@ -319,18 +409,18 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 // In practice this is using a tmpfs mount and is used for both "configs" and "secrets"
 func (daemon *Daemon) createSecretsDir(ctr *container.Container) error {
 	// retrieve possible remapped range start for root UID, GID
-	rootIDs := daemon.idMapping.RootPair()
+	uid, gid := daemon.idMapping.RootPair()
 	dir, err := ctr.SecretMountPath()
 	if err != nil {
 		return errors.Wrap(err, "error getting container secrets dir")
 	}
 
 	// create tmpfs
-	if err := idtools.MkdirAllAndChown(dir, 0o700, rootIDs); err != nil {
+	if err := user.MkdirAllAndChown(dir, 0o700, uid, gid); err != nil {
 		return errors.Wrap(err, "error creating secret local mount path")
 	}
 
-	tmpfsOwnership := fmt.Sprintf("uid=%d,gid=%d", rootIDs.UID, rootIDs.GID)
+	tmpfsOwnership := fmt.Sprintf("uid=%d,gid=%d", uid, gid)
 	if err := mount.Mount("tmpfs", dir, "tmpfs", "nodev,nosuid,noexec,"+tmpfsOwnership); err != nil {
 		return errors.Wrap(err, "unable to setup secret mount")
 	}
@@ -345,15 +435,27 @@ func (daemon *Daemon) remountSecretDir(ctr *container.Container) error {
 	if err := label.Relabel(dir, ctr.MountLabel, false); err != nil {
 		log.G(context.TODO()).WithError(err).WithField("dir", dir).Warn("Error while attempting to set selinux label")
 	}
-	rootIDs := daemon.idMapping.RootPair()
-	tmpfsOwnership := fmt.Sprintf("uid=%d,gid=%d", rootIDs.UID, rootIDs.GID)
+	uid, gid := daemon.idMapping.RootPair()
+	tmpfsOwnership := fmt.Sprintf("uid=%d,gid=%d", uid, gid)
 
-	// remount secrets ro
-	if err := mount.Mount("tmpfs", dir, "tmpfs", "remount,ro,"+tmpfsOwnership); err != nil {
-		return errors.Wrap(err, "unable to remount dir as readonly")
+	// Remount secrets as read-only, retrying on transient EBUSY errors.
+	// On busy hosts the tmpfs mount can momentarily be held by other
+	// processes (e.g. container runtime) right after writing secret/config
+	// files, causing the remount to fail. Retrying resolves the race.
+	// See https://github.com/moby/moby/issues/48783
+	var mountErr error
+	for retry := range 5 {
+		mountErr = mount.Mount("tmpfs", dir, "tmpfs", "remount,ro,"+tmpfsOwnership)
+		if mountErr == nil {
+			return nil
+		}
+		if !errors.Is(mountErr, syscall.EBUSY) {
+			return errors.Wrap(mountErr, "unable to remount dir as readonly")
+		}
+		log.G(context.TODO()).WithError(mountErr).WithField("dir", dir).Debug("Transient EBUSY on secrets remount, retrying")
+		time.Sleep(10*time.Millisecond + time.Duration(retry)*25*time.Millisecond)
 	}
-
-	return nil
+	return errors.Wrap(mountErr, "unable to remount dir as readonly")
 }
 
 func (daemon *Daemon) cleanupSecretDir(ctr *container.Container) {
@@ -370,18 +472,22 @@ func (daemon *Daemon) cleanupSecretDir(ctr *container.Container) {
 }
 
 func killProcessDirectly(ctr *container.Container) error {
-	pid := ctr.GetPID()
+	pid := ctr.State.GetPID()
 	if pid == 0 {
 		// Ensure that we don't kill ourselves
 		return nil
 	}
 
 	if err := unix.Kill(pid, syscall.SIGKILL); err != nil {
-		if err != unix.ESRCH {
+		if !errors.Is(err, unix.ESRCH) {
 			return errdefs.System(err)
 		}
 		err = errNoSuchProcess{pid, syscall.SIGKILL}
-		log.G(context.TODO()).WithError(err).WithField("container", ctr.ID).Debug("no such process")
+		log.G(context.TODO()).WithFields(log.Fields{
+			"error":     err,
+			"container": ctr.ID,
+			"pid":       pid,
+		}).Debug("no such process")
 		return err
 	}
 
@@ -390,7 +496,11 @@ func killProcessDirectly(ctr *container.Container) error {
 		// Since we can not kill a zombie pid, add zombie check here
 		isZombie, err := process.Zombie(pid)
 		if err != nil {
-			log.G(context.TODO()).WithError(err).WithField("container", ctr.ID).Warn("Container state is invalid")
+			log.G(context.TODO()).WithFields(log.Fields{
+				"error":     err,
+				"container": ctr.ID,
+				"pid":       pid,
+			}).Warn("Container state is invalid")
 			return err
 		}
 		if isZombie {
@@ -398,12 +508,6 @@ func killProcessDirectly(ctr *container.Container) error {
 		}
 	}
 	return nil
-}
-
-func isLinkable(child *container.Container) bool {
-	// A container is linkable only if it belongs to the default network
-	_, ok := child.NetworkSettings.Networks[network.DefaultNetwork]
-	return ok
 }
 
 // TODO(aker): remove when we make the default bridge network behave like any other network
@@ -417,9 +521,11 @@ func serviceDiscoveryOnDefaultNetwork() bool {
 	return false
 }
 
-func buildSandboxPlatformOptions(ctr *container.Container, cfg *config.Config, sboxOptions *[]libnetwork.SandboxOption) error {
-	var err error
-	var originResolvConfPath string
+func buildSandboxPlatformOptions(ctr *container.Container, cfg *config.Config) ([]libnetwork.SandboxOption, error) {
+	var (
+		sboxOptions          []libnetwork.SandboxOption
+		originResolvConfPath string
+	)
 
 	// Set the correct paths for /etc/hosts and /etc/resolv.conf, based on the
 	// networking-mode of the container. Note that containers with "container"
@@ -430,10 +536,7 @@ func buildSandboxPlatformOptions(ctr *container.Container, cfg *config.Config, s
 		// In host-mode networking, the container does not have its own networking
 		// namespace, so both `/etc/hosts` and `/etc/resolv.conf` should be the same
 		// as on the host itself. The container gets a copy of these files.
-		*sboxOptions = append(
-			*sboxOptions,
-			libnetwork.OptionOriginHostsPath("/etc/hosts"),
-		)
+		sboxOptions = append(sboxOptions, libnetwork.OptionOriginHostsPath("/etc/hosts"))
 		originResolvConfPath = "/etc/resolv.conf"
 	case ctr.HostConfig.NetworkMode.IsUserDefined():
 		// The container uses a user-defined network. We use the embedded DNS
@@ -463,26 +566,31 @@ func buildSandboxPlatformOptions(ctr *container.Container, cfg *config.Config, s
 		originResolvConfPath = cfg.GetResolvConf()
 	}
 
-	// Allow tests to point at their own resolv.conf file.
+	// Allow tests to point at their own resolv.conf file. Note that
+	// this only overrides the resolvConf path, not "/etc/hosts", which
+	// for containers using the "host" network namespace is set above.
 	if envPath := os.Getenv("DOCKER_TEST_RESOLV_CONF_PATH"); envPath != "" {
 		log.G(context.TODO()).Infof("Using OriginResolvConfPath from env: %s", envPath)
 		originResolvConfPath = envPath
 	}
-	*sboxOptions = append(*sboxOptions, libnetwork.OptionOriginResolvConfPath(originResolvConfPath))
+	sboxOptions = append(sboxOptions, libnetwork.OptionOriginResolvConfPath(originResolvConfPath))
 
-	ctr.HostsPath, err = ctr.GetRootResourcePath("hosts")
+	hostsPath, err := ctr.GetRootResourcePath("hosts")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	*sboxOptions = append(*sboxOptions, libnetwork.OptionHostsPath(ctr.HostsPath))
-
-	ctr.ResolvConfPath, err = ctr.GetRootResourcePath("resolv.conf")
+	resolvConfPath, err := ctr.GetRootResourcePath("resolv.conf")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	*sboxOptions = append(*sboxOptions, libnetwork.OptionResolvConfPath(ctr.ResolvConfPath))
 
-	return nil
+	ctr.HostsPath, ctr.ResolvConfPath = hostsPath, resolvConfPath
+	sboxOptions = append(sboxOptions,
+		libnetwork.OptionHostsPath(hostsPath),
+		libnetwork.OptionResolvConfPath(resolvConfPath),
+	)
+
+	return sboxOptions, nil
 }
 
 func (daemon *Daemon) initializeNetworkingPaths(ctr *container.Container, nc *container.Container) error {
@@ -498,5 +606,6 @@ func (daemon *Daemon) setupContainerMountsRoot(ctr *container.Container) error {
 	if err != nil {
 		return err
 	}
-	return idtools.MkdirAllAndChown(p, 0o710, idtools.Identity{UID: idtools.CurrentIdentity().UID, GID: daemon.IdentityMapping().RootPair().GID})
+	_, gid := daemon.IdentityMapping().RootPair()
+	return user.MkdirAllAndChown(p, 0o710, os.Getuid(), gid)
 }

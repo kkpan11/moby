@@ -1,4 +1,4 @@
-package daemon // import "github.com/docker/docker/integration-cli/daemon"
+package daemon
 
 import (
 	"context"
@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/testutil/daemon"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/stringid"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
 	"github.com/pkg/errors"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
@@ -24,7 +26,7 @@ type Daemon struct {
 // The daemon will not automatically start.
 func New(t testing.TB, dockerBinary string, dockerdBinary string, ops ...daemon.Option) *Daemon {
 	t.Helper()
-	ops = append(ops, daemon.WithDockerdBinary(dockerdBinary))
+	ops = append(ops, daemon.WithDockerdBinary(dockerdBinary), daemon.WithEnvVars("DOCKER_MIN_API_VERSION=1.24"))
 	d := daemon.New(t, ops...)
 	return &Daemon{
 		Daemon:       d,
@@ -35,8 +37,14 @@ func New(t testing.TB, dockerBinary string, dockerdBinary string, ops ...daemon.
 // Cmd executes a docker CLI command against this daemon.
 // Example: d.Cmd("version") will run docker -H unix://path/to/unix.sock version
 func (d *Daemon) Cmd(args ...string) (string, error) {
-	result := icmd.RunCmd(d.Command(args...))
+	result := d.RunCmd(args...)
 	return result.Combined(), result.Error
+}
+
+// RunCmd executes a docker CLI command against this daemon and returns the result.
+// Example: d.RunCmd("version") will run docker -H unix://path/to/unix.sock version
+func (d *Daemon) RunCmd(args ...string) *icmd.Result {
+	return icmd.RunCmd(d.Command(args...))
 }
 
 // Command creates a docker CLI command against this daemon, to be executed later.
@@ -80,15 +88,20 @@ func (d *Daemon) inspectFieldWithError(name, field string) (string, error) {
 
 // CheckActiveContainerCount returns the number of active containers
 // FIXME(vdemeester) should re-use ActivateContainers in some way
-func (d *Daemon) CheckActiveContainerCount(ctx context.Context) func(t *testing.T) (interface{}, string) {
-	return func(t *testing.T) (interface{}, string) {
+func (d *Daemon) CheckActiveContainerCount(ctx context.Context) func(t *testing.T) (any, string) {
+	return func(t *testing.T) (any, string) {
 		t.Helper()
-		out, err := d.Cmd("ps", "-q")
+		apiClient, err := client.New(client.FromEnv, client.WithHost(d.Sock()))
 		assert.NilError(t, err)
-		if len(strings.TrimSpace(out)) == 0 {
-			return 0, ""
+
+		list, err := apiClient.ContainerList(ctx, client.ContainerListOptions{})
+		_ = apiClient.Close()
+		assert.NilError(t, err)
+		var out strings.Builder
+		for _, ctr := range list.Items {
+			out.WriteString(stringid.TruncateID(ctr.ID) + "\n")
 		}
-		return len(strings.Split(strings.TrimSpace(out), "\n")), fmt.Sprintf("output: %q", out)
+		return len(list.Items), out.String()
 	}
 }
 
@@ -99,6 +112,7 @@ func (d *Daemon) WaitRun(contID string) error {
 }
 
 // WaitInspectWithArgs waits for the specified expression to be equals to the specified expected string in the given time.
+//
 // Deprecated: use cli.WaitCmd instead
 func WaitInspectWithArgs(dockerBinary, name, expr, expected string, timeout time.Duration, arg ...string) error {
 	after := time.After(timeout)

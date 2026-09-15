@@ -1,7 +1,4 @@
-// FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
-//go:build go1.21
-
-package loggerutils // import "github.com/docker/docker/daemon/logger/loggerutils"
+package loggerutils
 
 import (
 	"compress/gzip"
@@ -17,18 +14,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/tracing"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/log"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/pkg/pools"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/pkg/pools"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // rotateFileMetadata is a metadata of the gzip header of the compressed log file
 type rotateFileMetadata struct {
-	LastTime time.Time `json:"lastTime,omitempty"`
+	LastTime time.Time `json:"lastTime"`
 }
 
 // LogFile is Logger implementation for default Docker logging.
@@ -122,12 +118,12 @@ type GetTailReaderFunc func(ctx context.Context, f SizeReaderAt, nLogLines int) 
 
 // NewLogFile creates new LogFile
 func NewLogFile(logPath string, capacity int64, maxFiles int, compress bool, decodeFunc MakeDecoderFn, perms os.FileMode, getTailReader GetTailReaderFunc) (*LogFile, error) {
-	log, err := openFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, perms)
+	logFile, err := openFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, perms)
 	if err != nil {
 		return nil, err
 	}
 
-	size, err := log.Seek(0, io.SeekEnd)
+	size, err := logFile.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +138,7 @@ func NewLogFile(logPath string, capacity int64, maxFiles int, compress bool, dec
 	st <- logReadState{pos: pos}
 
 	return &LogFile{
-		f:             log,
+		f:             logFile,
 		read:          st,
 		pos:           pos,
 		closed:        make(chan struct{}),
@@ -372,7 +368,7 @@ func (w *LogFile) Close() error {
 	close(w.closed)
 	// Wait until any in-progress rotation is complete.
 	w.rotateMu.Lock()
-	w.rotateMu.Unlock() //nolint:staticcheck
+	defer w.rotateMu.Unlock()
 	return nil
 }
 
@@ -731,7 +727,7 @@ func getTailFiles(ctx context.Context, files []fileOpener, nLines int, getTailRe
 
 	if nLines <= 0 {
 		for _, fo := range files {
-			span.AddEvent("Open file", trace.WithAttributes(attribute.String("file", fo.Ref())))
+			span.AddEvent("Open file", attribute.String("file", fo.Ref()))
 
 			ra, err := fo.ReaderAt(ctx)
 			if err != nil {
@@ -751,14 +747,14 @@ func getTailFiles(ctx context.Context, files []fileOpener, nLines int, getTailRe
 		fo := files[i]
 
 		fileAttr := attribute.String("file", fo.Ref())
-		span.AddEvent("Open file", trace.WithAttributes(fileAttr))
+		span.AddEvent("Open file", fileAttr)
 
 		ra, err := fo.ReaderAt(ctx)
 		if err != nil {
 			return nil, err
 		}
 
-		span.AddEvent("Scan file to tail", trace.WithAttributes(fileAttr, attribute.Int("remaining_lines", nLines)))
+		span.AddEvent("Scan file to tail", fileAttr, attribute.Int("remaining_lines", nLines))
 
 		tail, n, err := getTailReader(ctx, ra, nLines)
 		if err != nil {
@@ -806,7 +802,6 @@ func tailFiles(ctx context.Context, files []fileOpener, watcher *logger.LogWatch
 	}()
 
 	for _, ra := range readers {
-		ra := ra
 		select {
 		case <-watcher.WatchConsumerGone():
 			return false

@@ -10,9 +10,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/request"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"github.com/pkg/errors"
 	"gotest.tools/v3/assert"
 )
@@ -34,7 +34,7 @@ func (s *DockerAPISuite) TestExecResizeImmediatelyAfterExecStart(c *testing.T) {
 	cli.DockerCmd(c, "run", "-d", "-i", "-t", "--name", name, "--restart", "always", "busybox", "/bin/sh")
 
 	testExecResize := func() error {
-		data := map[string]interface{}{
+		data := map[string]any{
 			"AttachStdin": true,
 			"Cmd":         []string{"/bin/sh"},
 		}
@@ -71,7 +71,7 @@ func (s *DockerAPISuite) TestExecResizeImmediatelyAfterExecStart(c *testing.T) {
 		_, rc, err := request.Post(testutil.GetContext(c), fmt.Sprintf("/exec/%s/resize?h=24&w=80", execID), request.ContentType("text/plain"))
 		if err != nil {
 			// It's probably a panic of the daemon if io.ErrUnexpectedEOF is returned.
-			if err == io.ErrUnexpectedEOF {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
 				return errors.New("the daemon might have crashed")
 			}
 			// Other error happened, should be reported.
@@ -92,14 +92,12 @@ func (s *DockerAPISuite) TestExecResizeImmediatelyAfterExecStart(c *testing.T) {
 		ch = make(chan error, n)
 		wg sync.WaitGroup
 	)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			if err := testExecResize(); err != nil {
 				ch <- err
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

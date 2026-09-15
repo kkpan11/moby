@@ -1,15 +1,14 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 
-	"github.com/containerd/containerd"
-	coci "github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/pkg/apparmor"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/oci/caps"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	containerd "github.com/containerd/containerd/v2/client"
+	coci "github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/pkg/oci/caps"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func getUserFromContainerd(ctx context.Context, containerdCli *containerd.Client, ec *container.ExecConfig) (specs.User, error) {
@@ -43,19 +42,20 @@ func getUserFromContainerd(ctx context.Context, containerdCli *containerd.Client
 }
 
 func (daemon *Daemon) execSetPlatformOpt(ctx context.Context, daemonCfg *config.Config, ec *container.ExecConfig, p *specs.Process) error {
-	if len(ec.User) > 0 {
+	if ec.User != "" {
+		var user specs.User
 		var err error
 		if daemon.UsesSnapshotter() {
-			p.User, err = getUserFromContainerd(ctx, daemon.containerdClient, ec)
-			if err != nil {
-				return err
-			}
+			user, err = getUserFromContainerd(ctx, daemon.containerdClient, ec)
 		} else {
-			p.User, err = getUser(ec.Container, ec.User)
-			if err != nil {
-				return err
-			}
+			user, err = getUser(ec.Container, ec.User)
 		}
+		if err != nil {
+			return err
+		}
+		// Preserve the umask inherited from the container's process spec.
+		user.Umask = p.User.Umask
+		p.User = user
 	}
 
 	if ec.Privileged {
@@ -66,7 +66,7 @@ func (daemon *Daemon) execSetPlatformOpt(ctx context.Context, daemonCfg *config.
 		}
 	}
 
-	if apparmor.HostSupports() {
+	if appArmorSupported() {
 		var appArmorProfile string
 		if ec.Container.AppArmorProfile != "" {
 			appArmorProfile = ec.Container.AppArmorProfile
@@ -83,9 +83,9 @@ func (daemon *Daemon) execSetPlatformOpt(ctx context.Context, daemonCfg *config.
 			// profiles inadvertently. Since we cannot store our profile in
 			// /etc/apparmor.d, nor can we practically add other ways of
 			// telling the system to keep our profile loaded, in order to make
-			// sure that we keep the default profile enabled we dynamically
-			// reload it if necessary.
-			if err := ensureDefaultAppArmorProfile(); err != nil {
+			// sure that we keep the default profile enabled we load it again
+			// if it is missing.
+			if err := daemon.loadDefaultAppArmorProfileIfMissing(); err != nil {
 				return err
 			}
 		}

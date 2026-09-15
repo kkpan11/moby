@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -9,8 +8,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/docker/docker/dockerversion"
 	"github.com/ishidawataru/sctp"
+	"github.com/moby/moby/v2/dockerversion"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // The caller is expected to pass-in open file descriptors ...
@@ -59,9 +60,9 @@ func main() {
 }
 
 func newProxy(config ProxyConfig) (p Proxy, err error) {
-	ipv := ipv4
+	ipv := ip4
 	if config.HostIP.To4() == nil {
-		ipv = ipv6
+		ipv = ip6
 	}
 
 	switch config.Proto {
@@ -96,6 +97,21 @@ func newProxy(config ProxyConfig) (p Proxy, err error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to listen on %s: %w", hostAddr, err)
 			}
+			// We need to setsockopt(IP_PKTINFO) on the listener to get the destination address as an ancillary
+			// message. The daddr will be used as the source address when sending back replies coming from the
+			// container to the client. If we don't do this, the kernel will have to pick a source address for us, and
+			// it might not pick what the client expects. That would result in ICMP Port Unreachable.
+			if ipv == ip4 {
+				pc := ipv4.NewPacketConn(listener)
+				if err := pc.SetControlMessage(ipv4.FlagDst, true); err != nil {
+					return nil, fmt.Errorf("failed to setsockopt(IP_PKTINFO): %w", err)
+				}
+			} else {
+				pc := ipv6.NewPacketConn(listener)
+				if err := pc.SetControlMessage(ipv6.FlagDst, true); err != nil {
+					return nil, fmt.Errorf("failed to setsockopt(IPV6_RECVPKTINFO): %w", err)
+				}
+			}
 		} else {
 			l, err := net.FilePacketConn(config.ListenSock)
 			if err != nil {
@@ -108,21 +124,21 @@ func newProxy(config ProxyConfig) (p Proxy, err error) {
 			}
 		}
 		container := &net.UDPAddr{IP: config.ContainerIP, Port: config.ContainerPort}
-		p, err = NewUDPProxy(listener, container)
+		p, err = NewUDPProxy(listener, container, ipv)
 	case "sctp":
 		var listener *sctp.SCTPListener
-		if config.ListenSock != nil {
-			// There's no way to construct an SCTPListener from a file descriptor at the moment.
-			// If a socket has been passed in, it's probably from a newer daemon using a version
-			// of the sctp module that does allow it.
-			return nil, errors.New("cannot use supplied SCTP socket, check the latest docker-proxy is in your $PATH")
+		if config.ListenSock == nil {
+			hostAddr := &sctp.SCTPAddr{IPAddrs: []net.IPAddr{{IP: config.HostIP}}, Port: config.HostPort}
+			listener, err = sctp.ListenSCTP("sctp"+string(ipv), hostAddr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to listen on %s: %w", hostAddr, err)
+			}
+		} else {
+			if listener, err = sctp.FileListener(config.ListenSock); err != nil {
+				return nil, err
+			}
 		}
-		hostAddr := &sctp.SCTPAddr{IPAddrs: []net.IPAddr{{IP: config.HostIP}}, Port: config.HostPort}
 		container := &sctp.SCTPAddr{IPAddrs: []net.IPAddr{{IP: config.ContainerIP}}, Port: config.ContainerPort}
-		listener, err = sctp.ListenSCTP("sctp"+string(ipv), hostAddr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to listen on %s: %w", hostAddr, err)
-		}
 		p, err = NewSCTPProxy(listener, container)
 	default:
 		return nil, fmt.Errorf("unsupported protocol %s", config.Proto)

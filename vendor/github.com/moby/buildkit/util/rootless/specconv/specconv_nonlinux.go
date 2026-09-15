@@ -1,5 +1,4 @@
 //go:build !linux
-// +build !linux
 
 package specconv
 
@@ -15,6 +14,6 @@ import (
 // * Remove cgroups
 //
 // See docs/rootless.md for the supported runc revision.
-func ToRootless(spec *specs.Spec) error {
-	return errors.Errorf("not implemented on on %s", runtime.GOOS)
+func ToRootless(spec *specs.Spec) ([]string, error) {
+	return nil, errors.Errorf("not implemented on %s", runtime.GOOS)
 }

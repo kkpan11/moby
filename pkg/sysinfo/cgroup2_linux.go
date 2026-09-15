@@ -1,4 +1,4 @@
-package sysinfo // import "github.com/docker/docker/pkg/sysinfo"
+package sysinfo
 
 import (
 	"context"
@@ -26,6 +26,7 @@ func newV2(options ...Opt) *SysInfo {
 		applyAppArmorInfo,
 		applySeccompInfo,
 		applyCgroupNsInfo,
+		applyTimeNsInfo,
 	}
 
 	m, err := cgroupsV2.Load(sysInfo.cg2GroupPath)
@@ -84,8 +85,6 @@ func applyMemoryCgroupInfoV2(info *SysInfo) {
 	info.MemoryReservation = true
 	info.OomKillDisable = false
 	info.MemorySwappiness = false
-	info.KernelMemory = false
-	info.KernelMemoryTCP = false
 }
 
 func applyCPUCgroupInfoV2(info *SysInfo) {
@@ -125,11 +124,25 @@ func applyCPUSetCgroupInfoV2(info *SysInfo) {
 	}
 	info.Cpus = strings.TrimSpace(string(cpus))
 
+	cpuSets, err := parseUintList(info.Cpus, 0)
+	if err != nil {
+		info.Warnings = append(info.Warnings, "Unable to parse cpuset cpus: "+err.Error())
+		return
+	}
+	info.CPUSets = cpuSets
+
 	mems, err := os.ReadFile(path.Join("/sys/fs/cgroup", info.cg2GroupPath, "cpuset.mems.effective"))
 	if err != nil {
 		return
 	}
 	info.Mems = strings.TrimSpace(string(mems))
+
+	memSets, err := parseUintList(info.Cpus, 0)
+	if err != nil {
+		info.Warnings = append(info.Warnings, "Unable to parse cpuset mems: "+err.Error())
+		return
+	}
+	info.MemSets = memSets
 }
 
 func applyPIDSCgroupInfoV2(info *SysInfo) {

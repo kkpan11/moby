@@ -1,24 +1,26 @@
-package build // import "github.com/docker/docker/integration/build"
+package build
 
 import (
 	"bufio"
 	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/daemon"
-	"github.com/docker/docker/testutil/fakecontext"
-	"github.com/docker/docker/testutil/fixtures/load"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	buildtypes "github.com/moby/moby/api/types/build"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/jsonmessage"
+	"github.com/moby/moby/v2/integration/internal/build"
+	"github.com/moby/moby/v2/integration/internal/container"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
+	"github.com/moby/moby/v2/internal/testutil/fakecontext"
+	"github.com/moby/moby/v2/internal/testutil/fixtures/load"
 	"gotest.tools/v3/assert"
+	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
 )
 
@@ -36,16 +38,14 @@ func TestBuildUserNamespaceValidateCapabilitiesAreV2(t *testing.T) {
 
 	const imageTag = "capabilities:1.0"
 
-	tmp, err := os.MkdirTemp("", "integration-")
-	assert.NilError(t, err)
-	defer os.RemoveAll(tmp)
+	tmpDir := t.TempDir()
 
-	dUserRemap := daemon.New(t)
-	dUserRemap.Start(t, "--userns-remap", "default")
+	dUserRemap := daemon.New(t, daemon.WithUserNsRemap("default"))
+	dUserRemap.Start(t)
 	clientUserRemap := dUserRemap.NewClientT(t)
 	defer clientUserRemap.Close()
 
-	err = load.FrozenImagesLinux(ctx, clientUserRemap, "debian:bookworm-slim")
+	err := load.FrozenImagesLinux(ctx, clientUserRemap, "debian:trixie-slim")
 	assert.NilError(t, err)
 
 	dUserRemapRunning := true
@@ -57,7 +57,7 @@ func TestBuildUserNamespaceValidateCapabilitiesAreV2(t *testing.T) {
 	}()
 
 	dockerfile := `
-		FROM debian:bookworm-slim
+		FROM debian:trixie-slim
 		RUN apt-get update && apt-get install -y libcap2-bin --no-install-recommends
 		RUN setcap CAP_NET_BIND_SERVICE=+eip /bin/sleep
 	`
@@ -65,23 +65,21 @@ func TestBuildUserNamespaceValidateCapabilitiesAreV2(t *testing.T) {
 	source := fakecontext.New(t, "", fakecontext.WithDockerfile(dockerfile))
 	defer source.Close()
 
-	resp, err := clientUserRemap.ImageBuild(ctx,
-		source.AsTarReader(t),
-		types.ImageBuildOptions{
-			Tags: []string{imageTag},
-		})
+	resp, err := clientUserRemap.ImageBuild(ctx, source.AsTarReader(t), client.ImageBuildOptions{
+		Tags: []string{imageTag},
+	})
 	assert.NilError(t, err)
 	defer resp.Body.Close()
 
 	buf := bytes.NewBuffer(nil)
-	err = jsonmessage.DisplayJSONMessagesStream(resp.Body, buf, 0, false, nil)
+	err = jsonmessage.DisplayStream(resp.Body, buf)
 	assert.NilError(t, err)
 
-	reader, err := clientUserRemap.ImageSave(ctx, []string{imageTag}, image.SaveOptions{})
+	reader, err := clientUserRemap.ImageSave(ctx, []string{imageTag})
 	assert.NilError(t, err, "failed to download capabilities image")
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
-	tar, err := os.Create(tmp + "/image.tar")
+	tar, err := os.Create(filepath.Join(tmpDir, "image.tar"))
 	assert.NilError(t, err, "failed to create image tar file")
 	defer tar.Close()
 
@@ -102,23 +100,25 @@ func TestBuildUserNamespaceValidateCapabilitiesAreV2(t *testing.T) {
 	clientNoUserRemap := dNoUserRemap.NewClientT(t)
 	defer clientNoUserRemap.Close()
 
-	tarFile, err := os.Open(tmp + "/image.tar")
+	tarFile, err := os.Open(tmpDir + "/image.tar")
 	assert.NilError(t, err, "failed to open image tar file")
 	defer tarFile.Close()
 
 	tarReader := bufio.NewReader(tarFile)
-	loadResp, err := clientNoUserRemap.ImageLoad(ctx, tarReader, image.LoadOptions{})
+	loadResp, err := clientNoUserRemap.ImageLoad(ctx, tarReader)
 	assert.NilError(t, err, "failed to load image tar file")
-	defer loadResp.Body.Close()
-	buf = bytes.NewBuffer(nil)
-	err = jsonmessage.DisplayJSONMessagesStream(loadResp.Body, buf, 0, false, nil)
+	defer loadResp.Close()
+	var buf2 bytes.Buffer
+	err = jsonmessage.DisplayStream(loadResp, &buf2)
 	assert.NilError(t, err)
 
 	cid := container.Run(ctx, t, clientNoUserRemap,
 		container.WithImage(imageTag),
 		container.WithCmd("/sbin/getcap", "-n", "/bin/sleep"),
 	)
-	logReader, err := clientNoUserRemap.ContainerLogs(ctx, cid, containertypes.LogsOptions{
+
+	poll.WaitOn(t, container.IsStopped(ctx, clientNoUserRemap, cid))
+	logReader, err := clientNoUserRemap.ContainerLogs(ctx, cid, client.ContainerLogsOptions{
 		ShowStdout: true,
 	})
 	assert.NilError(t, err)
@@ -131,4 +131,39 @@ func TestBuildUserNamespaceValidateCapabilitiesAreV2(t *testing.T) {
 	if strings.TrimSpace(actualStdout.String()) != "/bin/sleep cap_net_bind_service=eip" {
 		t.Fatalf("run produced invalid output: %q, expected %q", actualStdout.String(), "/bin/sleep cap_net_bind_service=eip")
 	}
+}
+
+func TestBuildUserNamespaceRemap(t *testing.T) {
+	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
+	skip.If(t, testEnv.IsRootless())
+	skip.If(t, testEnv.UsingSnapshotter(), "TODO: Broken with containerd")
+
+	ctx := testutil.StartSpan(baseContext, t)
+
+	d := daemon.New(t, daemon.WithUserNsRemap("default"))
+	d.Start(t)
+	defer func() {
+		d.Stop(t)
+		d.Cleanup(t)
+	}()
+
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
+
+	_, err := apiClient.Info(ctx, client.InfoOptions{})
+	assert.NilError(t, err)
+
+	err = load.FrozenImagesLinux(ctx, apiClient, "busybox:latest")
+	assert.NilError(t, err)
+
+	const dockerfile = `FROM busybox
+RUN echo "hello world"
+`
+
+	source := fakecontext.New(t, "", fakecontext.WithDockerfile(dockerfile))
+	defer source.Close()
+
+	assert.Check(t, build.Do(ctx, t, apiClient, source, client.ImageBuildOptions{
+		Version: buildtypes.BuilderBuildKit,
+	}) != "")
 }

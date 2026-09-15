@@ -35,8 +35,8 @@ func getCgroupIOStat(cgroupPath string) (*resourcestypes.IOStat, error) {
 	}
 
 	ioStat := &resourcestypes.IOStat{}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(string(data), "\n")
+	for line := range lines {
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
 			continue
@@ -53,37 +53,37 @@ func getCgroupIOStat(cgroupPath string) (*resourcestypes.IOStat, error) {
 				if ioStat.ReadBytes != nil {
 					*ioStat.ReadBytes += value
 				} else {
-					ioStat.ReadBytes = uint64Ptr(value)
+					ioStat.ReadBytes = new(value)
 				}
 			case ioWriteBytes:
 				if ioStat.WriteBytes != nil {
 					*ioStat.WriteBytes += value
 				} else {
-					ioStat.WriteBytes = uint64Ptr(value)
+					ioStat.WriteBytes = new(value)
 				}
 			case ioDiscardBytes:
 				if ioStat.DiscardBytes != nil {
 					*ioStat.DiscardBytes += value
 				} else {
-					ioStat.DiscardBytes = uint64Ptr(value)
+					ioStat.DiscardBytes = new(value)
 				}
 			case ioReadIOs:
 				if ioStat.ReadIOs != nil {
 					*ioStat.ReadIOs += value
 				} else {
-					ioStat.ReadIOs = uint64Ptr(value)
+					ioStat.ReadIOs = new(value)
 				}
 			case ioWriteIOs:
 				if ioStat.WriteIOs != nil {
 					*ioStat.WriteIOs += value
 				} else {
-					ioStat.WriteIOs = uint64Ptr(value)
+					ioStat.WriteIOs = new(value)
 				}
 			case ioDiscardIOs:
 				if ioStat.DiscardIOs != nil {
 					*ioStat.DiscardIOs += value
 				} else {
-					ioStat.DiscardIOs = uint64Ptr(value)
+					ioStat.DiscardIOs = new(value)
 				}
 			}
 		}
@@ -110,8 +110,4 @@ func parseKeyValue(kv string) (key string, value uint64) {
 		return "", 0
 	}
 	return key, value
-}
-
-func uint64Ptr(v uint64) *uint64 {
-	return &v
 }

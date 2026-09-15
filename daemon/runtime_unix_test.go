@@ -9,20 +9,20 @@ import (
 	"testing"
 
 	"dario.cat/mergo"
-	runtimeoptions_v1 "github.com/containerd/containerd/pkg/runtimeoptions/v1"
-	"github.com/containerd/containerd/plugin"
-	v2runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
-	"github.com/docker/docker/api/types/system"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/errdefs"
+	runcoptions "github.com/containerd/containerd/api/types/runc/options"
+	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
+	"github.com/containerd/containerd/v2/plugins"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/v2/daemon/config"
 	"google.golang.org/protobuf/proto"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestSetupRuntimes(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		name      string
 		config    *config.Config
 		expectErr string
@@ -49,7 +49,7 @@ func TestSetupRuntimes(t *testing.T) {
 			name: "OptionsOnly",
 			config: &config.Config{
 				Runtimes: map[string]system.Runtime{
-					"myruntime": {Options: map[string]interface{}{"hello": "world"}},
+					"myruntime": {Options: map[string]any{"hello": "world"}},
 				},
 			},
 			expectErr: "either a runtimeType or a path must be configured",
@@ -67,7 +67,7 @@ func TestSetupRuntimes(t *testing.T) {
 			name: "PathAndOptions",
 			config: &config.Config{
 				Runtimes: map[string]system.Runtime{
-					"myruntime": {Path: "/bin/true", Options: map[string]interface{}{"a": "b"}},
+					"myruntime": {Path: "/bin/true", Options: map[string]any{"a": "b"}},
 				},
 			},
 			expectErr: "options cannot be used with a path runtime",
@@ -88,7 +88,7 @@ func TestSetupRuntimes(t *testing.T) {
 					"myruntime": {
 						Path:    "/bin/true",
 						Args:    []string{"--version"},
-						Options: map[string]interface{}{"hmm": 3},
+						Options: map[string]any{"hmm": 3},
 					},
 				},
 			},
@@ -100,7 +100,7 @@ func TestSetupRuntimes(t *testing.T) {
 				Runtimes: map[string]system.Runtime{
 					"myruntime": {
 						Type:    "io.containerd.kata.v2",
-						Options: map[string]interface{}{"a": "b"},
+						Options: map[string]any{"a": "b"},
 						Args:    []string{"--help"},
 					},
 				},
@@ -115,7 +115,7 @@ func TestSetupRuntimes(t *testing.T) {
 						Path:    "/bin/true",
 						Args:    []string{"foo"},
 						Type:    "io.containerd.runsc.v1",
-						Options: map[string]interface{}{"a": "b"},
+						Options: map[string]any{"a": "b"},
 					},
 				},
 			},
@@ -169,8 +169,7 @@ func TestSetupRuntimes(t *testing.T) {
 			},
 		},
 	}
-	for _, tc := range cases {
-		tc := tc
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := config.New()
 			assert.NilError(t, err)
@@ -203,8 +202,8 @@ func TestGetRuntime(t *testing.T) {
 
 	const shimWithOptsName = "shimwithopts"
 	shimWithOpts := system.Runtime{
-		Type:    plugin.RuntimeRuncV2,
-		Options: map[string]interface{}{"IoUid": 42},
+		Type:    plugins.RuntimeRuncV2,
+		Options: map[string]any{"IoUid": 42},
 	}
 
 	const shimAliasName = "wasmedge"
@@ -218,7 +217,7 @@ func TestGetRuntime(t *testing.T) {
 	const gvisorName = "gvisor"
 	gvisorRuntime := system.Runtime{
 		Type: "io.containerd.runsc.v1",
-		Options: map[string]interface{}{
+		Options: map[string]any{
 			"TypeUrl":    "io.containerd.runsc.v1.options",
 			"ConfigPath": "/path/to/runsc.toml",
 		},
@@ -244,14 +243,14 @@ func TestGetRuntime(t *testing.T) {
 	assert.Assert(t, ok, "stock runtime could not be found (test needs to be updated)")
 	stockRuntime.Features = nil
 
-	configdOpts := proto.Clone(stockRuntime.Opts.(*v2runcoptions.Options)).(*v2runcoptions.Options)
+	configdOpts := proto.Clone(stockRuntime.Opts.(*runcoptions.Options)).(*runcoptions.Options)
 	configdOpts.BinaryName = configuredRuntime.Path
 	wantConfigdRuntime := &shimConfig{
 		Shim: stockRuntime.Shim,
 		Opts: configdOpts,
 	}
 
-	for _, tt := range []struct {
+	for _, tc := range []struct {
 		name, runtime string
 		want          *shimConfig
 	}{
@@ -305,7 +304,7 @@ func TestGetRuntime(t *testing.T) {
 			runtime: shimWithOptsName,
 			want: &shimConfig{
 				Shim: shimWithOpts.Type,
-				Opts: &v2runcoptions.Options{IoUid: 42},
+				Opts: &runcoptions.Options{IoUid: 42},
 			},
 		},
 		{
@@ -323,27 +322,26 @@ func TestGetRuntime(t *testing.T) {
 			runtime: gvisorName,
 			want: &shimConfig{
 				Shim: gvisorRuntime.Type,
-				Opts: &runtimeoptions_v1.Options{
+				Opts: &runtimeoptions.Options{
 					TypeUrl:    gvisorRuntime.Options["TypeUrl"].(string),
 					ConfigPath: gvisorRuntime.Options["ConfigPath"].(string),
 				},
 			},
 		},
 	} {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			shim, opts, err := runtimes.Get(tt.runtime)
-			if tt.want != nil {
+		t.Run(tc.name, func(t *testing.T) {
+			shim, opts, err := runtimes.Get(tc.runtime)
+			if tc.want != nil {
 				assert.Check(t, err)
 				got := &shimConfig{Shim: shim, Opts: opts}
-				assert.Check(t, is.DeepEqual(got, tt.want,
-					cmpopts.IgnoreUnexported(runtimeoptions_v1.Options{}),
-					cmpopts.IgnoreUnexported(v2runcoptions.Options{}),
+				assert.Check(t, is.DeepEqual(got, tc.want,
+					cmpopts.IgnoreUnexported(runtimeoptions.Options{}),
+					cmpopts.IgnoreUnexported(runcoptions.Options{}),
 				))
 			} else {
 				assert.Check(t, is.Equal(shim, ""))
 				assert.Check(t, is.Nil(opts))
-				assert.Check(t, errdefs.IsInvalidParameter(err), "[%T] %[1]v", err)
+				assert.Check(t, cerrdefs.IsInvalidArgument(err), "[%T] %[1]v", err)
 			}
 		})
 	}
@@ -351,8 +349,8 @@ func TestGetRuntime(t *testing.T) {
 		shim, opts, err := runtimes.Get(rtWithArgsName)
 		assert.Check(t, err)
 		assert.Check(t, is.Equal(shim, stockRuntime.Shim))
-		runcopts, ok := opts.(*v2runcoptions.Options)
-		if assert.Check(t, ok, "runtimes.Get() opts = type %T, want *v2runcoptions.Options", opts) {
+		runcopts, ok := opts.(*runcoptions.Options)
+		if assert.Check(t, ok, "runtimes.Get() opts = type %T, want *runcoptions.Options", opts) {
 			wrapper, err := os.ReadFile(runcopts.BinaryName)
 			if assert.Check(t, err) {
 				assert.Check(t, is.Contains(string(wrapper),
@@ -428,7 +426,7 @@ func TestRuntimeWrapping(t *testing.T) {
 	for name := range cfg.Runtimes {
 		_, opts, err := rt.Get(name)
 		if assert.Check(t, err, "rt.Get(%q)", name) {
-			binary := opts.(*v2runcoptions.Options).BinaryName
+			binary := opts.(*runcoptions.Options).BinaryName
 			content, err := os.ReadFile(binary)
 			assert.Check(t, err, "could not read wrapper script contents for runtime %q", binary)
 			wrappers[name] = WrapperInfo{BinaryName: binary, Content: string(content)}

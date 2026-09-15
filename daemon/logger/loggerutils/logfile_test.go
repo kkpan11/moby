@@ -1,4 +1,4 @@
-package loggerutils // import "github.com/docker/docker/daemon/logger/loggerutils"
+package loggerutils
 
 import (
 	"bufio"
@@ -15,10 +15,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/pkg/tailfile"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/pkg/tailfile"
 	"gotest.tools/v3/assert"
-	"gotest.tools/v3/assert/cmp"
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
 )
 
@@ -99,7 +99,7 @@ func TestTailFiles(t *testing.T) {
 	started := make(chan struct{})
 	go func() {
 		close(started)
-		tailFiles(context.TODO(), files, watcher, dec, tailReader, config.Tail, fwd)
+		tailFiles(t.Context(), files, watcher, dec, tailReader, config.Tail, fwd)
 	}()
 	<-started
 
@@ -133,7 +133,7 @@ func TestTailFiles(t *testing.T) {
 		f1 := bytes.NewBuffer(nil)
 		writeMsg(f1, msg1)
 
-		_, err := f1.WriteString("some randome garbage")
+		_, err := f1.WriteString("some random garbage")
 		assert.NilError(t, err, "error writing garbage to log stream")
 
 		writeMsg(f1, msg2) // This won't be seen due to garbage written above
@@ -167,7 +167,7 @@ func TestTailFiles(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			close(started)
-			tailFiles(context.TODO(), files, watcher, &testJSONStreamDecoder{}, tailReader, config.Tail, fwd)
+			tailFiles(t.Context(), files, watcher, &testJSONStreamDecoder{}, tailReader, config.Tail, fwd)
 			close(done)
 		}()
 
@@ -250,7 +250,7 @@ func TestCheckCapacityAndRotate(t *testing.T) {
 
 	t.Run("with log reader", func(t *testing.T) {
 		// Make sure rotate works with an active reader
-		lw := l.ReadLogs(context.TODO(), logger.ReadConfig{Follow: true, Tail: 1000})
+		lw := l.ReadLogs(t.Context(), logger.ReadConfig{Follow: true, Tail: 1000})
 		defer lw.ConsumerGone()
 
 		assert.NilError(t, l.WriteLogEntry(timestamp, []byte("hello world 0!\n")), ls)
@@ -276,7 +276,7 @@ func waitForMsg(t *testing.T, lw *logger.LogWatcher, expected string, timeout ti
 		assert.NilError(t, err)
 	case msg, ok := <-lw.Msg:
 		assert.Assert(t, ok, "log producer gone before log message arrived")
-		assert.Check(t, cmp.Equal(string(msg.Line), expected))
+		assert.Check(t, is.Equal(string(msg.Line), expected))
 	case <-timer.C:
 		t.Fatal("timeout waiting for log message")
 	}
@@ -303,7 +303,7 @@ func (d dirStringer) String() string {
 			return ""
 		}
 
-		btw.WriteString(fmt.Sprintf("%s\t%s\t%dB\t%s\n", fi.Name(), fi.Mode(), fi.Size(), fi.ModTime()))
+		fmt.Fprintf(btw, "%s\t%s\t%dB\t%s\n", fi.Name(), fi.Mode(), fi.Size(), fi.ModTime())
 	}
 	btw.Flush()
 	tw.Flush()

@@ -6,7 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/docker/docker/pkg/sysinfo"
+	"github.com/containerd/cgroups/v3"
+	"github.com/moby/moby/v2/pkg/sysinfo"
 )
 
 var sysInfo *sysinfo.SysInfo
@@ -63,8 +64,9 @@ func seccompEnabled() bool {
 	return sysInfo.Seccomp
 }
 
-func bridgeNfIptables() bool {
-	return !sysInfo.BridgeNFCallIPTablesDisabled
+func onlyCgroupsv2() bool {
+	// Only check for unified, cgroup v1 tests can run under other modes
+	return cgroups.Mode() == cgroups.Unified
 }
 
 func unprivilegedUsernsClone() bool {

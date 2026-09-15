@@ -1,69 +1,22 @@
-package network // import "github.com/docker/docker/integration/network"
+package network
 
 import (
-	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"os/exec"
-	"strings"
+	"slices"
 	"testing"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	networktypes "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/integration/internal/network"
-	"github.com/docker/docker/testutil"
-	"github.com/docker/docker/testutil/daemon"
-	"github.com/docker/docker/testutil/request"
+	cerrdefs "github.com/containerd/errdefs"
+	networktypes "github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/swarm"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"gotest.tools/v3/assert"
+
 	is "gotest.tools/v3/assert/cmp"
-	"gotest.tools/v3/icmd"
-	"gotest.tools/v3/skip"
+	"gotest.tools/v3/poll"
 )
-
-func TestRunContainerWithBridgeNone(t *testing.T) {
-	skip.If(t, testEnv.IsRemoteDaemon, "cannot start daemon on remote test run")
-	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
-	skip.If(t, testEnv.IsUserNamespace)
-	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
-
-	ctx := testutil.StartSpan(baseContext, t)
-
-	d := daemon.New(t)
-	d.StartWithBusybox(ctx, t, "-b", "none")
-	defer d.Stop(t)
-
-	c := d.NewClientT(t)
-
-	id1 := container.Run(ctx, t, c)
-	defer c.ContainerRemove(ctx, id1, containertypes.RemoveOptions{Force: true})
-
-	result, err := container.Exec(ctx, c, id1, []string{"ip", "l"})
-	assert.NilError(t, err)
-	assert.Check(t, is.Equal(false, strings.Contains(result.Combined(), "eth0")), "There shouldn't be eth0 in container in default(bridge) mode when bridge network is disabled")
-
-	id2 := container.Run(ctx, t, c, container.WithNetworkMode("bridge"))
-	defer c.ContainerRemove(ctx, id2, containertypes.RemoveOptions{Force: true})
-
-	result, err = container.Exec(ctx, c, id2, []string{"ip", "l"})
-	assert.NilError(t, err)
-	assert.Check(t, is.Equal(false, strings.Contains(result.Combined(), "eth0")), "There shouldn't be eth0 in container in bridge mode when bridge network is disabled")
-
-	nsCommand := "ls -l /proc/self/ns/net | awk -F '->' '{print $2}'"
-	cmd := exec.Command("sh", "-c", nsCommand)
-	stdout := bytes.NewBuffer(nil)
-	cmd.Stdout = stdout
-	err = cmd.Run()
-	assert.NilError(t, err, "Failed to get current process network namespace: %+v", err)
-
-	id3 := container.Run(ctx, t, c, container.WithNetworkMode("host"))
-	defer c.ContainerRemove(ctx, id3, containertypes.RemoveOptions{Force: true})
-
-	result, err = container.Exec(ctx, c, id3, []string{"sh", "-c", nsCommand})
-	assert.NilError(t, err)
-	assert.Check(t, is.Equal(stdout.String(), result.Combined()), "The network namespace of container should be the same with host when --net=host and bridge network is disabled")
-}
 
 // TestNetworkInvalidJSON tests that POST endpoints that expect a body return
 // the correct error when sending invalid JSON requests.
@@ -78,7 +31,6 @@ func TestNetworkInvalidJSON(t *testing.T) {
 	}
 
 	for _, ep := range endpoints {
-		ep := ep
 		t.Run(ep[1:], func(t *testing.T) {
 			t.Parallel()
 			ctx := testutil.StartSpan(ctx, t)
@@ -140,7 +92,6 @@ func TestNetworkList(t *testing.T) {
 	}
 
 	for _, ep := range endpoints {
-		ep := ep
 		t.Run(ep, func(t *testing.T) {
 			ctx := testutil.StartSpan(ctx, t)
 			t.Parallel()
@@ -159,131 +110,111 @@ func TestNetworkList(t *testing.T) {
 	}
 }
 
-func TestHostIPv4BridgeLabel(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	skip.If(t, testEnv.IsRemoteDaemon)
-	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
-	ctx := testutil.StartSpan(baseContext, t)
+func TestAPINetworkGetDefaults(t *testing.T) {
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
-	d := daemon.New(t)
-	d.Start(t)
-	defer d.Stop(t)
-	c := d.NewClientT(t)
-	defer c.Close()
-
-	ipv4SNATAddr := "172.0.0.172"
-	// Create a bridge network with --opt com.docker.network.host_ipv4=172.0.0.172
-	bridgeName := "hostIPv4Bridge"
-	network.CreateNoError(ctx, t, c, bridgeName,
-		network.WithDriver("bridge"),
-		network.WithOption("com.docker.network.host_ipv4", ipv4SNATAddr),
-		network.WithOption("com.docker.network.bridge.name", bridgeName),
-	)
-	defer network.RemoveNoError(ctx, t, c, bridgeName)
-	out, err := c.NetworkInspect(ctx, bridgeName, networktypes.InspectOptions{Verbose: true})
-	assert.NilError(t, err)
-	assert.Assert(t, len(out.IPAM.Config) > 0)
-	// Make sure the SNAT rule exists
-	testutil.RunCommand(ctx, "iptables", "-t", "nat", "-C", "POSTROUTING", "-s", out.IPAM.Config[0].Subnet, "!", "-o", bridgeName, "-j", "SNAT", "--to-source", ipv4SNATAddr).Assert(t, icmd.Success)
-}
-
-func TestDefaultNetworkOpts(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	skip.If(t, testEnv.IsRemoteDaemon)
-	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
-	ctx := testutil.StartSpan(baseContext, t)
-
-	tests := []struct {
-		name       string
-		mtu        int
-		configFrom bool
-		args       []string
-	}{
-		{
-			name: "default value",
-			mtu:  1500,
-			args: []string{},
-		},
-		{
-			name: "cmdline value",
-			mtu:  1234,
-			args: []string{"--default-network-opt", "bridge=com.docker.network.driver.mtu=1234"},
-		},
-		{
-			name:       "config-from value",
-			configFrom: true,
-			mtu:        1233,
-			args:       []string{"--default-network-opt", "bridge=com.docker.network.driver.mtu=1234"},
-		},
+	defaults := []string{"bridge", "host", "none"}
+	if testEnv.DaemonInfo.OSType == "windows" {
+		defaults = []string{"nat", "none"}
 	}
 
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := testutil.StartSpan(ctx, t)
-			d := daemon.New(t)
-			d.StartWithBusybox(ctx, t, tc.args...)
-			defer d.Stop(t)
-			c := d.NewClientT(t)
-			defer c.Close()
+	for _, netName := range defaults {
+		assert.Assert(t, IsNetworkAvailable(ctx, apiClient, netName))
+	}
+}
 
-			if tc.configFrom {
-				// Create a new network config
-				network.CreateNoError(ctx, t, c, "from-net", func(create *networktypes.CreateOptions) {
-					create.ConfigOnly = true
-					create.Options = map[string]string{
-						"com.docker.network.driver.mtu": fmt.Sprint(tc.mtu),
-					}
-				})
-				defer c.NetworkRemove(ctx, "from-net")
-			}
+func TestAPINetworkFilter(t *testing.T) {
+	networkName := "bridge"
+	if testEnv.DaemonInfo.OSType == "windows" {
+		networkName = "nat"
+	}
 
-			// Create a new network
-			networkName := "testnet"
-			networkId := network.CreateNoError(ctx, t, c, networkName, func(create *networktypes.CreateOptions) {
-				if tc.configFrom {
-					create.ConfigFrom = &networktypes.ConfigReference{
-						Network: "from-net",
-					}
-				}
-			})
-			defer c.NetworkRemove(ctx, networkName)
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
-			// Check the MTU of the bridge itself, before any devices are connected. (The
-			// bridge's MTU will be set to the minimum MTU of anything connected to it, but
-			// it's set explicitly on the bridge anyway - so it doesn't look like the option
-			// was ignored.)
-			cmd := exec.Command("ip", "link", "show", "br-"+networkId[:12])
-			output, err := cmd.CombinedOutput()
+	res, err := apiClient.NetworkList(ctx, client.NetworkListOptions{
+		Filters: make(client.Filters).Add("name", networkName),
+	})
+
+	assert.NilError(t, err)
+
+	found := false
+	for _, nw := range res.Items {
+		if nw.Name == networkName {
+			found = true
+		}
+	}
+	assert.Assert(t, found, networkName+" is not found")
+}
+
+func TestNetworkInspectWithScope(t *testing.T) {
+	ctx := setupTest(t)
+
+	d := swarm.NewSwarm(ctx, t, testEnv)
+	defer d.Stop(t)
+
+	cli := d.NewClientT(t) // IMPORTANT: talk to swarm daemon
+
+	name := "test-scoped-network"
+	create, err := cli.NetworkCreate(ctx, name, client.NetworkCreateOptions{Driver: "overlay"})
+	assert.NilError(t, err)
+
+	var inspect client.NetworkInspectResult
+	poll.WaitOn(t, func(_ poll.LogT) poll.Result {
+		var err error
+		inspect, err = cli.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
+		if err != nil {
+			return poll.Continue("waiting for network %s to be inspectable: %v", name, err)
+		}
+		return poll.Success()
+	}, swarm.NetworkPoll)
+	assert.Check(t, is.Equal("swarm", inspect.Network.Scope))
+	assert.Check(t, is.Equal(create.ID, inspect.Network.ID))
+
+	_, err = cli.NetworkInspect(ctx, name, client.NetworkInspectOptions{Scope: "local"})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsNotFound))
+}
+
+func TestCreateDeletePredefinedNetworks(t *testing.T) {
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	// Predefined networks differ per OS.
+	predefined := []string{"bridge", "host", "none"}
+	if testEnv.DaemonInfo.OSType == "windows" {
+		predefined = []string{"nat", "none"}
+	}
+
+	// Verify the daemon actually has those networks.
+	res, err := apiClient.NetworkList(ctx, client.NetworkListOptions{})
+	assert.NilError(t, err)
+
+	var actual []string
+	for _, nw := range res.Items {
+		if slices.Contains(predefined, nw.Name) {
+			actual = append(actual, nw.Name)
+		}
+	}
+	slices.Sort(actual)
+	slices.Sort(predefined)
+	assert.Check(t, is.DeepEqual(actual, predefined))
+
+	for _, name := range predefined {
+		t.Run(name, func(t *testing.T) {
+			// Creating a predefined network must fail.
+			_, err := apiClient.NetworkCreate(ctx, name, client.NetworkCreateOptions{})
+			assert.Check(t, is.ErrorContains(err, "operation is not permitted on predefined"))
+			assert.Check(t, is.ErrorType(err, cerrdefs.IsPermissionDenied))
+
+			// Deleting a predefined network must fail.
+			_, err = apiClient.NetworkRemove(ctx, name, client.NetworkRemoveOptions{})
+			assert.Check(t, is.ErrorContains(err, "is a pre-defined network and cannot be removed"))
+			assert.Check(t, is.ErrorType(err, cerrdefs.IsPermissionDenied))
+
+			// Sanity: it should still exist.
+			_, err = apiClient.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
 			assert.NilError(t, err)
-			assert.Check(t, is.Contains(string(output), fmt.Sprintf(" mtu %d ", tc.mtu)), "Bridge MTU should have been set to %d", tc.mtu)
-
-			// Start a container to inspect the MTU of its network interface
-			id1 := container.Run(ctx, t, c, container.WithNetworkMode(networkName))
-			defer c.ContainerRemove(ctx, id1, containertypes.RemoveOptions{Force: true})
-
-			result, err := container.Exec(ctx, c, id1, []string{"ip", "l", "show", "eth0"})
-			assert.NilError(t, err)
-			assert.Check(t, is.Contains(result.Combined(), fmt.Sprintf(" mtu %d ", tc.mtu)), "Network MTU should have been set to %d", tc.mtu)
 		})
 	}
-}
-
-func TestForbidDuplicateNetworkNames(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-
-	ctx := testutil.StartSpan(baseContext, t)
-
-	d := daemon.New(t)
-	d.StartWithBusybox(ctx, t)
-	defer d.Stop(t)
-
-	c := d.NewClientT(t)
-	defer c.Close()
-
-	network.CreateNoError(ctx, t, c, "testnet")
-	defer network.RemoveNoError(ctx, t, c, "testnet")
-
-	_, err := c.NetworkCreate(ctx, "testnet", networktypes.CreateOptions{})
-	assert.Error(t, err, "Error response from daemon: network with name testnet already exists", "2nd NetworkCreate call should have failed")
 }

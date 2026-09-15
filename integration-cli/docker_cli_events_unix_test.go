@@ -14,8 +14,8 @@ import (
 	"unicode"
 
 	"github.com/creack/pty"
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/cli/build"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli/build"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -100,7 +100,7 @@ func (s *DockerCLIEventSuite) TestEventsOOMDisableTrue(c *testing.T) {
 	}()
 
 	cli.WaitRun(c, "oomTrue")
-	defer dockerCmdWithResult("kill", "oomTrue")
+	defer cli.Docker(cli.Args("kill", "oomTrue"))
 	containerID := inspectField(c, "oomTrue", "Id")
 
 	testActions := map[string]chan bool{
@@ -240,12 +240,12 @@ func (s *DockerCLIEventSuite) TestEventsContainerWithMultiNetwork(c *testing.T) 
 
 	// received two network disconnect events
 	assert.Equal(c, len(netEvents), 2)
-	assert.Assert(c, strings.Contains(netEvents[0], "disconnect"))
-	assert.Assert(c, strings.Contains(netEvents[1], "disconnect"))
+	assert.Assert(c, is.Contains(netEvents[0], "disconnect"))
+	assert.Assert(c, is.Contains(netEvents[1], "disconnect"))
 
 	// both networks appeared in the network event output
-	assert.Assert(c, strings.Contains(out, "test-event-network-local-1"))
-	assert.Assert(c, strings.Contains(out, "test-event-network-local-2"))
+	assert.Assert(c, is.Contains(out, "test-event-network-local-1"))
+	assert.Assert(c, is.Contains(out, "test-event-network-local-2"))
 }
 
 func (s *DockerCLIEventSuite) TestEventsStreaming(c *testing.T) {
@@ -312,7 +312,7 @@ func (s *DockerCLIEventSuite) TestEventsImageUntagDelete(c *testing.T) {
 	defer observer.Stop()
 
 	name := "testimageevents"
-	buildImageSuccessfully(c, name, build.WithDockerfile(`FROM scratch
+	cli.BuildCmd(c, name, build.WithDockerfile(`FROM scratch
 		MAINTAINER "docker"`))
 	imageID := getIDByName(c, name)
 	assert.NilError(c, deleteImages(name))
@@ -371,8 +371,8 @@ func (s *DockerCLIEventSuite) TestEventsFilterVolumeID(c *testing.T) {
 	assert.Equal(c, len(events), 1)
 
 	assert.Equal(c, len(events), 1)
-	assert.Assert(c, strings.Contains(events[0], "test-event-volume-id"))
-	assert.Assert(c, strings.Contains(events[0], "driver=local"))
+	assert.Assert(c, is.Contains(events[0], "test-event-volume-id"))
+	assert.Assert(c, is.Contains(events[0], "driver=local"))
 }
 
 func (s *DockerCLIEventSuite) TestEventsFilterNetworkID(c *testing.T) {
@@ -384,8 +384,8 @@ func (s *DockerCLIEventSuite) TestEventsFilterNetworkID(c *testing.T) {
 	out := cli.DockerCmd(c, "events", "--filter", "network=test-event-network-local", "--since", since, "--until", daemonUnixTime(c)).Stdout()
 	events := strings.Split(strings.TrimSpace(out), "\n")
 	assert.Equal(c, len(events), 1)
-	assert.Assert(c, strings.Contains(events[0], "test-event-network-local"))
-	assert.Assert(c, strings.Contains(events[0], "type=bridge"))
+	assert.Assert(c, is.Contains(events[0], "test-event-network-local"))
+	assert.Assert(c, is.Contains(events[0], "type=bridge"))
 }
 
 func (s *DockerDaemonSuite) TestDaemonEvents(c *testing.T) {
@@ -414,8 +414,7 @@ func (s *DockerDaemonSuite) TestDaemonEvents(c *testing.T) {
 	// otherwise just check for names being present.
 	expectedSubstrings := []string{
 		` daemon reload ` + info.ID + " ",
-		`(allow-nondistributable-artifacts=[`,
-		` debug=true, `,
+		`debug=true, `,
 		` default-ipc-mode=`,
 		` default-runtime=`,
 		` default-shm-size=`,
@@ -450,23 +449,23 @@ func (s *DockerDaemonSuite) TestDaemonEventsWithFilters(c *testing.T) {
 	assert.NilError(c, s.d.Signal(unix.SIGHUP))
 	time.Sleep(3 * time.Second)
 
-	out, err := s.d.Cmd("events", "--since=0", "--until", daemonUnixTime(c), "--filter", fmt.Sprintf("daemon=%s", info.ID))
+	out, err := s.d.Cmd("events", "--since=0", "--until", daemonUnixTime(c), "--filter", "daemon="+info.ID)
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf("daemon reload %s", info.ID)))
+	assert.Assert(c, is.Contains(out, "daemon reload "+info.ID))
 
-	out, err = s.d.Cmd("events", "--since=0", "--until", daemonUnixTime(c), "--filter", fmt.Sprintf("daemon=%s", info.ID))
+	out, err = s.d.Cmd("events", "--since=0", "--until", daemonUnixTime(c), "--filter", "daemon="+info.ID)
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf("daemon reload %s", info.ID)))
+	assert.Assert(c, is.Contains(out, "daemon reload "+info.ID))
 
 	out, err = s.d.Cmd("events", "--since=0", "--until", daemonUnixTime(c), "--filter", "daemon=foo")
 	assert.NilError(c, err)
-	assert.Assert(c, !strings.Contains(out, fmt.Sprintf("daemon reload %s", info.ID)))
+	assert.Assert(c, !strings.Contains(out, "daemon reload "+info.ID))
 
 	out, err = s.d.Cmd("events", "--since=0", "--until", daemonUnixTime(c), "--filter", "type=daemon")
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(out, fmt.Sprintf("daemon reload %s", info.ID)))
+	assert.Assert(c, is.Contains(out, "daemon reload "+info.ID))
 
 	out, err = s.d.Cmd("events", "--since=0", "--until", daemonUnixTime(c), "--filter", "type=container")
 	assert.NilError(c, err)
-	assert.Assert(c, !strings.Contains(out, fmt.Sprintf("daemon reload %s", info.ID)))
+	assert.Assert(c, !strings.Contains(out, "daemon reload "+info.ID))
 }

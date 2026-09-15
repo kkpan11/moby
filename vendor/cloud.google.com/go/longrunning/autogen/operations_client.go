@@ -1,4 +1,4 @@
-// Copyright 2023 Google LLC
+// Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -28,7 +28,7 @@ import (
 
 	longrunningpb "cloud.google.com/go/longrunning/autogen/longrunningpb"
 	gax "github.com/googleapis/gax-go/v2"
-	"google.golang.org/api/googleapi"
+	"github.com/googleapis/gax-go/v2/callctx"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/api/option/internaloption"
@@ -54,10 +54,13 @@ type OperationsCallOptions struct {
 func defaultOperationsGRPCClientOptions() []option.ClientOption {
 	return []option.ClientOption{
 		internaloption.WithDefaultEndpoint("longrunning.googleapis.com:443"),
+		internaloption.WithDefaultEndpointTemplate("longrunning.UNIVERSE_DOMAIN:443"),
 		internaloption.WithDefaultMTLSEndpoint("longrunning.mtls.googleapis.com:443"),
+		internaloption.WithDefaultUniverseDomain("googleapis.com"),
 		internaloption.WithDefaultAudience("https://longrunning.googleapis.com/"),
 		internaloption.WithDefaultScopes(DefaultAuthScopes()...),
 		internaloption.EnableJwtWithScope(),
+		internaloption.EnableNewAuthLibrary(),
 		option.WithGRPCDialOption(grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(math.MaxInt32))),
 	}
@@ -185,12 +188,12 @@ type internalOperationsClient interface {
 // Manages long-running operations with an API service.
 //
 // When an API method normally takes long time to complete, it can be designed
-// to return Operation to the client, and the client can use this
-// interface to receive the real response asynchronously by polling the
-// operation resource, or pass the operation resource to another API (such as
-// Google Cloud Pub/Sub API) to receive the response.  Any API service that
-// returns long-running operations should implement the Operations interface
-// so developers can have a consistent client experience.
+// to return Operation to the client, and the
+// client can use this interface to receive the real response asynchronously by
+// polling the operation resource, or pass the operation resource to another API
+// (such as Pub/Sub API) to receive the response.  Any API service that returns
+// long-running operations should implement the Operations interface so
+// developers can have a consistent client experience.
 type OperationsClient struct {
 	// The internal transport-dependent client.
 	internalClient internalOperationsClient
@@ -201,7 +204,7 @@ type OperationsClient struct {
 
 // Wrapper methods routed to the internal client.
 
-// Close closes the connection to the API service. The user should invoke this when
+// Close closes the connection to the API service. **Always** call Close() when
 // the client is no longer required.
 func (c *OperationsClient) Close() error {
 	return c.internalClient.Close()
@@ -224,14 +227,6 @@ func (c *OperationsClient) Connection() *grpc.ClientConn {
 
 // ListOperations lists operations that match the specified filter in the request. If the
 // server doesn’t support this method, it returns UNIMPLEMENTED.
-//
-// NOTE: the name binding allows API services to override the binding
-// to use different resource name schemes, such as users/*/operations. To
-// override the binding, API services can add a binding such as
-// "/v1/{name=users/*}/operations" to their service configuration.
-// For backwards compatibility, the default name includes the operations
-// collection id, however overriding users must ensure the name binding
-// is the parent resource, without the operations collection id.
 func (c *OperationsClient) ListOperations(ctx context.Context, req *longrunningpb.ListOperationsRequest, opts ...gax.CallOption) *OperationIterator {
 	return c.internalClient.ListOperations(ctx, req, opts...)
 }
@@ -259,8 +254,9 @@ func (c *OperationsClient) DeleteOperation(ctx context.Context, req *longrunning
 // other methods to check whether the cancellation succeeded or whether the
 // operation completed despite cancellation. On successful cancellation,
 // the operation is not deleted; instead, it becomes an operation with
-// an Operation.error value with a google.rpc.Status.code of 1,
-// corresponding to Code.CANCELLED.
+// an Operation.error value with a
+// google.rpc.Status.code of 1, corresponding to
+// Code.CANCELLED.
 func (c *OperationsClient) CancelOperation(ctx context.Context, req *longrunningpb.CancelOperationRequest, opts ...gax.CallOption) error {
 	return c.internalClient.CancelOperation(ctx, req, opts...)
 }
@@ -293,6 +289,8 @@ type operationsGRPCClient struct {
 
 	// The x-goog-* metadata to be sent with each request.
 	xGoogHeaders []string
+
+	logger *slog.Logger
 }
 
 // NewOperationsClient creates a new operations client based on gRPC.
@@ -301,14 +299,24 @@ type operationsGRPCClient struct {
 // Manages long-running operations with an API service.
 //
 // When an API method normally takes long time to complete, it can be designed
-// to return Operation to the client, and the client can use this
-// interface to receive the real response asynchronously by polling the
-// operation resource, or pass the operation resource to another API (such as
-// Google Cloud Pub/Sub API) to receive the response.  Any API service that
-// returns long-running operations should implement the Operations interface
-// so developers can have a consistent client experience.
+// to return Operation to the client, and the
+// client can use this interface to receive the real response asynchronously by
+// polling the operation resource, or pass the operation resource to another API
+// (such as Pub/Sub API) to receive the response.  Any API service that returns
+// long-running operations should implement the Operations interface so
+// developers can have a consistent client experience.
 func NewOperationsClient(ctx context.Context, opts ...option.ClientOption) (*OperationsClient, error) {
 	clientOpts := defaultOperationsGRPCClientOptions()
+	if gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		clientOpts = append(clientOpts, internaloption.WithTelemetryAttributes(map[string]string{
+			"gcp.client.service":  "longrunning",
+			"gcp.client.version":  getVersionClient(),
+			"gcp.client.repo":     "googleapis/google-cloud-go",
+			"gcp.client.artifact": "cloud.google.com/go/longrunning/autogen",
+			"gcp.client.language": "go",
+			"url.domain":          "longrunning.googleapis.com",
+		}))
+	}
 	if newOperationsClientHook != nil {
 		hookOpts, err := newOperationsClientHook(ctx, clientHookParams{})
 		if err != nil {
@@ -327,8 +335,27 @@ func NewOperationsClient(ctx context.Context, opts ...option.ClientOption) (*Ope
 		connPool:         connPool,
 		operationsClient: longrunningpb.NewOperationsClient(connPool),
 		CallOptions:      &client.CallOptions,
+		logger:           internaloption.GetLogger(opts),
 	}
 	c.setGoogleClientInfo()
+	if gax.IsFeatureEnabled("METRICS") {
+		metrics := gax.NewClientMetrics(
+			gax.WithTelemetryLogger(c.logger),
+			gax.WithTelemetryAttributes(map[string]string{
+				gax.ClientService:  "longrunning",
+				gax.ClientVersion:  getVersionClient(),
+				gax.ClientArtifact: "cloud.google.com/go/longrunning/autogen",
+				gax.RPCSystem:      "grpc",
+				gax.URLDomain:      "longrunning.googleapis.com",
+			}),
+		)
+
+		client.CallOptions.ListOperations = append(client.CallOptions.ListOperations, gax.WithClientMetrics(metrics))
+		client.CallOptions.GetOperation = append(client.CallOptions.GetOperation, gax.WithClientMetrics(metrics))
+		client.CallOptions.DeleteOperation = append(client.CallOptions.DeleteOperation, gax.WithClientMetrics(metrics))
+		client.CallOptions.CancelOperation = append(client.CallOptions.CancelOperation, gax.WithClientMetrics(metrics))
+		client.CallOptions.WaitOperation = append(client.CallOptions.WaitOperation, gax.WithClientMetrics(metrics))
+	}
 
 	client.internalClient = c
 
@@ -348,11 +375,13 @@ func (c *operationsGRPCClient) Connection() *grpc.ClientConn {
 // use by Google-written clients.
 func (c *operationsGRPCClient) setGoogleClientInfo(keyval ...string) {
 	kv := append([]string{"gl-go", gax.GoVersion}, keyval...)
-	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "grpc", grpc.Version)
-	c.xGoogHeaders = []string{"x-goog-api-client", gax.XGoogHeader(kv...)}
+	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "grpc", grpc.Version, "pb", protoVersion)
+	c.xGoogHeaders = []string{
+		"x-goog-api-client", gax.XGoogHeader(kv...),
+	}
 }
 
-// Close closes the connection to the API service. The user should invoke this when
+// Close closes the connection to the API service. **Always** call Close() when
 // the client is no longer required.
 func (c *operationsGRPCClient) Close() error {
 	return c.connPool.Close()
@@ -371,6 +400,8 @@ type operationsRESTClient struct {
 
 	// Points back to the CallOptions field of the containing OperationsClient
 	CallOptions **OperationsCallOptions
+
+	logger *slog.Logger
 }
 
 // NewOperationsRESTClient creates a new operations rest client.
@@ -378,14 +409,24 @@ type operationsRESTClient struct {
 // Manages long-running operations with an API service.
 //
 // When an API method normally takes long time to complete, it can be designed
-// to return Operation to the client, and the client can use this
-// interface to receive the real response asynchronously by polling the
-// operation resource, or pass the operation resource to another API (such as
-// Google Cloud Pub/Sub API) to receive the response.  Any API service that
-// returns long-running operations should implement the Operations interface
-// so developers can have a consistent client experience.
+// to return Operation to the client, and the
+// client can use this interface to receive the real response asynchronously by
+// polling the operation resource, or pass the operation resource to another API
+// (such as Pub/Sub API) to receive the response.  Any API service that returns
+// long-running operations should implement the Operations interface so
+// developers can have a consistent client experience.
 func NewOperationsRESTClient(ctx context.Context, opts ...option.ClientOption) (*OperationsClient, error) {
 	clientOpts := append(defaultOperationsRESTClientOptions(), opts...)
+	if gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		clientOpts = append(clientOpts, internaloption.WithTelemetryAttributes(map[string]string{
+			"gcp.client.service":  "longrunning",
+			"gcp.client.version":  getVersionClient(),
+			"gcp.client.repo":     "googleapis/google-cloud-go",
+			"gcp.client.artifact": "cloud.google.com/go/longrunning/autogen",
+			"gcp.client.language": "go",
+			"url.domain":          "longrunning.googleapis.com",
+		}))
+	}
 	httpClient, endpoint, err := httptransport.NewClient(ctx, clientOpts...)
 	if err != nil {
 		return nil, err
@@ -396,8 +437,28 @@ func NewOperationsRESTClient(ctx context.Context, opts ...option.ClientOption) (
 		endpoint:    endpoint,
 		httpClient:  httpClient,
 		CallOptions: &callOpts,
+		logger:      internaloption.GetLogger(opts),
 	}
 	c.setGoogleClientInfo()
+
+	if gax.IsFeatureEnabled("METRICS") {
+		metrics := gax.NewClientMetrics(
+			gax.WithTelemetryLogger(c.logger),
+			gax.WithTelemetryAttributes(map[string]string{
+				gax.ClientService:  "longrunning",
+				gax.ClientVersion:  getVersionClient(),
+				gax.ClientArtifact: "cloud.google.com/go/longrunning/autogen",
+				gax.RPCSystem:      "http",
+				gax.URLDomain:      "longrunning.googleapis.com",
+			}),
+		)
+
+		callOpts.ListOperations = append(callOpts.ListOperations, gax.WithClientMetrics(metrics))
+		callOpts.GetOperation = append(callOpts.GetOperation, gax.WithClientMetrics(metrics))
+		callOpts.DeleteOperation = append(callOpts.DeleteOperation, gax.WithClientMetrics(metrics))
+		callOpts.CancelOperation = append(callOpts.CancelOperation, gax.WithClientMetrics(metrics))
+		callOpts.WaitOperation = append(callOpts.WaitOperation, gax.WithClientMetrics(metrics))
+	}
 
 	return &OperationsClient{internalClient: c, CallOptions: callOpts}, nil
 }
@@ -405,9 +466,12 @@ func NewOperationsRESTClient(ctx context.Context, opts ...option.ClientOption) (
 func defaultOperationsRESTClientOptions() []option.ClientOption {
 	return []option.ClientOption{
 		internaloption.WithDefaultEndpoint("https://longrunning.googleapis.com"),
+		internaloption.WithDefaultEndpointTemplate("https://longrunning.UNIVERSE_DOMAIN"),
 		internaloption.WithDefaultMTLSEndpoint("https://longrunning.mtls.googleapis.com"),
+		internaloption.WithDefaultUniverseDomain("googleapis.com"),
 		internaloption.WithDefaultAudience("https://longrunning.googleapis.com/"),
 		internaloption.WithDefaultScopes(DefaultAuthScopes()...),
+		internaloption.EnableNewAuthLibrary(),
 	}
 }
 
@@ -416,11 +480,13 @@ func defaultOperationsRESTClientOptions() []option.ClientOption {
 // use by Google-written clients.
 func (c *operationsRESTClient) setGoogleClientInfo(keyval ...string) {
 	kv := append([]string{"gl-go", gax.GoVersion}, keyval...)
-	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "rest", "UNKNOWN")
-	c.xGoogHeaders = []string{"x-goog-api-client", gax.XGoogHeader(kv...)}
+	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "rest", "UNKNOWN", "pb", protoVersion)
+	c.xGoogHeaders = []string{
+		"x-goog-api-client", gax.XGoogHeader(kv...),
+	}
 }
 
-// Close closes the connection to the API service. The user should invoke this when
+// Close closes the connection to the API service. **Always** call Close() when
 // the client is no longer required.
 func (c *operationsRESTClient) Close() error {
 	// Replace httpClient with nil to force cleanup.
@@ -439,9 +505,12 @@ func (c *operationsGRPCClient) ListOperations(ctx context.Context, req *longrunn
 
 	hds = append(c.xGoogHeaders, hds...)
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/ListOperations")
+	}
 	opts = append((*c.CallOptions).ListOperations[0:len((*c.CallOptions).ListOperations):len((*c.CallOptions).ListOperations)], opts...)
 	it := &OperationIterator{}
-	req = proto.Clone(req).(*longrunningpb.ListOperationsRequest)
+	req = proto.CloneOf(req)
 	it.InternalFetch = func(pageSize int, pageToken string) ([]*longrunningpb.Operation, string, error) {
 		resp := &longrunningpb.ListOperationsResponse{}
 		if pageToken != "" {
@@ -454,7 +523,7 @@ func (c *operationsGRPCClient) ListOperations(ctx context.Context, req *longrunn
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.operationsClient.ListOperations(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.operationsClient.ListOperations, req, settings.GRPC, c.logger, "ListOperations")
 			return err
 		}, opts...)
 		if err != nil {
@@ -485,11 +554,14 @@ func (c *operationsGRPCClient) GetOperation(ctx context.Context, req *longrunnin
 
 	hds = append(c.xGoogHeaders, hds...)
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/GetOperation")
+	}
 	opts = append((*c.CallOptions).GetOperation[0:len((*c.CallOptions).GetOperation):len((*c.CallOptions).GetOperation)], opts...)
 	var resp *longrunningpb.Operation
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.operationsClient.GetOperation(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.operationsClient.GetOperation, req, settings.GRPC, c.logger, "GetOperation")
 		return err
 	}, opts...)
 	if err != nil {
@@ -503,10 +575,13 @@ func (c *operationsGRPCClient) DeleteOperation(ctx context.Context, req *longrun
 
 	hds = append(c.xGoogHeaders, hds...)
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/DeleteOperation")
+	}
 	opts = append((*c.CallOptions).DeleteOperation[0:len((*c.CallOptions).DeleteOperation):len((*c.CallOptions).DeleteOperation)], opts...)
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		_, err = c.operationsClient.DeleteOperation(ctx, req, settings.GRPC...)
+		_, err = executeRPC(ctx, c.operationsClient.DeleteOperation, req, settings.GRPC, c.logger, "DeleteOperation")
 		return err
 	}, opts...)
 	return err
@@ -517,10 +592,13 @@ func (c *operationsGRPCClient) CancelOperation(ctx context.Context, req *longrun
 
 	hds = append(c.xGoogHeaders, hds...)
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/CancelOperation")
+	}
 	opts = append((*c.CallOptions).CancelOperation[0:len((*c.CallOptions).CancelOperation):len((*c.CallOptions).CancelOperation)], opts...)
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		_, err = c.operationsClient.CancelOperation(ctx, req, settings.GRPC...)
+		_, err = executeRPC(ctx, c.operationsClient.CancelOperation, req, settings.GRPC, c.logger, "CancelOperation")
 		return err
 	}, opts...)
 	return err
@@ -528,11 +606,14 @@ func (c *operationsGRPCClient) CancelOperation(ctx context.Context, req *longrun
 
 func (c *operationsGRPCClient) WaitOperation(ctx context.Context, req *longrunningpb.WaitOperationRequest, opts ...gax.CallOption) (*longrunningpb.Operation, error) {
 	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, c.xGoogHeaders...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/WaitOperation")
+	}
 	opts = append((*c.CallOptions).WaitOperation[0:len((*c.CallOptions).WaitOperation):len((*c.CallOptions).WaitOperation)], opts...)
 	var resp *longrunningpb.Operation
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.operationsClient.WaitOperation(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.operationsClient.WaitOperation, req, settings.GRPC, c.logger, "WaitOperation")
 		return err
 	}, opts...)
 	if err != nil {
@@ -543,17 +624,9 @@ func (c *operationsGRPCClient) WaitOperation(ctx context.Context, req *longrunni
 
 // ListOperations lists operations that match the specified filter in the request. If the
 // server doesn’t support this method, it returns UNIMPLEMENTED.
-//
-// NOTE: the name binding allows API services to override the binding
-// to use different resource name schemes, such as users/*/operations. To
-// override the binding, API services can add a binding such as
-// "/v1/{name=users/*}/operations" to their service configuration.
-// For backwards compatibility, the default name includes the operations
-// collection id, however overriding users must ensure the name binding
-// is the parent resource, without the operations collection id.
 func (c *operationsRESTClient) ListOperations(ctx context.Context, req *longrunningpb.ListOperationsRequest, opts ...gax.CallOption) *OperationIterator {
 	it := &OperationIterator{}
-	req = proto.Clone(req).(*longrunningpb.ListOperationsRequest)
+	req = proto.CloneOf(req)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	it.InternalFetch = func(pageSize int, pageToken string) ([]*longrunningpb.Operation, string, error) {
 		resp := &longrunningpb.ListOperationsResponse{}
@@ -581,6 +654,9 @@ func (c *operationsRESTClient) ListOperations(ctx context.Context, req *longrunn
 		if req.GetPageToken() != "" {
 			params.Add("pageToken", fmt.Sprintf("%v", req.GetPageToken()))
 		}
+		if req.GetReturnPartialSuccess() {
+			params.Add("returnPartialSuccess", fmt.Sprintf("%v", req.GetReturnPartialSuccess()))
+		}
 
 		baseUrl.RawQuery = params.Encode()
 
@@ -597,21 +673,10 @@ func (c *operationsRESTClient) ListOperations(ctx context.Context, req *longrunn
 			}
 			httpReq.Header = headers
 
-			httpRsp, err := c.httpClient.Do(httpReq)
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "ListOperations")
 			if err != nil {
 				return err
 			}
-			defer httpRsp.Body.Close()
-
-			if err = googleapi.CheckResponse(httpRsp); err != nil {
-				return err
-			}
-
-			buf, err := io.ReadAll(httpRsp.Body)
-			if err != nil {
-				return err
-			}
-
 			if err := unm.Unmarshal(buf, resp); err != nil {
 				return err
 			}
@@ -657,6 +722,10 @@ func (c *operationsRESTClient) GetOperation(ctx context.Context, req *longrunnin
 	hds = append(c.xGoogHeaders, hds...)
 	hds = append(hds, "Content-Type", "application/json")
 	headers := gax.BuildHeaders(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/GetOperation")
+		ctx = callctx.WithTelemetryContext(ctx, "url_template", "/v1/{name=operations/**}")
+	}
 	opts = append((*c.CallOptions).GetOperation[0:len((*c.CallOptions).GetOperation):len((*c.CallOptions).GetOperation)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &longrunningpb.Operation{}
@@ -671,17 +740,7 @@ func (c *operationsRESTClient) GetOperation(ctx context.Context, req *longrunnin
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetOperation")
 		if err != nil {
 			return err
 		}
@@ -715,6 +774,10 @@ func (c *operationsRESTClient) DeleteOperation(ctx context.Context, req *longrun
 	hds = append(c.xGoogHeaders, hds...)
 	hds = append(hds, "Content-Type", "application/json")
 	headers := gax.BuildHeaders(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/DeleteOperation")
+		ctx = callctx.WithTelemetryContext(ctx, "url_template", "/v1/{name=operations/**}")
+	}
 	return gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		if settings.Path != "" {
 			baseUrl.Path = settings.Path
@@ -726,15 +789,8 @@ func (c *operationsRESTClient) DeleteOperation(ctx context.Context, req *longrun
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		// Returns nil if there is no error, otherwise wraps
-		// the response code and body into a non-nil error
-		return googleapi.CheckResponse(httpRsp)
+		_, err = executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "DeleteOperation")
+		return err
 	}, opts...)
 }
 
@@ -746,8 +802,9 @@ func (c *operationsRESTClient) DeleteOperation(ctx context.Context, req *longrun
 // other methods to check whether the cancellation succeeded or whether the
 // operation completed despite cancellation. On successful cancellation,
 // the operation is not deleted; instead, it becomes an operation with
-// an Operation.error value with a google.rpc.Status.code of 1,
-// corresponding to Code.CANCELLED.
+// an Operation.error value with a
+// google.rpc.Status.code of 1, corresponding to
+// Code.CANCELLED.
 func (c *operationsRESTClient) CancelOperation(ctx context.Context, req *longrunningpb.CancelOperationRequest, opts ...gax.CallOption) error {
 	m := protojson.MarshalOptions{AllowPartial: true, UseEnumNumbers: true}
 	jsonReq, err := m.Marshal(req)
@@ -767,6 +824,10 @@ func (c *operationsRESTClient) CancelOperation(ctx context.Context, req *longrun
 	hds = append(c.xGoogHeaders, hds...)
 	hds = append(hds, "Content-Type", "application/json")
 	headers := gax.BuildHeaders(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/CancelOperation")
+		ctx = callctx.WithTelemetryContext(ctx, "url_template", "/v1/{name=operations/**}:cancel")
+	}
 	return gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		if settings.Path != "" {
 			baseUrl.Path = settings.Path
@@ -778,15 +839,8 @@ func (c *operationsRESTClient) CancelOperation(ctx context.Context, req *longrun
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		// Returns nil if there is no error, otherwise wraps
-		// the response code and body into a non-nil error
-		return googleapi.CheckResponse(httpRsp)
+		_, err = executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "CancelOperation")
+		return err
 	}, opts...)
 }
 
@@ -811,11 +865,11 @@ func (c *operationsRESTClient) WaitOperation(ctx context.Context, req *longrunni
 		params.Add("name", fmt.Sprintf("%v", req.GetName()))
 	}
 	if req.GetTimeout() != nil {
-		timeout, err := protojson.Marshal(req.GetTimeout())
+		field, err := protojson.Marshal(req.GetTimeout())
 		if err != nil {
 			return nil, err
 		}
-		params.Add("timeout", string(timeout[1:len(timeout)-1]))
+		params.Add("timeout", string(field[1:len(field)-1]))
 	}
 
 	baseUrl.RawQuery = params.Encode()
@@ -823,6 +877,9 @@ func (c *operationsRESTClient) WaitOperation(ctx context.Context, req *longrunni
 	// Build HTTP headers from client and context metadata.
 	hds := append(c.xGoogHeaders, "Content-Type", "application/json")
 	headers := gax.BuildHeaders(ctx, hds...)
+	if gax.IsFeatureEnabled("METRICS") || gax.IsFeatureEnabled("TRACING") || gax.IsFeatureEnabled("LOGGING") {
+		ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "google.longrunning.Operations/WaitOperation")
+	}
 	opts = append((*c.CallOptions).WaitOperation[0:len((*c.CallOptions).WaitOperation):len((*c.CallOptions).WaitOperation)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &longrunningpb.Operation{}
@@ -837,17 +894,7 @@ func (c *operationsRESTClient) WaitOperation(ctx context.Context, req *longrunni
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "WaitOperation")
 		if err != nil {
 			return err
 		}
@@ -862,51 +909,4 @@ func (c *operationsRESTClient) WaitOperation(ctx context.Context, req *longrunni
 		return nil, e
 	}
 	return resp, nil
-}
-
-// OperationIterator manages a stream of *longrunningpb.Operation.
-type OperationIterator struct {
-	items    []*longrunningpb.Operation
-	pageInfo *iterator.PageInfo
-	nextFunc func() error
-
-	// Response is the raw response for the current page.
-	// It must be cast to the RPC response type.
-	// Calling Next() or InternalFetch() updates this value.
-	Response interface{}
-
-	// InternalFetch is for use by the Google Cloud Libraries only.
-	// It is not part of the stable interface of this package.
-	//
-	// InternalFetch returns results from a single call to the underlying RPC.
-	// The number of results is no greater than pageSize.
-	// If there are no more results, nextPageToken is empty and err is nil.
-	InternalFetch func(pageSize int, pageToken string) (results []*longrunningpb.Operation, nextPageToken string, err error)
-}
-
-// PageInfo supports pagination. See the google.golang.org/api/iterator package for details.
-func (it *OperationIterator) PageInfo() *iterator.PageInfo {
-	return it.pageInfo
-}
-
-// Next returns the next result. Its second return value is iterator.Done if there are no more
-// results. Once Next returns Done, all subsequent calls will return Done.
-func (it *OperationIterator) Next() (*longrunningpb.Operation, error) {
-	var item *longrunningpb.Operation
-	if err := it.nextFunc(); err != nil {
-		return item, err
-	}
-	item = it.items[0]
-	it.items = it.items[1:]
-	return item, nil
-}
-
-func (it *OperationIterator) bufLen() int {
-	return len(it.items)
-}
-
-func (it *OperationIterator) takeBuf() interface{} {
-	b := it.items
-	it.items = nil
-	return b
 }

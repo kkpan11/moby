@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -12,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
 )
@@ -23,12 +24,12 @@ type DockerCLIAttachSuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerCLIAttachSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIAttachSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIAttachSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIAttachSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 func (s *DockerCLIAttachSuite) TestAttachMultipleAndRestart(c *testing.T) {
@@ -53,7 +54,7 @@ func (s *DockerCLIAttachSuite) TestAttachMultipleAndRestart(c *testing.T) {
 		close(startDone)
 	}()
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		go func() {
 			cmd := exec.Command(dockerBinary, "attach", "attacher")
 
@@ -136,7 +137,7 @@ func (s *DockerCLIAttachSuite) TestAttachTTYWithoutStdin(c *testing.T) {
 			Stdout:  cmd.Stdout,
 		})
 		if result.Error == nil {
-			done <- fmt.Errorf("attach should have failed")
+			done <- errors.New("attach should have failed")
 			return
 		} else if !strings.Contains(result.Combined(), expected) {
 			done <- fmt.Errorf("attach failed with error %q: expected %q", out, expected)
@@ -166,7 +167,7 @@ func (s *DockerCLIAttachSuite) TestAttachDisconnect(c *testing.T) {
 	stdout, err := cmd.StdoutPipe()
 	assert.NilError(c, err)
 	defer stdout.Close()
-	assert.Assert(c, cmd.Start() == nil)
+	assert.NilError(c, cmd.Start())
 	defer func() {
 		cmd.Process.Kill()
 		cmd.Wait()
@@ -178,7 +179,7 @@ func (s *DockerCLIAttachSuite) TestAttachDisconnect(c *testing.T) {
 	assert.NilError(c, err)
 	assert.Equal(c, strings.TrimSpace(out), "hello")
 
-	assert.Assert(c, stdin.Close() == nil)
+	assert.NilError(c, stdin.Close())
 
 	// Expect container to still be running after stdin is closed
 	running := inspectField(c, id, "State.Running")
@@ -194,6 +195,6 @@ func (s *DockerCLIAttachSuite) TestAttachPausedContainer(c *testing.T) {
 	result.Assert(c, icmd.Expected{
 		Error:    "exit status 1",
 		ExitCode: 1,
-		Err:      "You cannot attach to a paused container, unpause it first",
+		Err:      "cannot attach to a paused container",
 	})
 }

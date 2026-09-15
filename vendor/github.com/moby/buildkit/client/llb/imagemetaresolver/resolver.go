@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
@@ -86,8 +86,8 @@ func (imr *imageMetaResolver) ResolveImageConfig(ctx context.Context, ref string
 	defer imr.locker.Unlock(ref)
 
 	platform := imr.platform
-	if opt.Platform != nil {
-		platform = opt.Platform
+	if imgOpt := opt.ImageOpt; imgOpt != nil && imgOpt.Platform != nil {
+		platform = imgOpt.Platform
 	}
 
 	k := imr.key(ref, platform)
@@ -107,7 +107,7 @@ func (imr *imageMetaResolver) ResolveImageConfig(ctx context.Context, ref string
 
 func (imr *imageMetaResolver) key(ref string, platform *ocispecs.Platform) string {
 	if platform != nil {
-		ref += platforms.Format(*platform)
+		ref += platforms.FormatAll(*platform)
 	}
 	return ref
 }

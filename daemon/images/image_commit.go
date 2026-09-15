@@ -1,16 +1,17 @@
-package images // import "github.com/docker/docker/daemon/images"
+package images
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 
-	"github.com/docker/docker/api/types/backend"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/image"
-	"github.com/docker/docker/layer"
-	"github.com/docker/docker/pkg/ioutils"
-	"github.com/pkg/errors"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon/internal/image"
+	"github.com/moby/moby/v2/daemon/internal/layer"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/errdefs"
+	"github.com/moby/moby/v2/pkg/ioutils"
 )
 
 // CommitImage creates a new image from a commit config
@@ -64,7 +65,7 @@ func (i *ImageService) CommitImage(ctx context.Context, c backend.CommitConfig) 
 		return "", err
 	}
 
-	i.LogImageEvent(id.String(), id.String(), events.ActionCreate)
+	i.LogImageEvent(ctx, id.String(), id.String(), events.ActionCreate)
 
 	if err := i.imageStore.SetBuiltLocally(id); err != nil {
 		return "", err
@@ -78,14 +79,14 @@ func (i *ImageService) CommitImage(ctx context.Context, c backend.CommitConfig) 
 	return id, nil
 }
 
-func exportContainerRw(layerStore layer.Store, id, mountLabel string) (arch io.ReadCloser, err error) {
+func exportContainerRw(layerStore layer.Store, id, mountLabel string) (arch io.ReadCloser, retErr error) {
 	rwlayer, err := layerStore.GetRWLayer(id)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err != nil {
-			layerStore.ReleaseRWLayer(rwlayer)
+		if retErr != nil {
+			_, _ = layerStore.ReleaseRWLayer(rwlayer)
 		}
 	}()
 
@@ -93,23 +94,21 @@ func exportContainerRw(layerStore layer.Store, id, mountLabel string) (arch io.R
 	// mount the layer if needed. But the Diff() function for windows requests that
 	// the layer should be mounted when calling it. So we reserve this mount call
 	// until windows driver can implement Diff() interface correctly.
-	_, err = rwlayer.Mount(mountLabel)
-	if err != nil {
+	if _, err := rwlayer.Mount(mountLabel); err != nil {
 		return nil, err
 	}
 
 	archive, err := rwlayer.TarStream()
 	if err != nil {
-		rwlayer.Unmount()
+		_ = rwlayer.Unmount()
 		return nil, err
 	}
 	return ioutils.NewReadCloserWrapper(archive, func() error {
-			archive.Close()
-			err = rwlayer.Unmount()
-			layerStore.ReleaseRWLayer(rwlayer)
-			return err
-		}),
-		nil
+		_ = archive.Close()
+		err := rwlayer.Unmount()
+		_, _ = layerStore.ReleaseRWLayer(rwlayer)
+		return err
+	}), nil
 }
 
 // CommitBuildStep is used by the builder to create an image for each step in
@@ -124,11 +123,10 @@ func exportContainerRw(layerStore layer.Store, id, mountLabel string) (arch io.R
 func (i *ImageService) CommitBuildStep(ctx context.Context, c backend.CommitConfig) (image.ID, error) {
 	ctr := i.containers.Get(c.ContainerID)
 	if ctr == nil {
-		// TODO: use typed error
-		return "", errors.Errorf("container not found: %s", c.ContainerID)
+		return "", errdefs.NotFound(fmt.Errorf("container not found: %s", c.ContainerID))
 	}
 	c.ContainerMountLabel = ctr.MountLabel
-	c.ContainerOS = ctr.OS
+	c.ContainerOS = ctr.ImagePlatform.OS
 	c.ParentImageID = string(ctr.ImageID)
 	return i.CommitImage(ctx, c)
 }

@@ -1,10 +1,6 @@
 DOCKER ?= docker
 BUILDX ?= $(DOCKER) buildx
 
-# set the graph driver as the current graphdriver if not set
-DOCKER_GRAPHDRIVER := $(if $(DOCKER_GRAPHDRIVER),$(DOCKER_GRAPHDRIVER),$(shell docker info -f '{{ .Driver }}' 2>&1))
-export DOCKER_GRAPHDRIVER
-
 DOCKER_GITCOMMIT := $(shell git rev-parse HEAD)
 export DOCKER_GITCOMMIT
 
@@ -25,17 +21,13 @@ export GIT_PAGER
 # option of "go build". For example, a built-in graphdriver priority list
 # can be changed during build time like this:
 #
-# make DOCKER_LDFLAGS="-X github.com/docker/docker/daemon/graphdriver.priority=overlay2,zfs" dynbinary
+# make DOCKER_LDFLAGS="-X github.com/moby/moby/v2/daemon/graphdriver.priority=overlay2,zfs" dynbinary
 #
 DOCKER_ENVS := \
 	-e BUILDFLAGS \
 	-e KEEPBUNDLE \
 	-e DOCKER_BUILD_ARGS \
-	-e DOCKER_BUILD_GOGC \
-	-e DOCKER_BUILD_OPTS \
-	-e DOCKER_BUILD_PKGS \
 	-e DOCKER_BUILDKIT \
-	-e DOCKER_BASH_COMPLETION_PATH \
 	-e DOCKER_CLI_PATH \
 	-e DOCKERCLI_VERSION \
 	-e DOCKERCLI_REPOSITORY \
@@ -43,8 +35,10 @@ DOCKER_ENVS := \
 	-e DOCKERCLI_INTEGRATION_REPOSITORY \
 	-e DOCKER_DEBUG \
 	-e DOCKER_EXPERIMENTAL \
+	-e DOCKER_FIREWALL_BACKEND \
 	-e DOCKER_GITCOMMIT \
 	-e DOCKER_GRAPHDRIVER \
+	-e DOCKER_IGNORE_BR_NETFILTER_ERROR \
 	-e DOCKER_LDFLAGS \
 	-e DOCKER_PORT \
 	-e DOCKER_REMAP_ROOT \
@@ -54,15 +48,18 @@ DOCKER_ENVS := \
 	-e DOCKER_USERLANDPROXY \
 	-e DOCKERD_ARGS \
 	-e DELVE_PORT \
+	-e FIREWALLD \
 	-e GITHUB_ACTIONS \
+	-e CI \
 	-e TEST_FORCE_VALIDATE \
 	-e TEST_INTEGRATION_DIR \
-	-e TEST_INTEGRATION_USE_SNAPSHOTTER \
+	-e TEST_INTEGRATION_CONTAINERD_EMBEDDED \
+	-e TEST_INTEGRATION_USE_GRAPHDRIVER \
 	-e TEST_INTEGRATION_FAIL_FAST \
 	-e TEST_SKIP_INTEGRATION \
 	-e TEST_SKIP_INTEGRATION_CLI \
-	-e TEST_IGNORE_CGROUP_CHECK \
 	-e TESTCOVERAGE \
+	-e FLAKY_EXTRA_TESTS \
 	-e TESTDEBUG \
 	-e TESTDIRS \
 	-e TESTFLAGS \
@@ -88,21 +85,20 @@ DOCKER_ENVS := \
 # to allow `make BIND_DIR=. shell` or `make BIND_DIR= test`
 # (default to no bind mount if DOCKER_HOST is set)
 # note: BINDDIR is supported for backwards-compatibility here
-BIND_DIR := $(if $(BINDDIR),$(BINDDIR),$(if $(DOCKER_HOST),,bundles))
+BIND_DIR := $(if $(BINDDIR),$(BINDDIR),$(if $(DOCKER_HOST),,.))
 
 # DOCKER_MOUNT can be overridden, but use at your own risk!
 ifndef DOCKER_MOUNT
-DOCKER_MOUNT := $(if $(BIND_DIR),-v "$(CURDIR)/$(BIND_DIR):/go/src/github.com/docker/docker/$(BIND_DIR)")
+DOCKER_MOUNT := $(if $(BIND_DIR),-v "$(BIND_DIR):/usr/src/moby/$(BIND_DIR)")
 DOCKER_MOUNT := $(if $(DOCKER_BINDDIR_MOUNT_OPTS),$(DOCKER_MOUNT):$(DOCKER_BINDDIR_MOUNT_OPTS),$(DOCKER_MOUNT))
 
 # This allows the test suite to be able to run without worrying about the underlying fs used by the container running the daemon (e.g. aufs-on-aufs), so long as the host running the container is running a supported fs.
 # The volume will be cleaned up when the container is removed due to `--rm`.
 # Note that `BIND_DIR` will already be set to `bundles` if `DOCKER_HOST` is not set (see above BIND_DIR line), in such case this will do nothing since `DOCKER_MOUNT` will already be set.
-DOCKER_MOUNT := $(if $(DOCKER_MOUNT),$(DOCKER_MOUNT),-v /go/src/github.com/docker/docker/bundles) -v "$(CURDIR)/.git:/go/src/github.com/docker/docker/.git"
+DOCKER_MOUNT := $(if $(DOCKER_MOUNT),$(DOCKER_MOUNT),-v /usr/src/moby/bundles) -v "$(CURDIR)/.git:/usr/src/moby/.git"
 
 DOCKER_MOUNT_CACHE := -v docker-dev-cache:/root/.cache -v docker-mod-cache:/go/pkg/mod/
 DOCKER_MOUNT_CLI := $(if $(DOCKER_CLI_PATH),-v $(shell dirname $(DOCKER_CLI_PATH)):/usr/local/cli,)
-DOCKER_MOUNT_BASH_COMPLETION := $(if $(DOCKER_BASH_COMPLETION_PATH),-v $(shell dirname $(DOCKER_BASH_COMPLETION_PATH)):/usr/local/completion/bash,)
 
 ifdef BIND_GIT
 	# Gets the common .git directory (even from inside a git worktree)
@@ -122,10 +118,7 @@ DELVE_PORT_FORWARD := $(if $(DELVE_PORT),-p "$(DELVE_PORT)",)
 
 DOCKER_FLAGS := $(DOCKER) run --rm --privileged $(DOCKER_CONTAINER_NAME) $(DOCKER_ENVS) $(DOCKER_MOUNT) $(DOCKER_PORT_FORWARD) $(DELVE_PORT_FORWARD)
 
-SWAGGER_DOCS_PORT ?= 9000
-
 define \n
-
 
 endef
 
@@ -155,8 +148,11 @@ DOCKER_BUILD_ARGS += --build-arg=DOCKERCLI_INTEGRATION_REPOSITORY
 ifdef DOCKER_SYSTEMD
 DOCKER_BUILD_ARGS += --build-arg=SYSTEMD=true
 endif
+ifdef FIREWALLD
+DOCKER_BUILD_ARGS += --build-arg=FIREWALLD=true
+endif
 
-BUILD_OPTS := ${DOCKER_BUILD_ARGS} ${DOCKER_BUILD_OPTS}
+BUILD_OPTS := ${DOCKER_BUILD_ARGS}
 BUILD_CMD := $(BUILDX) build
 BAKE_CMD := $(BUILDX) bake
 
@@ -206,12 +202,16 @@ build: shell_target := --target=dev-base
 else
 build: shell_target := --target=dev
 endif
-build: bundles
+build: validate-bind-dir bundles
 	$(BUILD_CMD) $(BUILD_OPTS) $(shell_target) --load -t "$(DOCKER_IMAGE)" .
 
 .PHONY: shell
 shell: build  ## start a shell inside the build env
 	$(DOCKER_RUN_DOCKER) bash
+
+.PHONY: dev
+dev: build  ## start a dev mode inside the build env
+	$(DOCKER_RUN_DOCKER) hack/dev.sh
 
 .PHONY: test
 test: build test-unit ## run the unit, integration and docker-py tests
@@ -260,20 +260,12 @@ win: bundles ## cross build the binary for windows
 	$(BAKE_CMD) --set *.platform=windows/amd64 binary
 
 .PHONY: swagger-gen
-swagger-gen:
-	docker run --rm -v $(PWD):/go/src/github.com/docker/docker \
-		-w /go/src/github.com/docker/docker \
-		--entrypoint hack/generate-swagger-api.sh \
-		-e GOPATH=/go \
-		quay.io/goswagger/swagger:0.7.4
+swagger-gen:  ## generate swagger API types
+	$(MAKE) -C api swagger-gen
 
 .PHONY: swagger-docs
 swagger-docs: ## preview the API documentation
-	@echo "API docs preview will be running at http://localhost:$(SWAGGER_DOCS_PORT)"
-	@docker run --rm -v $(PWD)/api/swagger.yaml:/usr/share/nginx/html/swagger.yaml \
-		-e 'REDOC_OPTIONS=hide-hostname="true" lazy-rendering' \
-		-p $(SWAGGER_DOCS_PORT):80 \
-		bfirsh/redoc:1.14.0
+	$(MAKE) -C api swagger-docs
 
 .PHONY: generate-files
 generate-files:
@@ -287,3 +279,10 @@ generate-files:
 		--file "./hack/dockerfiles/generate-files.Dockerfile" .
 	cp -R "$($@_TMP_OUT)"/. .
 	rm -rf "$($@_TMP_OUT)"/*
+
+.PHONY: validate-bind-dir
+validate-bind-dir:
+	@case "$(BIND_DIR)" in \
+		".."*|"/"*) echo "Make needs to be run from the project-root directory, with BIND_DIR set to \".\" or a subdir"; \
+		exit 1 ;; \
+	esac

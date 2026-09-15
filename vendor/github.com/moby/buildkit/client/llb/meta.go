@@ -18,14 +18,15 @@ import (
 type contextKeyT string
 
 var (
-	keyArgs         = contextKeyT("llb.exec.args")
-	keyDir          = contextKeyT("llb.exec.dir")
-	keyEnv          = contextKeyT("llb.exec.env")
-	keyExtraHost    = contextKeyT("llb.exec.extrahost")
-	keyHostname     = contextKeyT("llb.exec.hostname")
-	keyUlimit       = contextKeyT("llb.exec.ulimit")
-	keyCgroupParent = contextKeyT("llb.exec.cgroup.parent")
-	keyUser         = contextKeyT("llb.exec.user")
+	keyArgs           = contextKeyT("llb.exec.args")
+	keyDir            = contextKeyT("llb.exec.dir")
+	keyEnv            = contextKeyT("llb.exec.env")
+	keyExtraHost      = contextKeyT("llb.exec.extrahost")
+	keyHostname       = contextKeyT("llb.exec.hostname")
+	keyUlimit         = contextKeyT("llb.exec.ulimit")
+	keyCgroupParent   = contextKeyT("llb.exec.cgroup.parent")
+	keyUser           = contextKeyT("llb.exec.user")
+	keyValidExitCodes = contextKeyT("llb.exec.validexitcodes")
 
 	keyPlatform = contextKeyT("llb.platform")
 	keyNetwork  = contextKeyT("llb.network")
@@ -34,7 +35,7 @@ var (
 
 // AddEnvf is the same as [AddEnv] but allows for a format string.
 // This is the equivalent of `[State.AddEnvf]`
-func AddEnvf(key, value string, v ...interface{}) StateOption {
+func AddEnvf(key, value string, v ...any) StateOption {
 	return addEnvf(key, value, true, v...)
 }
 
@@ -45,12 +46,12 @@ func AddEnv(key, value string) StateOption {
 	return addEnvf(key, value, false)
 }
 
-func addEnvf(key, value string, replace bool, v ...interface{}) StateOption {
+func addEnvf(key, value string, replace bool, v ...any) StateOption {
 	if replace {
 		value = fmt.Sprintf(value, v...)
 	}
 	return func(s State) State {
-		return s.withValue(keyEnv, func(ctx context.Context, c *Constraints) (interface{}, error) {
+		return s.withValue(keyEnv, func(ctx context.Context, c *Constraints) (any, error) {
 			env, err := getEnv(s)(ctx, c)
 			if err != nil {
 				return nil, err
@@ -68,16 +69,16 @@ func Dir(str string) StateOption {
 }
 
 // Dirf is the same as [Dir] but allows for a format string.
-func Dirf(str string, v ...interface{}) StateOption {
+func Dirf(str string, v ...any) StateOption {
 	return dirf(str, true, v...)
 }
 
-func dirf(value string, replace bool, v ...interface{}) StateOption {
+func dirf(value string, replace bool, v ...any) StateOption {
 	if replace {
 		value = fmt.Sprintf(value, v...)
 	}
 	return func(s State) State {
-		return s.withValue(keyDir, func(ctx context.Context, c *Constraints) (interface{}, error) {
+		return s.withValue(keyDir, func(ctx context.Context, c *Constraints) (any, error) {
 			if !path.IsAbs(value) {
 				prev, err := getDir(s)(ctx, c)
 				if err != nil {
@@ -165,6 +166,25 @@ func getUser(s State) func(context.Context, *Constraints) (string, error) {
 	}
 }
 
+func validExitCodes(codes ...int) StateOption {
+	return func(s State) State {
+		return s.WithValue(keyValidExitCodes, codes)
+	}
+}
+
+func getValidExitCodes(s State) func(context.Context, *Constraints) ([]int, error) {
+	return func(ctx context.Context, c *Constraints) ([]int, error) {
+		v, err := s.getValue(keyValidExitCodes)(ctx, c)
+		if err != nil {
+			return nil, err
+		}
+		if v != nil {
+			return v.([]int), nil
+		}
+		return nil, nil
+	}
+}
+
 // Hostname returns a [StateOption] which sets the hostname used for containers created by [State.Run].
 // This is the equivalent of [State.Hostname]
 // See [State.With] for where to use this.
@@ -193,7 +213,7 @@ func args(args ...string) StateOption {
 	}
 }
 
-func shlexf(str string, replace bool, v ...interface{}) StateOption {
+func shlexf(str string, replace bool, v ...any) StateOption {
 	if replace {
 		str = fmt.Sprintf(str, v...)
 	}
@@ -228,7 +248,7 @@ func getPlatform(s State) func(context.Context, *Constraints) (*ocispecs.Platfor
 
 func extraHost(host string, ip net.IP) StateOption {
 	return func(s State) State {
-		return s.withValue(keyExtraHost, func(ctx context.Context, c *Constraints) (interface{}, error) {
+		return s.withValue(keyExtraHost, func(ctx context.Context, c *Constraints) (any, error) {
 			v, err := getExtraHosts(s)(ctx, c)
 			if err != nil {
 				return nil, err
@@ -258,12 +278,12 @@ type HostIP struct {
 
 func ulimit(name UlimitName, soft int64, hard int64) StateOption {
 	return func(s State) State {
-		return s.withValue(keyUlimit, func(ctx context.Context, c *Constraints) (interface{}, error) {
+		return s.withValue(keyUlimit, func(ctx context.Context, c *Constraints) (any, error) {
 			v, err := getUlimit(s)(ctx, c)
 			if err != nil {
 				return nil, err
 			}
-			return append(v, pb.Ulimit{
+			return append(v, &pb.Ulimit{
 				Name: string(name),
 				Soft: soft,
 				Hard: hard,
@@ -272,14 +292,14 @@ func ulimit(name UlimitName, soft int64, hard int64) StateOption {
 	}
 }
 
-func getUlimit(s State) func(context.Context, *Constraints) ([]pb.Ulimit, error) {
-	return func(ctx context.Context, c *Constraints) ([]pb.Ulimit, error) {
+func getUlimit(s State) func(context.Context, *Constraints) ([]*pb.Ulimit, error) {
+	return func(ctx context.Context, c *Constraints) ([]*pb.Ulimit, error) {
 		v, err := s.getValue(keyUlimit)(ctx, c)
 		if err != nil {
 			return nil, err
 		}
 		if v != nil {
-			return v.([]pb.Ulimit), nil
+			return v.([]*pb.Ulimit), nil
 		}
 		return nil, nil
 	}
@@ -304,6 +324,17 @@ func getCgroupParent(s State) func(context.Context, *Constraints) (string, error
 	}
 }
 
+// LinuxResources holds CPU and memory resource limits for containers.
+type LinuxResources struct {
+	Memory     int64
+	MemorySwap int64
+	CPUShares  uint64
+	CPUPeriod  uint64
+	CPUQuota   int64
+	CpusetCpus string
+	CpusetMems string
+}
+
 // Network returns a [StateOption] which sets the network mode used for containers created by [State.Run].
 // This is the equivalent of [State.Network]
 // See [State.With] for where to use this.
@@ -312,6 +343,7 @@ func Network(v pb.NetMode) StateOption {
 		return s.WithValue(keyNetwork, v)
 	}
 }
+
 func getNetwork(s State) func(context.Context, *Constraints) (pb.NetMode, error) {
 	return func(ctx context.Context, c *Constraints) (pb.NetMode, error) {
 		v, err := s.getValue(keyNetwork)(ctx, c)
@@ -334,6 +366,7 @@ func Security(v pb.SecurityMode) StateOption {
 		return s.WithValue(keySecurity, v)
 	}
 }
+
 func getSecurity(s State) func(context.Context, *Constraints) (pb.SecurityMode, error) {
 	return func(ctx context.Context, c *Constraints) (pb.SecurityMode, error) {
 		v, err := s.getValue(keySecurity)(ctx, c)

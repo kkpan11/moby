@@ -1,18 +1,19 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/container"
-	daemonevents "github.com/docker/docker/daemon/events"
-	"github.com/docker/docker/libnetwork"
 	gogotypes "github.com/gogo/protobuf/types"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon/container"
+	daemonevents "github.com/moby/moby/v2/daemon/events"
+	"github.com/moby/moby/v2/daemon/internal/filters"
+	"github.com/moby/moby/v2/daemon/libnetwork"
 	swarmapi "github.com/moby/swarmkit/v2/api"
 )
 
@@ -23,11 +24,13 @@ func (daemon *Daemon) LogContainerEvent(container *container.Container, action e
 
 // LogContainerEventWithAttributes generates an event related to a container with specific given attributes.
 func (daemon *Daemon) LogContainerEventWithAttributes(container *container.Container, action events.Action, attributes map[string]string) {
-	copyAttributes(attributes, container.Config.Labels)
+	if container.Config.Labels != nil {
+		maps.Copy(attributes, container.Config.Labels)
+	}
 	if container.Config.Image != "" {
 		attributes["image"] = container.Config.Image
 	}
-	attributes["name"] = strings.TrimLeft(container.Name, "/")
+	attributes["name"] = strings.TrimPrefix(container.Name, "/")
 	daemon.EventsService.Log(action, events.ContainerEventType, events.Actor{
 		ID:         container.ID,
 		Attributes: attributes,
@@ -79,24 +82,14 @@ func (daemon *Daemon) LogDaemonEventWithAttributes(action events.Action, attribu
 }
 
 // SubscribeToEvents returns the currently record of events, a channel to stream new events from, and a function to cancel the stream of events.
-func (daemon *Daemon) SubscribeToEvents(since, until time.Time, filter filters.Args) ([]events.Message, chan interface{}) {
+func (daemon *Daemon) SubscribeToEvents(since, until time.Time, filter filters.Args) ([]events.Message, chan any) {
 	return daemon.EventsService.SubscribeTopic(since, until, daemonevents.NewFilter(filter))
 }
 
 // UnsubscribeFromEvents stops the event subscription for a client by closing the
 // channel where the daemon sends events to.
-func (daemon *Daemon) UnsubscribeFromEvents(listener chan interface{}) {
+func (daemon *Daemon) UnsubscribeFromEvents(listener chan any) {
 	daemon.EventsService.Evict(listener)
-}
-
-// copyAttributes guarantees that labels are not mutated by event triggers.
-func copyAttributes(attributes, labels map[string]string) {
-	if labels == nil {
-		return
-	}
-	for k, v := range labels {
-		attributes[k] = v
-	}
 }
 
 // ProcessClusterNotifications gets changes from store and add them to event list
@@ -248,15 +241,25 @@ func (daemon *Daemon) logServiceEvent(action swarmapi.WatchActionKind, service *
 	daemon.logClusterEvent(action, service.ID, events.ServiceEventType, eventTime, attributes)
 }
 
-var clusterEventAction = map[swarmapi.WatchActionKind]events.Action{
-	swarmapi.WatchActionKindCreate: events.ActionCreate,
-	swarmapi.WatchActionKindUpdate: events.ActionUpdate,
-	swarmapi.WatchActionKindRemove: events.ActionRemove,
-}
-
 func (daemon *Daemon) logClusterEvent(action swarmapi.WatchActionKind, id string, eventType events.Type, eventTime time.Time, attributes map[string]string) {
+	var eventAction events.Action
+	switch action {
+	case swarmapi.WatchActionKindCreate:
+		eventAction = events.ActionCreate
+	case swarmapi.WatchActionKindUpdate:
+		eventAction = events.ActionUpdate
+	case swarmapi.WatchActionKindRemove:
+		eventAction = events.ActionRemove
+	case swarmapi.WatchActionKindUnknown:
+		// Unknown action kind - skip publishing invalid event
+		return
+	default:
+		// Unknown action kind - skip publishing invalid event
+		return
+	}
+
 	daemon.EventsService.PublishMessage(events.Message{
-		Action: clusterEventAction[action],
+		Action: eventAction,
 		Type:   eventType,
 		Actor: events.Actor{
 			ID:         id,
@@ -269,16 +272,21 @@ func (daemon *Daemon) logClusterEvent(action swarmapi.WatchActionKind, id string
 }
 
 func eventTimestamp(meta swarmapi.Meta, action swarmapi.WatchActionKind) time.Time {
-	var eventTime time.Time
 	switch action {
 	case swarmapi.WatchActionKindCreate:
-		eventTime, _ = gogotypes.TimestampFromProto(meta.CreatedAt)
+		eventTime, _ := gogotypes.TimestampFromProto(meta.CreatedAt)
+		return eventTime
 	case swarmapi.WatchActionKindUpdate:
-		eventTime, _ = gogotypes.TimestampFromProto(meta.UpdatedAt)
+		eventTime, _ := gogotypes.TimestampFromProto(meta.UpdatedAt)
+		return eventTime
 	case swarmapi.WatchActionKindRemove:
 		// There is no timestamp from store message for remove operations.
 		// Use current time.
-		eventTime = time.Now()
+		return time.Now()
+	case swarmapi.WatchActionKindUnknown:
+		return time.Now()
+	default:
+		// For any unexpected action kinds, use current time as fallback.
+		return time.Now()
 	}
-	return eventTime
 }

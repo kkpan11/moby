@@ -1,7 +1,9 @@
 package containerd
 
 import (
+	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/containerd/platforms"
@@ -15,6 +17,24 @@ var (
 	pLinuxAmd64 = ocispec.Platform{
 		OS:           "linux",
 		Architecture: "amd64",
+	}
+
+	pLinuxAmd64v2 = ocispec.Platform{
+		OS:           "linux",
+		Architecture: "amd64",
+		Variant:      "v2",
+	}
+
+	pLinuxAmd64v3 = ocispec.Platform{
+		OS:           "linux",
+		Architecture: "amd64",
+		Variant:      "v3",
+	}
+
+	pLinuxAmd64v4 = ocispec.Platform{
+		OS:           "linux",
+		Architecture: "amd64",
+		Variant:      "v4",
 	}
 
 	pLinuxArmv5 = ocispec.Platform{
@@ -42,6 +62,55 @@ var (
 	}
 )
 
+func TestHostPlatformSpecSetsAMD64Variant(t *testing.T) {
+	imgSvc := ImageService{defaultPlatformOverride: &pLinuxAmd64}
+	p := imgSvc.hostPlatformSpec()
+	assert.Check(t, is.DeepEqual(p, pLinuxAmd64))
+
+	imgSvc = ImageService{}
+	p = imgSvc.hostPlatformSpec()
+	if p.Architecture == "amd64" {
+		assert.Assert(t, strings.HasPrefix(p.Variant, "v"))
+	}
+}
+
+func TestMatcherOnLinuxAmd64v4(t *testing.T) {
+	yes := true
+	no := false
+
+	for _, indexTc := range []indexTestCase{
+		{
+			name:  "linux_amd64_linux_amd64_v3",
+			index: []ocispec.Platform{pLinuxAmd64, pLinuxAmd64v3},
+			tc: []requestedAndFirst{
+				{requested: nil, first: &pLinuxAmd64v3},
+				{requested: &ocispec.Platform{OS: "linux", Architecture: "amd64"}, first: &pLinuxAmd64},
+				{requested: &ocispec.Platform{OS: "linux", Architecture: "amd64", Variant: "v3"}, first: &pLinuxAmd64v3},
+			},
+		},
+		{
+			name:  "linux_amd64_v3_only",
+			index: []ocispec.Platform{pLinuxAmd64v3},
+			tc: []requestedAndFirst{
+				{requested: nil, first: &pLinuxAmd64v3},
+				{strict: &yes, requested: &ocispec.Platform{OS: "linux", Architecture: "amd64"}, first: nil},
+				{strict: &no, requested: &ocispec.Platform{OS: "linux", Architecture: "amd64"}, first: nil},
+			},
+		},
+		{
+			name:  "linux_amd64_v2_v3",
+			index: []ocispec.Platform{pLinuxAmd64v2, pLinuxAmd64v3},
+			tc: []requestedAndFirst{
+				{requested: nil, first: &pLinuxAmd64v3},
+				{strict: &yes, requested: &ocispec.Platform{OS: "linux", Architecture: "amd64", Variant: "v4"}, first: nil},
+				{strict: &no, requested: &ocispec.Platform{OS: "linux", Architecture: "amd64", Variant: "v4"}, first: &pLinuxAmd64v3},
+			},
+		},
+	} {
+		testOnlyAndOnlyStrict(t, pLinuxAmd64v4, indexTc)
+	}
+}
+
 type requestedAndFirst struct {
 	// Whether platforms.Only or OnlyStrict should be used
 	// Nil means both should be the same
@@ -57,11 +126,11 @@ type indexTestCase struct {
 }
 
 func TestMatcherOnLinuxArm64v8(t *testing.T) {
-	daemonPlatform := platforms.Only(ocispec.Platform{
+	daemonPlatform := ocispec.Platform{
 		OS:           "linux",
 		Architecture: "arm64",
 		Variant:      "v8",
-	})
+	}
 
 	yes := true
 	no := false
@@ -95,11 +164,11 @@ func TestMatcherOnLinuxArm64v8(t *testing.T) {
 
 func TestMatcherOnWindowsAmd64(t *testing.T) {
 	skip.If(t, runtime.GOOS != "windows", "TODO: containerd matcher only matches OSVersion when on Windows")
-	daemonPlatform := platforms.Only(ocispec.Platform{
+	daemonPlatform := ocispec.Platform{
 		OS:           "windows",
 		Architecture: "amd64",
 		OSVersion:    "10.0.18362",
-	})
+	}
 
 	for _, indexTc := range []indexTestCase{
 		{
@@ -120,18 +189,15 @@ func TestMatcherOnWindowsAmd64(t *testing.T) {
 	}
 }
 
-func testOnlyAndOnlyStrict(t *testing.T, daemonPlatform platforms.MatchComparer, indexTc indexTestCase) {
+func testOnlyAndOnlyStrict(t *testing.T, daemonPlatform ocispec.Platform, indexTc indexTestCase) {
 	imgSvc := ImageService{}
-	imgSvc.defaultPlatformOverride = daemonPlatform
+	imgSvc.defaultPlatformOverride = &daemonPlatform
 
 	t.Run(indexTc.name, func(t *testing.T) {
 		indexTc := indexTc
 		idx := indexTc.index
 		for _, tc := range indexTc.tc {
-			tc := tc
-
 			for _, strict := range []bool{false, true} {
-				strict := strict
 				s := "non-strict"
 				if strict {
 					s = "strict"
@@ -156,7 +222,6 @@ func testOnlyAndOnlyStrict(t *testing.T, daemonPlatform platforms.MatchComparer,
 
 					var first *ocispec.Platform
 					for _, p := range idx {
-						p := p
 						if !pm.Match(p) {
 							continue
 						}
@@ -170,4 +235,36 @@ func testOnlyAndOnlyStrict(t *testing.T, daemonPlatform platforms.MatchComparer,
 			}
 		}
 	})
+}
+
+func TestPlatformsWithPreferenceMatcher(t *testing.T) {
+	platformList := []ocispec.Platform{
+		pLinuxAmd64,
+		pLinuxArmv5,
+		pLinuxArmv6,
+		pLinuxArm64,
+		pWindowsAmd64,
+	}
+
+	// Use pLinuxArm64 as the preferred platform
+	preferred := platforms.Only(pLinuxArm64)
+	matcher := matchAnyWithPreference(preferred, platformList)
+
+	// Should match all platforms in the list
+	for _, p := range platformList {
+		assert.Assert(t, matcher.Match(p), "matcher should match platform: %v", platforms.Format(p))
+	}
+
+	// Should not match a platform not in the list
+	notInList := ocispec.Platform{OS: "linux", Architecture: "s390x"}
+	assert.Assert(t, !matcher.Match(notInList), "matcher should not match platform: %v", platforms.Format(notInList))
+
+	// Test Less: preferred should be less than others
+	for _, p := range platformList {
+		if reflect.DeepEqual(p, pLinuxArm64) {
+			continue
+		}
+		assert.Assert(t, matcher.Less(pLinuxArm64, p), "preferred platform should be less than %v", platforms.Format(p))
+		assert.Assert(t, !matcher.Less(p, pLinuxArm64), "%v should not be less than preferred platform", platforms.Format(p))
+	}
 }

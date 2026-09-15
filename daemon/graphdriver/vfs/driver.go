@@ -1,17 +1,16 @@
-package vfs // import "github.com/docker/docker/daemon/graphdriver/vfs"
+package vfs
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/docker/docker/daemon/graphdriver"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/internal/containerfs"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/parsers"
-	"github.com/docker/docker/quota"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
+	"github.com/moby/moby/v2/daemon/graphdriver"
+	"github.com/moby/moby/v2/daemon/internal/containerfs"
+	"github.com/moby/moby/v2/daemon/internal/quota"
+	"github.com/moby/moby/v2/errdefs"
+	"github.com/moby/sys/user"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 )
@@ -30,7 +29,7 @@ func init() {
 
 // Init returns a new VFS driver.
 // This sets the home directory for the driver and returns NaiveDiffDriver.
-func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdriver.Driver, error) {
+func Init(home string, options []string, idMap user.IdentityMapping) (graphdriver.Driver, error) {
 	d := &Driver{
 		home:      home,
 		idMapping: idMap,
@@ -40,11 +39,11 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		return nil, err
 	}
 
-	dirID := idtools.Identity{
-		UID: idtools.CurrentIdentity().UID,
-		GID: d.idMapping.RootPair().GID,
+	_, gid := d.idMapping.RootPair()
+	if err := user.MkdirAndChown(home, 0o710, os.Getuid(), gid); err != nil {
+		return nil, err
 	}
-	if err := idtools.MkdirAllAndChown(home, 0o710, dirID); err != nil {
+	if err := user.MkdirAndChown(filepath.Join(home, "dir"), 0o710, os.Getuid(), gid); err != nil {
 		return nil, err
 	}
 
@@ -68,7 +67,7 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 type Driver struct {
 	driverQuota
 	home             string
-	idMapping        idtools.IdentityMapping
+	idMapping        user.IdentityMapping
 	bestEffortXattrs bool
 }
 
@@ -90,7 +89,16 @@ func (d *Driver) Status() [][2]string {
 
 // GetMetadata is used for implementing the graphdriver.ProtoDriver interface. VFS does not currently have any meta data.
 func (d *Driver) GetMetadata(id string) (map[string]string, error) {
-	return nil, nil
+	dir := d.dir(id)
+	if _, err := os.Stat(dir); err != nil {
+		return nil, err
+	}
+
+	metadata := map[string]string{
+		"SourceDir": dir,
+	}
+
+	return metadata, nil
 }
 
 // Cleanup is used to implement graphdriver.ProtoDriver. There is no cleanup required for this driver.
@@ -100,7 +108,7 @@ func (d *Driver) Cleanup() error {
 
 func (d *Driver) parseOptions(options []string) error {
 	for _, option := range options {
-		key, val, err := parsers.ParseKeyValueOpt(option)
+		key, val, err := graphdriver.ParseStorageOptKeyValue(option)
 		if err != nil {
 			return errdefs.InvalidParameter(err)
 		}
@@ -154,7 +162,7 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 // Create prepares the filesystem for the VFS driver and copies the directory for the given id under the parent.
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 	if opts != nil && len(opts.StorageOpt) != 0 {
-		return fmt.Errorf("--storage-opt is not supported for vfs on read-only layers")
+		return errors.New("--storage-opt is not supported for vfs on read-only layers")
 	}
 
 	return d.create(id, parent, 0)
@@ -162,16 +170,9 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 
 func (d *Driver) create(id, parent string, size uint64) error {
 	dir := d.dir(id)
-	rootIDs := d.idMapping.RootPair()
+	uid, gid := d.idMapping.RootPair()
 
-	dirID := idtools.Identity{
-		UID: idtools.CurrentIdentity().UID,
-		GID: rootIDs.GID,
-	}
-	if err := idtools.MkdirAllAndChown(filepath.Dir(dir), 0o710, dirID); err != nil {
-		return err
-	}
-	if err := idtools.MkdirAndChown(dir, 0o755, rootIDs); err != nil {
+	if err := user.MkdirAndChown(dir, 0o755, uid, gid); err != nil {
 		return err
 	}
 

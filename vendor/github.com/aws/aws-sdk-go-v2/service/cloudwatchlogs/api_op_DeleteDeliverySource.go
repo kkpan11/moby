@@ -4,18 +4,17 @@ package cloudwatchlogs
 
 import (
 	"context"
-	"fmt"
-	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/smithy-go/middleware"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Deletes a delivery source. A delivery is a connection between a logical
-// delivery source and a logical delivery destination. You can't delete a delivery
-// source if any current deliveries are associated with it. To find whether any
-// deliveries are associated with this delivery source, use the DescribeDeliveries (https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_DescribeDeliveries.html)
-// operation and check the deliverySourceName field in the results.
+// delivery source and a logical delivery destination.
+//
+// You can't delete a delivery source if any current deliveries are associated
+// with it. To find whether any deliveries are associated with this delivery
+// source, use the [DescribeDeliveries]operation and check the deliverySourceName field in the results.
+//
+// [DescribeDeliveries]: https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_DescribeDeliveries.html
 func (c *Client) DeleteDeliverySource(ctx context.Context, params *DeleteDeliverySourceInput, optFns ...func(*Options)) (*DeleteDeliverySourceOutput, error) {
 	if params == nil {
 		params = &DeleteDeliverySourceInput{}
@@ -49,9 +48,6 @@ type DeleteDeliverySourceOutput struct {
 }
 
 func (c *Client) addOperationDeleteDeliverySourceMiddlewares(stack *middleware.Stack, options Options) (err error) {
-	if err := stack.Serialize.Add(&setOperationInputMiddleware{}, middleware.After); err != nil {
-		return err
-	}
 	err = stack.Serialize.Add(&awsAwsjson11_serializeOpDeleteDeliverySource{}, middleware.After)
 	if err != nil {
 		return err
@@ -60,56 +56,23 @@ func (c *Client) addOperationDeleteDeliverySourceMiddlewares(stack *middleware.S
 	if err != nil {
 		return err
 	}
-	if err := addProtocolFinalizerMiddlewares(stack, options, "DeleteDeliverySource"); err != nil {
-		return fmt.Errorf("add protocol finalizers: %v", err)
-	}
 
-	if err = addlegacyEndpointContextSetter(stack, options); err != nil {
-		return err
-	}
-	if err = addSetLoggerMiddleware(stack, options); err != nil {
-		return err
-	}
-	if err = awsmiddleware.AddClientRequestIDMiddleware(stack); err != nil {
-		return err
-	}
-	if err = smithyhttp.AddComputeContentLengthMiddleware(stack); err != nil {
+	if err = addComputeContentLength(stack); err != nil {
 		return err
 	}
 	if err = addResolveEndpointMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = v4.AddComputePayloadSHA256Middleware(stack); err != nil {
+	if err = addComputePayloadSHA256(stack); err != nil {
 		return err
 	}
-	if err = addRetryMiddlewares(stack, options); err != nil {
+	if err = addRecordResponseTiming(stack, options); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRawResponseToMetadata(stack); err != nil {
-		return err
-	}
-	if err = awsmiddleware.AddRecordResponseTiming(stack); err != nil {
-		return err
-	}
-	if err = addClientUserAgent(stack, options); err != nil {
-		return err
-	}
-	if err = smithyhttp.AddErrorCloseResponseBodyMiddleware(stack); err != nil {
-		return err
-	}
-	if err = smithyhttp.AddCloseResponseBodyMiddleware(stack); err != nil {
-		return err
-	}
-	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+	if err = addCredentialSource(stack, options); err != nil {
 		return err
 	}
 	if err = addOpDeleteDeliverySourceValidationMiddleware(stack); err != nil {
-		return err
-	}
-	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDeleteDeliverySource(options.Region), middleware.Before); err != nil {
-		return err
-	}
-	if err = awsmiddleware.AddRecursionDetection(stack); err != nil {
 		return err
 	}
 	if err = addRequestIDRetrieverMiddleware(stack); err != nil {
@@ -124,13 +87,8 @@ func (c *Client) addOperationDeleteDeliverySourceMiddlewares(stack *middleware.S
 	if err = addDisableHTTPSMiddleware(stack, options); err != nil {
 		return err
 	}
-	return nil
-}
-
-func newServiceMetadataMiddleware_opDeleteDeliverySource(region string) *awsmiddleware.RegisterServiceMetadata {
-	return &awsmiddleware.RegisterServiceMetadata{
-		Region:        region,
-		ServiceID:     ServiceID,
-		OperationName: "DeleteDeliverySource",
+	if err = addInterceptors(stack, options); err != nil {
+		return err
 	}
+	return nil
 }

@@ -33,6 +33,18 @@ func (cm *combinedCacheManager) ID() string {
 	return cm.id
 }
 
+func (cm *combinedCacheManager) ReleaseUnreferenced(ctx context.Context) error {
+	eg, ctx := errgroup.WithContext(ctx)
+	for _, c := range cm.cms {
+		func(c CacheManager) {
+			eg.Go(func() error {
+				return c.ReleaseUnreferenced(ctx)
+			})
+		}(c)
+	}
+	return eg.Wait()
+}
+
 func (cm *combinedCacheManager) Query(inp []CacheKeyWithSelector, inputIndex Index, dgst digest.Digest, outputIndex Index) ([]*CacheKey, error) {
 	eg, _ := errgroup.WithContext(context.TODO())
 	keys := make(map[string]*CacheKey, len(cm.cms))
@@ -89,7 +101,7 @@ func (cm *combinedCacheManager) Load(ctx context.Context, rec *CacheRecord) (res
 		}
 	}
 	if len(results) == 0 { // TODO: handle gracefully
-		return nil, errors.Errorf("failed to load deleted cache")
+		return nil, errors.New("failed to load deleted cache")
 	}
 	return results[0].Result, nil
 }
@@ -105,7 +117,7 @@ func (cm *combinedCacheManager) Records(ctx context.Context, ck *CacheKey) ([]*C
 	ck.mu.RLock()
 	if len(ck.ids) == 0 {
 		ck.mu.RUnlock()
-		return nil, errors.Errorf("no results")
+		return nil, errors.New("no results")
 	}
 
 	cms := make([]*cacheManager, 0, len(ck.ids))
@@ -119,7 +131,6 @@ func (cm *combinedCacheManager) Records(ctx context.Context, ck *CacheKey) ([]*C
 
 	eg, _ := errgroup.WithContext(context.TODO())
 	for _, c := range cms {
-		c := c
 		eg.Go(func() error {
 			recs, err := c.Records(ctx, ck)
 			if err != nil {

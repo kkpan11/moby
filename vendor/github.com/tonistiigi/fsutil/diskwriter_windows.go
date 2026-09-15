@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package fsutil
 
@@ -20,7 +19,7 @@ func rewriteMetadata(p string, stat *types.Stat) error {
 
 // handleTarTypeBlockCharFifo is an OS-specific helper function used by
 // createTarFile to handle the following types of header: Block; Char; Fifo
-func handleTarTypeBlockCharFifo(path string, stat *types.Stat) error {
+func handleTarTypeBlockCharFifo(_ string, _ *types.Stat) error {
 	return errors.New("Not implemented on windows")
 }
 

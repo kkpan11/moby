@@ -13,13 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	eventtypes "github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/client"
-	eventstestutils "github.com/docker/docker/daemon/events/testutils"
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/cli/build"
-	"github.com/docker/docker/testutil"
+	eventtypes "github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/client"
+	eventstestutils "github.com/moby/moby/v2/daemon/events/testutils"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli/build"
+	"github.com/moby/moby/v2/internal/testutil"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
@@ -29,12 +28,12 @@ type DockerCLIEventSuite struct {
 	ds *DockerSuite
 }
 
-func (s *DockerCLIEventSuite) TearDownTest(ctx context.Context, c *testing.T) {
-	s.ds.TearDownTest(ctx, c)
+func (s *DockerCLIEventSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
 }
 
-func (s *DockerCLIEventSuite) OnTimeout(c *testing.T) {
-	s.ds.OnTimeout(c)
+func (s *DockerCLIEventSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
 }
 
 func (s *DockerCLIEventSuite) TestEventsTimestampFormats(c *testing.T) {
@@ -48,7 +47,7 @@ func (s *DockerCLIEventSuite) TestEventsTimestampFormats(c *testing.T) {
 	end := daemonTime(c)
 
 	// List of available time formats to --since
-	unixTs := func(t time.Time) string { return fmt.Sprintf("%v", t.Unix()) }
+	unixTs := func(t time.Time) string { return strconv.FormatInt(t.Unix(), 10) }
 	rfc3339 := func(t time.Time) string { return t.Format(time.RFC3339) }
 	duration := func(t time.Time) string { return time.Since(t).String() }
 
@@ -189,7 +188,7 @@ func (s *DockerCLIEventSuite) TestEventsImageImport(c *testing.T) {
 	assert.NilError(c, err, "import failed with output: %q", out)
 	imageRef := strings.TrimSpace(out)
 
-	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event=import").Stdout()
+	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event="+string(eventtypes.ActionImport)).Stdout()
 	events := strings.Split(strings.TrimSpace(out), "\n")
 	assert.Equal(c, len(events), 1)
 	matches := eventstestutils.ScanMap(events[0])
@@ -221,14 +220,14 @@ func (s *DockerCLIEventSuite) TestEventsImageLoad(c *testing.T) {
 	imageID := strings.TrimSpace(out)
 	assert.Equal(c, imageID, longImageID, "Should have same image id as before")
 
-	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event=load").Stdout()
+	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event="+string(eventtypes.ActionLoad)).Stdout()
 	events := strings.Split(strings.TrimSpace(out), "\n")
 	assert.Equal(c, len(events), 1)
 	matches := eventstestutils.ScanMap(events[0])
 	assert.Equal(c, matches["id"], imageID, "matches: %v\nout:\n%s\n", matches, out)
 	assert.Equal(c, matches["action"], "load", "matches: %v\nout:\n%s\n", matches, out)
 
-	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event=save").Stdout()
+	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event="+string(eventtypes.ActionSave)).Stdout()
 	events = strings.Split(strings.TrimSpace(out), "\n")
 	assert.Equal(c, len(events), 1)
 	matches = eventstestutils.ScanMap(events[0])
@@ -259,10 +258,10 @@ func (s *DockerCLIEventSuite) TestEventsFilters(c *testing.T) {
 	since := daemonUnixTime(c)
 	cli.DockerCmd(c, "run", "--rm", "busybox", "true")
 	cli.DockerCmd(c, "run", "--rm", "busybox", "true")
-	out := cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event=die").Stdout()
+	out := cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event="+string(eventtypes.ActionDie)).Stdout()
 	parseEvents(c, out, "die")
 
-	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event=die", "--filter", "event=start").Stdout()
+	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "event=die", "--filter", "event="+string(eventtypes.ActionStart)).Stdout()
 	parseEvents(c, out, "die|start")
 
 	// make sure we at least got 2 start events
@@ -280,7 +279,7 @@ func (s *DockerCLIEventSuite) TestEventsFilterImageName(c *testing.T) {
 	container2 := strings.TrimSpace(out)
 
 	name := "busybox"
-	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", fmt.Sprintf("image=%s", name)).Stdout()
+	out = cli.DockerCmd(c, "events", "--since", since, "--until", daemonUnixTime(c), "--filter", "image="+name).Stdout()
 	events := strings.Split(out, "\n")
 	events = events[:len(events)-1]
 	assert.Assert(c, len(events) != 0, "Expected events but found none for the image busybox:latest")
@@ -338,7 +337,7 @@ func (s *DockerCLIEventSuite) TestEventsFilterImageLabels(c *testing.T) {
 	label := "io.docker.testing=image"
 
 	// Build a test image.
-	buildImageSuccessfully(c, name,
+	cli.BuildCmd(c, name,
 		build.WithDockerfile("FROM busybox:latest\nLABEL "+label),
 		build.WithoutCache, // Make sure image is actually built
 	)
@@ -350,8 +349,14 @@ func (s *DockerCLIEventSuite) TestEventsFilterImageLabels(c *testing.T) {
 		"events",
 		"--since", since,
 		"--until", daemonUnixTime(c),
-		"--filter", fmt.Sprintf("label=%s", label),
-		"--filter", "type=image",
+		"--filter", "label="+label,
+		"--filter", "type="+string(eventtypes.ImageEventType),
+
+		// Depending on the API version, 3 or 4 events are produced; 2 events from
+		// the "docker tag" command, and 1 or 2 events from "docker build";
+		// Image create events were added in API 1.46, and filtered out in older
+		// API versions.
+		"--filter", "event="+string(eventtypes.ActionTag),
 	).Stdout()
 
 	events := strings.Split(strings.TrimSpace(out), "\n")
@@ -359,7 +364,7 @@ func (s *DockerCLIEventSuite) TestEventsFilterImageLabels(c *testing.T) {
 	// 2 events from the "docker tag" command, another one is from "docker build"
 	assert.Equal(c, len(events), 3, "Events == %s", events)
 	for _, e := range events {
-		assert.Check(c, strings.Contains(e, "labelfiltertest"))
+		assert.Check(c, is.Contains(e, "labelfiltertest"))
 	}
 }
 
@@ -419,7 +424,7 @@ func (s *DockerCLIEventSuite) TestEventsCommit(c *testing.T) {
 
 func (s *DockerCLIEventSuite) TestEventsCopy(c *testing.T) {
 	// Build a test image.
-	buildImageSuccessfully(c, "cpimg", build.WithDockerfile(`
+	cli.BuildCmd(c, "cpimg", build.WithDockerfile(`
 		  FROM busybox
 		  RUN echo HI > /file`))
 	id := getIDByName(c, "cpimg")
@@ -450,15 +455,15 @@ func (s *DockerCLIEventSuite) TestEventsResize(c *testing.T) {
 	cID := runSleepingContainer(c, "-d", "-t")
 	cli.WaitRun(c, cID)
 
-	apiClient, err := client.NewClientWithOpts(client.FromEnv)
+	apiClient, err := client.New(client.FromEnv)
 	assert.NilError(c, err)
 	defer apiClient.Close()
 
-	options := container.ResizeOptions{
+	options := client.ContainerResizeOptions{
 		Height: 80,
 		Width:  24,
 	}
-	err = apiClient.ContainerResize(testutil.GetContext(c), cID, options)
+	_, err = apiClient.ContainerResize(testutil.GetContext(c), cID, options)
 	assert.NilError(c, err)
 
 	cli.DockerCmd(c, "stop", cID)
@@ -549,19 +554,18 @@ func (s *DockerRegistrySuite) TestEventsImageFilterPush(c *testing.T) {
 	cli.DockerCmd(c, "push", imgRepoName)
 
 	until := daemonUnixTime(c)
-	out = cli.DockerCmd(c, "events", "-f", "image="+imgRepoName, "-f", "event=push", "--until", until).Stdout()
+	out = cli.DockerCmd(c, "events", "-f", "image="+imgRepoName, "-f", "event="+string(eventtypes.ActionPush), "--until", until).Stdout()
 	assert.Assert(c, strings.Contains(out, imgRepoName), "Missing 'push' log event for %s", imgRepoName)
 }
 
 func (s *DockerCLIEventSuite) TestEventsFilterType(c *testing.T) {
-	// FIXME(vdemeester) fails on e2e run
 	testRequires(c, testEnv.IsLocalDaemon)
 	since := daemonUnixTime(c)
 	name := "labelfiltertest"
 	label := "io.docker.testing=image"
 
 	// Build a test image.
-	buildImageSuccessfully(c, name,
+	cli.BuildCmd(c, name,
 		build.WithDockerfile("FROM busybox:latest\nLABEL "+label),
 		build.WithoutCache, // Make sure image is actually built
 	)
@@ -574,7 +578,13 @@ func (s *DockerCLIEventSuite) TestEventsFilterType(c *testing.T) {
 		"--since", since,
 		"--until", daemonUnixTime(c),
 		"--filter", "label="+label,
-		"--filter", "type=image",
+		"--filter", "type="+string(eventtypes.ImageEventType),
+
+		// Depending on the API version, 3 or 4 events are produced; 2 events from
+		// the "docker tag" command, and 1 or 2 events from "docker build";
+		// Image create events were added in API 1.46, and filtered out in older
+		// API versions.
+		"--filter", "event="+string(eventtypes.ActionTag),
 	).Stdout()
 
 	events := strings.Split(strings.TrimSpace(out), "\n")
@@ -582,26 +592,14 @@ func (s *DockerCLIEventSuite) TestEventsFilterType(c *testing.T) {
 	// 2 events from the "docker tag" command, another one is from "docker build"
 	assert.Equal(c, len(events), 3, "Events == %s", events)
 	for _, e := range events {
-		assert.Check(c, strings.Contains(e, "labelfiltertest"))
+		assert.Check(c, is.Contains(e, "labelfiltertest"))
 	}
 
 	out = cli.DockerCmd(c,
 		"events",
 		"--since", since,
 		"--until", daemonUnixTime(c),
-		"--filter", fmt.Sprintf("label=%s", label),
-		"--filter", "type=container",
-	).Stdout()
-	events = strings.Split(strings.TrimSpace(out), "\n")
-
-	// Events generated by the container that builds the image
-	assert.Equal(c, len(events), 2, "Events == %s", events)
-
-	out = cli.DockerCmd(c,
-		"events",
-		"--since", since,
-		"--until", daemonUnixTime(c),
-		"--filter", "type=network",
+		"--filter", "type="+string(eventtypes.NetworkEventType),
 	).Stdout()
 	events = strings.Split(strings.TrimSpace(out), "\n")
 	assert.Assert(c, len(events) >= 1, "Events == %s", events)
@@ -631,7 +629,7 @@ func (s *DockerCLIEventSuite) TestEventsSpecialFiltersWithExecCreate(c *testing.
 		"--since", since,
 		"--until", daemonUnixTime(c),
 		"--filter",
-		"event=exec_create",
+		"event="+string(eventtypes.ActionExecCreate),
 	).Stdout()
 	assert.Equal(c, len(events), 1, out)
 }
@@ -690,10 +688,14 @@ func (s *DockerCLIEventSuite) TestEventsSinceInTheFuture(c *testing.T) {
 
 	since := daemonTime(c)
 	until := since.Add(time.Duration(-24) * time.Hour)
-	out, _, err := dockerCmdWithError("events", "--filter", "image=busybox", "--since", parseEventTime(since), "--until", parseEventTime(until))
+	out, _, err := dockerCmdWithError("events",
+		"--filter", "image=busybox",
+		"--since", fmt.Sprintf("%d.%09d", since.Unix(), int64(since.Nanosecond())),
+		"--until", fmt.Sprintf("%d.%09d", until.Unix(), int64(until.Nanosecond())),
+	)
 
 	assert.ErrorContains(c, err, "")
-	assert.Assert(c, strings.Contains(out, "cannot be after `until`"))
+	assert.Assert(c, is.Contains(out, "cannot be after `until`"))
 }
 
 func (s *DockerCLIEventSuite) TestEventsUntilInThePast(c *testing.T) {
@@ -708,7 +710,7 @@ func (s *DockerCLIEventSuite) TestEventsUntilInThePast(c *testing.T) {
 	out := cli.DockerCmd(c, "events", "--filter", "image=busybox", "--since", since, "--until", until).Stdout()
 
 	assert.Assert(c, !strings.Contains(out, "test-container2"))
-	assert.Assert(c, strings.Contains(out, "test-container"))
+	assert.Assert(c, is.Contains(out, "test-container"))
 }
 
 func (s *DockerCLIEventSuite) TestEventsFormat(c *testing.T) {

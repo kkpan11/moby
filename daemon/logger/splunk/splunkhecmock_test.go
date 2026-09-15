@@ -1,4 +1,4 @@
-package splunk // import "github.com/docker/docker/daemon/logger/splunk"
+package splunk
 
 import (
 	"compress/gzip"
@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 )
 
 func (message *splunkMessage) EventAsString() (string, error) {
@@ -19,8 +20,8 @@ func (message *splunkMessage) EventAsString() (string, error) {
 	return "", fmt.Errorf("Cannot cast Event %v to string", message.Event)
 }
 
-func (message *splunkMessage) EventAsMap() (map[string]interface{}, error) {
-	if val, ok := message.Event.(map[string]interface{}); ok {
+func (message *splunkMessage) EventAsMap() (map[string]any, error) {
+	if val, ok := message.Event.(map[string]any); ok {
 		return val, nil
 	}
 	return nil, fmt.Errorf("Cannot cast Event %v to map", message.Event)
@@ -76,7 +77,12 @@ func (hec *HTTPEventCollectorMock) URL() string {
 }
 
 func (hec *HTTPEventCollectorMock) Serve() error {
-	return http.Serve(hec.tcpListener, hec)
+	srv := &http.Server{
+		Handler: hec,
+
+		ReadHeaderTimeout: 5 * time.Minute, // "G112: Potential Slowloris Attack (gosec)"; not a real concern for our use, so setting a long timeout.
+	}
+	return srv.Serve(hec.tcpListener)
 }
 
 func (hec *HTTPEventCollectorMock) Close() error {

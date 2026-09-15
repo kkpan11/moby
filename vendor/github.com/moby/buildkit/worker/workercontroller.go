@@ -1,8 +1,9 @@
 package worker
 
 import (
-	"github.com/containerd/containerd/filters"
-	"github.com/hashicorp/go-multierror"
+	stderrors "errors"
+
+	"github.com/containerd/containerd/v2/pkg/filters"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/client"
 	"github.com/pkg/errors"
@@ -16,13 +17,13 @@ type Controller struct {
 }
 
 func (c *Controller) Close() error {
-	var rerr error
+	var errs []error
 	for _, w := range c.workers {
 		if err := w.Close(); err != nil {
-			rerr = multierror.Append(rerr, err)
+			errs = append(errs, err)
 		}
 	}
-	return rerr
+	return stderrors.Join(errs...)
 }
 
 // Add adds a local worker.
@@ -52,7 +53,7 @@ func (c *Controller) List(filterStrings ...string) ([]Worker, error) {
 // GetDefault returns the default local worker
 func (c *Controller) GetDefault() (Worker, error) {
 	if len(c.workers) == 0 {
-		return nil, errors.Errorf("no default worker")
+		return nil, errors.New("no default worker")
 	}
 	return c.workers[0], nil
 }

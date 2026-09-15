@@ -1,11 +1,10 @@
 //go:build linux
 
-package fuseoverlayfs // import "github.com/docker/docker/daemon/graphdriver/fuse-overlayfs"
+package fuseoverlayfs
 
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -14,18 +13,18 @@ import (
 	"strings"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/daemon/graphdriver"
-	"github.com/docker/docker/daemon/graphdriver/overlayutils"
-	"github.com/docker/docker/daemon/internal/fstype"
-	"github.com/docker/docker/daemon/internal/mountref"
-	"github.com/docker/docker/internal/containerfs"
-	"github.com/docker/docker/internal/directory"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/chrootarchive"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/parsers/kernel"
+	"github.com/moby/go-archive"
+	"github.com/moby/go-archive/chrootarchive"
 	"github.com/moby/locker"
+	"github.com/moby/moby/v2/daemon/graphdriver"
+	"github.com/moby/moby/v2/daemon/graphdriver/overlayutils"
+	"github.com/moby/moby/v2/daemon/internal/containerfs"
+	"github.com/moby/moby/v2/daemon/internal/directory"
+	"github.com/moby/moby/v2/daemon/internal/fstype"
+	"github.com/moby/moby/v2/daemon/internal/mountref"
+	"github.com/moby/moby/v2/pkg/parsers/kernel"
 	"github.com/moby/sys/mount"
+	"github.com/moby/sys/user"
 	"github.com/moby/sys/userns"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
@@ -59,7 +58,7 @@ const (
 // mounts that are created using this driver.
 type Driver struct {
 	home      string
-	idMap     idtools.IdentityMapping
+	idMap     user.IdentityMapping
 	ctr       *mountref.Counter
 	naiveDiff graphdriver.DiffDriver
 	locker    *locker.Locker
@@ -74,7 +73,7 @@ func init() {
 // Init returns the naive diff driver for fuse-overlayfs.
 // If fuse-overlayfs is not supported on the host, the error
 // graphdriver.ErrNotSupported is returned.
-func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdriver.Driver, error) {
+func Init(home string, options []string, idMap user.IdentityMapping) (graphdriver.Driver, error) {
 	if _, err := exec.LookPath(binary); err != nil {
 		logger.Error(err)
 		return nil, graphdriver.ErrNotSupported
@@ -83,16 +82,12 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		return nil, graphdriver.ErrNotSupported
 	}
 
-	currentID := idtools.CurrentIdentity()
-	dirID := idtools.Identity{
-		UID: currentID.UID,
-		GID: idMap.RootPair().GID,
-	}
-
-	if err := idtools.MkdirAllAndChown(home, 0o710, dirID); err != nil {
+	cuid := os.Getuid()
+	_, gid := idMap.RootPair()
+	if err := user.MkdirAndChown(home, 0o710, cuid, gid); err != nil {
 		return nil, err
 	}
-	if err := idtools.MkdirAllAndChown(path.Join(home, linkDir), 0o700, currentID); err != nil {
+	if err := user.MkdirAndChown(path.Join(home, linkDir), 0o700, cuid, os.Getegid()); err != nil {
 		return nil, err
 	}
 
@@ -159,7 +154,7 @@ func (d *Driver) Cleanup() error {
 // file system.
 func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
 	if opts != nil && len(opts.StorageOpt) != 0 {
-		return fmt.Errorf("--storage-opt is not supported")
+		return errors.New("--storage-opt is not supported")
 	}
 	return d.create(id, parent, opts)
 }
@@ -168,19 +163,16 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 // The parent filesystem is used to configure these directories for the overlay.
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
 	if opts != nil && len(opts.StorageOpt) != 0 {
-		return fmt.Errorf("--storage-opt is not supported")
+		return errors.New("--storage-opt is not supported")
 	}
 	return d.create(id, parent, opts)
 }
 
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
 	dir := d.dir(id)
-	root := d.idMap.RootPair()
+	uid, gid := d.idMap.RootPair()
 
-	if err := idtools.MkdirAllAndChown(path.Dir(dir), 0o710, root); err != nil {
-		return err
-	}
-	if err := idtools.MkdirAndChown(dir, 0o710, root); err != nil {
+	if err := user.MkdirAndChown(dir, 0o710, uid, gid); err != nil {
 		return err
 	}
 
@@ -192,10 +184,10 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 	}()
 
 	if opts != nil && len(opts.StorageOpt) > 0 {
-		return fmt.Errorf("--storage-opt is not supported")
+		return errors.New("--storage-opt is not supported")
 	}
 
-	if err := idtools.MkdirAndChown(path.Join(dir, diffDirName), 0o755, root); err != nil {
+	if err := user.MkdirAndChown(path.Join(dir, diffDirName), 0o755, uid, gid); err != nil {
 		return err
 	}
 
@@ -214,7 +206,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return nil
 	}
 
-	if err := idtools.MkdirAndChown(path.Join(dir, workDirName), 0o710, root); err != nil {
+	if err := user.MkdirAndChown(path.Join(dir, workDirName), 0o710, uid, gid); err != nil {
 		return err
 	}
 
@@ -227,7 +219,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return err
 	}
 	if lower != "" {
-		if err := os.WriteFile(path.Join(dir, lowerFile), []byte(lower), 0o666); err != nil {
+		if err := os.WriteFile(path.Join(dir, lowerFile), []byte(lower), 0o644); err != nil {
 			return err
 		}
 	}
@@ -269,7 +261,7 @@ func (d *Driver) getLowerDirs(id string) ([]string, error) {
 	var lowersArray []string
 	lowers, err := os.ReadFile(path.Join(d.dir(id), lowerFile))
 	if err == nil {
-		for _, s := range strings.Split(string(lowers), ":") {
+		for s := range strings.SplitSeq(string(lowers), ":") {
 			lp, err := os.Readlink(path.Join(d.home, s))
 			if err != nil {
 				return nil, err
@@ -285,7 +277,7 @@ func (d *Driver) getLowerDirs(id string) ([]string, error) {
 // Remove cleans the directories that are created for this id.
 func (d *Driver) Remove(id string) error {
 	if id == "" {
-		return fmt.Errorf("refusing to remove the directories: id is empty")
+		return errors.New("refusing to remove the directories: id is empty")
 	}
 	d.locker.Lock(id)
 	defer d.locker.Unlock(id)
@@ -367,7 +359,8 @@ func (d *Driver) Get(id, mountLabel string) (_ string, retErr error) {
 	mountData := label.FormatMountLabel(opts, mountLabel)
 	mountTarget := mergedDir
 
-	if err := idtools.MkdirAndChown(mergedDir, 0o700, d.idMap.RootPair()); err != nil {
+	uid, gid := d.idMap.RootPair()
+	if err := user.MkdirAndChown(mergedDir, 0o700, uid, gid); err != nil {
 		return "", err
 	}
 
@@ -453,7 +446,7 @@ func (d *Driver) isParent(id, parent string) bool {
 }
 
 // ApplyDiff applies the new layer into a root
-func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64, err error) {
+func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64, _ error) {
 	if !d.isParent(id, parent) {
 		return d.naiveDiff.ApplyDiff(id, parent, diff)
 	}
@@ -483,7 +476,7 @@ func (d *Driver) getDiffPath(id string) string {
 // DiffSize calculates the changes between the specified id
 // and its parent and returns the size in bytes of the changes
 // relative to its base filesystem directory.
-func (d *Driver) DiffSize(id, parent string) (size int64, err error) {
+func (d *Driver) DiffSize(id, parent string) (int64, error) {
 	return d.naiveDiff.DiffSize(id, parent)
 }
 
@@ -504,25 +497,22 @@ func fusermountU(mountpoint string) (unmounted bool) {
 	// Attempt to unmount the FUSE mount using either fusermount or fusermount3.
 	// If they fail, fallback to unix.Unmount
 	for _, v := range []string{"fusermount3", "fusermount"} {
-		err := exec.Command(v, "-u", mountpoint).Run()
-		if err != nil && !os.IsNotExist(err) {
-			log.G(context.TODO()).Debugf("Error unmounting %s with %s - %v", mountpoint, v, err)
+		if err := exec.Command(v, "-u", mountpoint).Run(); err != nil {
+			if !os.IsNotExist(err) {
+				log.G(context.TODO()).WithError(err).Debugf("Error unmounting %s with %s", mountpoint, v)
+			}
+			continue
 		}
-		if err == nil {
-			unmounted = true
-			break
-		}
+		return true
 	}
 	// If fusermount|fusermount3 failed to unmount the FUSE file system, make sure all
 	// pending changes are propagated to the file system
-	if !unmounted {
-		fd, err := unix.Open(mountpoint, unix.O_DIRECTORY, 0)
-		if err == nil {
-			if err := unix.Syncfs(fd); err != nil {
-				log.G(context.TODO()).Debugf("Error Syncfs(%s) - %v", mountpoint, err)
-			}
-			unix.Close(fd)
+	fd, err := unix.Open(mountpoint, unix.O_DIRECTORY, 0)
+	if err == nil {
+		if err := unix.Syncfs(fd); err != nil {
+			log.G(context.TODO()).WithError(err).Debugf("Error Syncfs(%s)", mountpoint)
 		}
+		_ = unix.Close(fd)
 	}
-	return
+	return false
 }

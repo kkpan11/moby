@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"slices"
 	"strings"
 
 	"github.com/containerd/platforms"
@@ -59,8 +60,8 @@ func NewState(o Output) State {
 type State struct {
 	out   Output
 	prev  *State
-	key   interface{}
-	value func(context.Context, *Constraints) (interface{}, error)
+	key   any
+	value func(context.Context, *Constraints) (any, error)
 	opts  []ConstraintsOpt
 	async *asyncState
 }
@@ -76,13 +77,13 @@ func (s State) ensurePlatform() State {
 	return s
 }
 
-func (s State) WithValue(k, v interface{}) State {
-	return s.withValue(k, func(context.Context, *Constraints) (interface{}, error) {
+func (s State) WithValue(k, v any) State {
+	return s.withValue(k, func(context.Context, *Constraints) (any, error) {
 		return v, nil
 	})
 }
 
-func (s State) withValue(k interface{}, v func(context.Context, *Constraints) (interface{}, error)) State {
+func (s State) withValue(k any, v func(context.Context, *Constraints) (any, error)) State {
 	return State{
 		out:   s.Output(),
 		prev:  &s, // doesn't need to be original pointer
@@ -91,7 +92,7 @@ func (s State) withValue(k interface{}, v func(context.Context, *Constraints) (i
 	}
 }
 
-func (s State) Value(ctx context.Context, k interface{}, co ...ConstraintsOpt) (interface{}, error) {
+func (s State) Value(ctx context.Context, k any, co ...ConstraintsOpt) (any, error) {
 	c := &Constraints{}
 	for _, f := range co {
 		f.SetConstraintsOption(c)
@@ -99,12 +100,12 @@ func (s State) Value(ctx context.Context, k interface{}, co ...ConstraintsOpt) (
 	return s.getValue(k)(ctx, c)
 }
 
-func (s State) getValue(k interface{}) func(context.Context, *Constraints) (interface{}, error) {
+func (s State) getValue(k any) func(context.Context, *Constraints) (any, error) {
 	if s.key == k {
 		return s.value
 	}
 	if s.async != nil {
-		return func(ctx context.Context, c *Constraints) (interface{}, error) {
+		return func(ctx context.Context, c *Constraints) (any, error) {
 			target, err := s.async.Do(ctx, c)
 			if err != nil {
 				return nil, err
@@ -139,7 +140,7 @@ func (s State) SetMarshalDefaults(co ...ConstraintsOpt) State {
 func (s State) Marshal(ctx context.Context, co ...ConstraintsOpt) (*Definition, error) {
 	c := NewConstraints(append(s.opts, co...)...)
 	def := &Definition{
-		Metadata:    make(map[digest.Digest]pb.OpMetadata, 0),
+		Metadata:    make(map[digest.Digest]OpMetadata, 0),
 		Constraints: c,
 	}
 
@@ -157,7 +158,7 @@ func (s State) Marshal(ctx context.Context, co ...ConstraintsOpt) (*Definition, 
 		return def, err
 	}
 	proto := &pb.Op{Inputs: []*pb.Input{inp}}
-	dt, err := proto.Marshal()
+	dt, err := proto.MarshalVT()
 	if err != nil {
 		return def, err
 	}
@@ -210,7 +211,7 @@ func marshal(ctx context.Context, v Vertex, def *Definition, s *sourceMapCollect
 	}
 	vertexCache[v] = struct{}{}
 	if opMeta != nil {
-		def.Metadata[dgst] = mergeMetadata(def.Metadata[dgst], *opMeta)
+		def.Metadata[dgst] = mergeMetadata(def.Metadata[dgst], NewOpMetadata(opMeta))
 	}
 	s.Add(dgst, sls)
 	if _, ok := cache[dgst]; ok {
@@ -271,7 +272,7 @@ func (s State) WithImageConfig(c []byte) (State, error) {
 			OSVersion:    img.OSVersion,
 		}
 		if img.OSFeatures != nil {
-			plat.OSFeatures = append([]string{}, img.OSFeatures...)
+			plat.OSFeatures = slices.Clone(img.OSFeatures)
 		}
 		s = s.Platform(plat)
 	}
@@ -295,6 +296,7 @@ func (s State) Run(ro ...RunOption) ExecState {
 	}
 	exec.secrets = ei.Secrets
 	exec.ssh = ei.SSH
+	exec.cdiDevices = ei.CDIDevices
 
 	return ExecState{
 		State: s.WithOutput(exec.Output()),
@@ -320,7 +322,7 @@ func (s State) AddEnv(key, value string) State {
 }
 
 // AddEnvf is the same as [State.AddEnv] but with a format string.
-func (s State) AddEnvf(key, value string, v ...interface{}) State {
+func (s State) AddEnvf(key, value string, v ...any) State {
 	return AddEnvf(key, value, v...)(s)
 }
 
@@ -331,7 +333,7 @@ func (s State) Dir(str string) State {
 }
 
 // Dirf is the same as [State.Dir] but with a format string.
-func (s State) Dirf(str string, v ...interface{}) State {
+func (s State) Dirf(str string, v ...any) State {
 	return Dirf(str, v...)(s)
 }
 
@@ -349,8 +351,7 @@ func (s State) GetEnv(ctx context.Context, key string, co ...ConstraintsOpt) (st
 	return v, ok, nil
 }
 
-// Env returns a new [State] with the provided environment variable set.
-// See [Env]
+// Env returns the current environment variables for the state.
 func (s State) Env(ctx context.Context, co ...ConstraintsOpt) (*EnvList, error) {
 	c := &Constraints{}
 	for _, f := range co {
@@ -382,6 +383,18 @@ func (s State) GetArgs(ctx context.Context, co ...ConstraintsOpt) ([]string, err
 // provided state.  See [Reset] for more details.
 func (s State) Reset(s2 State) State {
 	return Reset(s2)(s)
+}
+
+func (s State) Requires(id string, deps ...State) State {
+	if len(deps) == 0 {
+		return s
+	}
+	inputs := make([]PassthroughInput, 0, len(deps)+1)
+	inputs = append(inputs, PassthroughInput{State: s, Output: true})
+	for _, dep := range deps {
+		inputs = append(inputs, PassthroughInput{State: dep})
+	}
+	return s.WithOutput(NewPassthroughOp(id, inputs).Output())
 }
 
 // User sets the user for this state.
@@ -509,7 +522,7 @@ func (o *output) ToInput(ctx context.Context, c *Constraints) (*pb.Input, error)
 	if err != nil {
 		return nil, err
 	}
-	return &pb.Input{Digest: dgst, Index: index}, nil
+	return &pb.Input{Digest: string(dgst), Index: int64(index)}, nil
 }
 
 func (o *output) Vertex(context.Context, *Constraints) Vertex {
@@ -525,6 +538,7 @@ type ConstraintsOpt interface {
 	RunOption
 	LocalOption
 	HTTPOption
+	ImageBlobOption
 	ImageOption
 	GitOption
 	OCILayoutOption
@@ -552,6 +566,10 @@ func (fn constraintsOptFunc) SetHTTPOption(hi *HTTPInfo) {
 	hi.applyConstraints(fn)
 }
 
+func (fn constraintsOptFunc) SetImageBlobOption(ii *ImageBlobInfo) {
+	ii.applyConstraints(fn)
+}
+
 func (fn constraintsOptFunc) SetImageOption(ii *ImageInfo) {
 	ii.applyConstraints(fn)
 }
@@ -560,7 +578,7 @@ func (fn constraintsOptFunc) SetGitOption(gi *GitInfo) {
 	gi.applyConstraints(fn)
 }
 
-func mergeMetadata(m1, m2 pb.OpMetadata) pb.OpMetadata {
+func mergeMetadata(m1, m2 OpMetadata) OpMetadata {
 	if m2.IgnoreCache {
 		m1.IgnoreCache = true
 	}
@@ -585,6 +603,10 @@ func mergeMetadata(m1, m2 pb.OpMetadata) pb.OpMetadata {
 		m1.ProgressGroup = m2.ProgressGroup
 	}
 
+	if m2.LinuxResources != nil {
+		m1.LinuxResources = m2.LinuxResources
+	}
+
 	return m1
 }
 
@@ -607,7 +629,7 @@ func WithCustomName(name string) ConstraintsOpt {
 	})
 }
 
-func WithCustomNamef(name string, a ...interface{}) ConstraintsOpt {
+func WithCustomNamef(name string, a ...any) ConstraintsOpt {
 	return WithCustomName(fmt.Sprintf(name, a...))
 }
 
@@ -654,10 +676,61 @@ func (cw *constraintsWrapper) applyConstraints(f func(c *Constraints)) {
 type Constraints struct {
 	Platform          *ocispecs.Platform
 	WorkerConstraints []string
-	Metadata          pb.OpMetadata
+	Metadata          OpMetadata
 	LocalUniqueID     string
 	Caps              *apicaps.CapSet
 	SourceLocations   []*SourceLocation
+}
+
+// OpMetadata has a more friendly interface for pb.OpMetadata.
+type OpMetadata struct {
+	IgnoreCache    bool                   `json:"ignore_cache,omitempty"`
+	Description    map[string]string      `json:"description,omitempty"`
+	ExportCache    *pb.ExportCache        `json:"export_cache,omitempty"`
+	Caps           map[apicaps.CapID]bool `json:"caps,omitempty"`
+	ProgressGroup  *pb.ProgressGroup      `json:"progress_group,omitempty"`
+	LinuxResources *pb.LinuxResources     `json:"linux_resources,omitempty"`
+}
+
+func NewOpMetadata(mpb *pb.OpMetadata) OpMetadata {
+	var m OpMetadata
+	m.FromPB(mpb)
+	return m
+}
+
+func (m OpMetadata) ToPB() *pb.OpMetadata {
+	caps := make(map[string]bool, len(m.Caps))
+	for k, v := range m.Caps {
+		caps[string(k)] = v
+	}
+	return &pb.OpMetadata{
+		IgnoreCache:    m.IgnoreCache,
+		Description:    m.Description,
+		ExportCache:    m.ExportCache,
+		Caps:           caps,
+		ProgressGroup:  m.ProgressGroup,
+		LinuxResources: m.LinuxResources,
+	}
+}
+
+func (m *OpMetadata) FromPB(mpb *pb.OpMetadata) {
+	if mpb == nil {
+		return
+	}
+
+	m.IgnoreCache = mpb.IgnoreCache
+	m.Description = mpb.Description
+	m.ExportCache = mpb.ExportCache
+	if len(mpb.Caps) > 0 {
+		m.Caps = make(map[apicaps.CapID]bool, len(mpb.Caps))
+		for k, v := range mpb.Caps {
+			m.Caps[apicaps.CapID(k)] = v
+		}
+	} else {
+		m.Caps = nil
+	}
+	m.ProgressGroup = mpb.ProgressGroup
+	m.LinuxResources = mpb.LinuxResources
 }
 
 func Platform(p ocispecs.Platform) ConstraintsOpt {
@@ -678,6 +751,71 @@ func ProgressGroup(id, name string, weak bool) ConstraintsOpt {
 	})
 }
 
+// WithLinuxResources sets all CPU/memory resource limits at once.
+// Resource limits are applied via OpMetadata and do not affect the cache key.
+func WithLinuxResources(res LinuxResources) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		c.Metadata.LinuxResources = &pb.LinuxResources{
+			Memory:     res.Memory,
+			MemorySwap: res.MemorySwap,
+			CpuShares:  res.CPUShares,
+			CpuPeriod:  res.CPUPeriod,
+			CpuQuota:   res.CPUQuota,
+			CpusetCpus: res.CpusetCpus,
+			CpusetMems: res.CpusetMems,
+		}
+	})
+}
+
+func ensureLinuxResources(c *Constraints) *pb.LinuxResources {
+	if c.Metadata.LinuxResources == nil {
+		c.Metadata.LinuxResources = &pb.LinuxResources{}
+	}
+	return c.Metadata.LinuxResources
+}
+
+func MemoryLimit(limit int64) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		ensureLinuxResources(c).Memory = limit
+	})
+}
+
+func MemorySwapLimit(limit int64) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		ensureLinuxResources(c).MemorySwap = limit
+	})
+}
+
+func CPUShares(shares uint64) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		ensureLinuxResources(c).CpuShares = shares
+	})
+}
+
+func CPUPeriod(period uint64) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		ensureLinuxResources(c).CpuPeriod = period
+	})
+}
+
+func CPUQuota(quota int64) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		ensureLinuxResources(c).CpuQuota = quota
+	})
+}
+
+func CpusetCpus(cpus string) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		ensureLinuxResources(c).CpusetCpus = cpus
+	})
+}
+
+func CpusetMems(mems string) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		ensureLinuxResources(c).CpusetMems = mems
+	})
+}
+
 var (
 	LinuxAmd64   = Platform(ocispecs.Platform{OS: "linux", Architecture: "amd64"})
 	LinuxArmhf   = Platform(ocispecs.Platform{OS: "linux", Architecture: "arm", Variant: "v7"})
@@ -687,6 +825,7 @@ var (
 	LinuxS390x   = Platform(ocispecs.Platform{OS: "linux", Architecture: "s390x"})
 	LinuxPpc64   = Platform(ocispecs.Platform{OS: "linux", Architecture: "ppc64"})
 	LinuxPpc64le = Platform(ocispecs.Platform{OS: "linux", Architecture: "ppc64le"})
+	LinuxRiscv64 = Platform(ocispecs.Platform{OS: "linux", Architecture: "riscv64"})
 	Darwin       = Platform(ocispecs.Platform{OS: "darwin", Architecture: "amd64"})
 	Windows      = Platform(ocispecs.Platform{OS: "windows", Architecture: "amd64"})
 )
@@ -697,6 +836,6 @@ func Require(filters ...string) ConstraintsOpt {
 	})
 }
 
-func nilValue(context.Context, *Constraints) (interface{}, error) {
+func nilValue(context.Context, *Constraints) (any, error) {
 	return nil, nil
 }

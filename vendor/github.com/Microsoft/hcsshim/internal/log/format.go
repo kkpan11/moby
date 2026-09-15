@@ -61,7 +61,7 @@ func formatAddr(a net.Addr) string {
 // HTML escapes.
 // Context is used to output a log waring if the conversion fails.
 //
-// This is intended primarily for `trace.StringAttribute()`
+// This is intended primarily for `attribute.String()`
 func Format(ctx context.Context, v interface{}) string {
 	b, err := encode(v)
 	if err != nil {
@@ -103,9 +103,7 @@ func encode(v interface{}) (_ []byte, err error) {
 
 	if jErr := enc.Encode(v); jErr != nil {
 		if err != nil {
-			// TODO (go1.20): use multierror via fmt.Errorf("...: %w; ...: %w", ...)
-			//nolint:errorlint // non-wrapping format verb for fmt.Errorf
-			return nil, fmt.Errorf("protojson encoding: %v; json encoding: %w", err, jErr)
+			return nil, fmt.Errorf("protojson encoding: %w; json encoding: %w", err, jErr)
 		}
 		return nil, fmt.Errorf("json encoding: %w", jErr)
 	}

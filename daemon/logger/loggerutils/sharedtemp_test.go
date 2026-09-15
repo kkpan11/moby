@@ -1,4 +1,4 @@
-package loggerutils // import "github.com/docker/docker/daemon/logger/loggerutils"
+package loggerutils
 
 import (
 	"io"
@@ -29,7 +29,7 @@ func TestSharedTempFileConverter(t *testing.T) {
 		uut := newSharedTempFileConverter(copyTransform(strings.ToUpper))
 		uut.TempDir = dir
 
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			t.Logf("Iteration %v", i)
 
 			rdr := convertPath(t, uut, name)
@@ -113,8 +113,7 @@ func TestSharedTempFileConverter(t *testing.T) {
 		closers := make(chan io.Closer, 4)
 		var wg sync.WaitGroup
 		wg.Add(3)
-		for i := 0; i < 3; i++ {
-			i := i
+		for i := range 3 {
 			go func() {
 				defer wg.Done()
 				t.Logf("goroutine %v: enter", i)
@@ -175,15 +174,14 @@ func TestSharedTempFileConverter(t *testing.T) {
 
 		var done sync.WaitGroup
 		done.Add(3)
-		for i := 0; i < 3; i++ {
-			i := i
+		for i := range 3 {
 			go func() {
 				defer done.Done()
 				t.Logf("goroutine %v: enter", i)
 				defer t.Logf("goroutine %v: exit", i)
 				start.Done()
 				_, err := uut.Do(src)
-				assert.Check(t, errors.Is(err, fakeErr), "in goroutine %v", i)
+				assert.Check(t, is.ErrorIs(err, fakeErr), "in goroutine %v", i)
 			}()
 		}
 		done.Wait()
@@ -192,7 +190,7 @@ func TestSharedTempFileConverter(t *testing.T) {
 		// request should retry from scratch.
 		fakeErr = errors.New("another fake error")
 		_, err = uut.Do(src)
-		assert.Check(t, errors.Is(err, fakeErr))
+		assert.Check(t, is.ErrorIs(err, fakeErr))
 
 		fakeErr = nil
 		f, err := uut.Do(src)

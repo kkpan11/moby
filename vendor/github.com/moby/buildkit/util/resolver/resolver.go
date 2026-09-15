@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/pkg/errors"
 
 	"github.com/moby/buildkit/util/resolver/config"
@@ -81,9 +81,10 @@ func loadTLSConfig(c config.RegistryConfig) (*tls.Config, error) {
 				c.RootCAs = append(c.RootCAs, filepath.Join(d, f.Name()))
 			}
 			if strings.HasSuffix(f.Name(), ".cert") {
+				base, _ := strings.CutSuffix(f.Name(), ".cert")
 				c.KeyPairs = append(c.KeyPairs, config.TLSKeyPair{
 					Certificate: filepath.Join(d, f.Name()),
-					Key:         filepath.Join(d, strings.TrimSuffix(f.Name(), ".cert")+".key"),
+					Key:         filepath.Join(d, base+".key"),
 				})
 			}
 		}
@@ -172,12 +173,11 @@ func NewRegistryConfig(m map[string]config.RegistryConfig) docker.RegistryHosts 
 
 func newMirrorRegistryHost(mirror string) docker.RegistryHost {
 	mirrorHost, mirrorPath := extractMirrorHostAndPath(mirror)
-	path := path.Join(defaultPath, mirrorPath)
 	h := docker.RegistryHost{
 		Scheme:       "https",
 		Client:       newDefaultClient(),
 		Host:         mirrorHost,
-		Path:         path,
+		Path:         path.Join(defaultPath, mirrorPath),
 		Capabilities: docker.HostCapabilityPull | docker.HostCapabilityResolve,
 	}
 

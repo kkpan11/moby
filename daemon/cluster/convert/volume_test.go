@@ -3,10 +3,11 @@ package convert
 import (
 	"testing"
 
-	volumetypes "github.com/docker/docker/api/types/volume"
+	volumetypes "github.com/moby/moby/api/types/volume"
 	swarmapi "github.com/moby/swarmkit/v2/api"
 
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestTopologyFromGRPC(t *testing.T) {
@@ -23,7 +24,7 @@ func TestTopologyFromGRPC(t *testing.T) {
 
 func TestCapacityRangeFromGRPC(t *testing.T) {
 	nilCapacity := capacityRangeFromGRPC(nil)
-	assert.Assert(t, nilCapacity == nil)
+	assert.Assert(t, is.Nil(nilCapacity))
 
 	swarmZeroCapacity := &swarmapi.CapacityRange{}
 	zeroCapacity := capacityRangeFromGRPC(swarmZeroCapacity)
@@ -61,7 +62,6 @@ func TestVolumeAvailabilityFromGRPC(t *testing.T) {
 			expected: volumetypes.AvailabilityDrain,
 		},
 	} {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			actual := volumeAvailabilityFromGRPC(tc.in)
 			assert.Equal(t, actual, tc.expected)
@@ -113,7 +113,6 @@ func TestAccessModeFromGRPC(t *testing.T) {
 			},
 		},
 	} {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			out := accessModeFromGRPC(tc.in)
 			assert.DeepEqual(t, tc.expected, out)
@@ -124,7 +123,7 @@ func TestAccessModeFromGRPC(t *testing.T) {
 // TestVolumeCreateToGRPC tests that a docker-typed VolumeCreateBody is
 // correctly converted to a swarm-typed VolumeSpec.
 func TestVolumeCreateToGRPC(t *testing.T) {
-	volume := &volumetypes.CreateOptions{
+	volume := &volumetypes.CreateRequest{
 		Driver:     "plug1",
 		DriverOpts: map[string]string{"options": "yeah"},
 		Labels:     map[string]string{"labeled": "yeah"},

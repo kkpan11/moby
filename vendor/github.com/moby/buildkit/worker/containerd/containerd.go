@@ -2,22 +2,21 @@ package containerd
 
 import (
 	"context"
+	"maps"
 	"os"
 	"path/filepath"
-	goRuntime "runtime"
 	"strconv"
 	"strings"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/gc"
-	"github.com/containerd/containerd/leases"
-	ptypes "github.com/containerd/containerd/protobuf/types"
+	ctd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/pkg/gc"
 	"github.com/containerd/platforms"
-	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/executor/containerdexecutor"
 	"github.com/moby/buildkit/executor/oci"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/util/winlayers"
@@ -45,34 +44,20 @@ type WorkerOptions struct {
 	ParallelismSem  *semaphore.Weighted
 	TraceSocket     string
 	Runtime         *RuntimeInfo
+	CDIManager      *cdidevices.Manager
 }
 
 // NewWorkerOpt creates a WorkerOpt.
-func NewWorkerOpt(
-	workerOpts WorkerOptions,
-	opts ...containerd.ClientOpt,
-) (base.WorkerOpt, error) {
-	opts = append(opts, containerd.WithDefaultNamespace(workerOpts.Namespace))
-
-	address := workerOpts.Address
-
-	if goRuntime.GOOS == "windows" {
-		// TODO(profnandaa): once the upstream PR[1] is merged and
-		// vendored in buildkit, we will remove this block.
-		// [1] https://github.com/containerd/containerd/pull/9412
-		address = strings.TrimPrefix(address, "npipe://")
-	}
-	client, err := containerd.New(address, opts...)
+func NewWorkerOpt(workerOpts WorkerOptions, opts ...ctd.Opt) (base.WorkerOpt, error) {
+	opts = append(opts, ctd.WithDefaultNamespace(workerOpts.Namespace))
+	client, err := ctd.New(workerOpts.Address, opts...)
 	if err != nil {
-		return base.WorkerOpt{}, errors.Wrapf(err, "failed to connect client to %q . make sure containerd is running", address)
+		return base.WorkerOpt{}, errors.Wrapf(err, "failed to connect client to %q . make sure containerd is running", workerOpts.Address)
 	}
-	return newContainerd(
-		client,
-		workerOpts,
-	)
+	return newContainerd(client, workerOpts)
 }
 
-func newContainerd(client *containerd.Client, workerOpts WorkerOptions) (base.WorkerOpt, error) {
+func newContainerd(client *ctd.Client, workerOpts WorkerOptions) (base.WorkerOpt, error) {
 	if strings.Contains(workerOpts.SnapshotterName, "/") {
 		return base.WorkerOpt{}, errors.Errorf("bad snapshotter name: %q", workerOpts.SnapshotterName)
 	}
@@ -89,12 +74,12 @@ func newContainerd(client *containerd.Client, workerOpts WorkerOptions) (base.Wo
 		return base.WorkerOpt{}, err
 	}
 
-	serverInfo, err := client.IntrospectionService().Server(context.TODO(), &ptypes.Empty{})
+	serverInfo, err := client.IntrospectionService().Server(context.TODO())
 	if err != nil {
 		return base.WorkerOpt{}, err
 	}
 
-	np, npResolvedMode, err := netproviders.Providers(workerOpts.NetworkOpt)
+	np, proxyProvider, npResolvedMode, err := netproviders.Providers(workerOpts.NetworkOpt)
 	if err != nil {
 		return base.WorkerOpt{}, err
 	}
@@ -115,9 +100,7 @@ func newContainerd(client *containerd.Client, workerOpts WorkerOptions) (base.Wo
 	}
 	xlabels[wlabel.ContainerdNamespace] = workerOpts.Namespace
 	xlabels[wlabel.ContainerdUUID] = serverInfo.UUID
-	for k, v := range workerOpts.Labels {
-		xlabels[k] = v
-	}
+	maps.Copy(xlabels, workerOpts.Labels)
 
 	lm := leaseutil.WithNamespace(client.LeasesService(), workerOpts.Namespace)
 
@@ -131,7 +114,7 @@ func newContainerd(client *containerd.Client, workerOpts WorkerOptions) (base.Wo
 
 	cs := containerdsnapshot.NewContentStore(client.ContentStore(), workerOpts.Namespace)
 
-	resp, err := client.IntrospectionService().Plugins(context.TODO(), []string{"type==io.containerd.runtime.v1", "type==io.containerd.runtime.v2"})
+	resp, err := client.IntrospectionService().Plugins(context.TODO(), "type==io.containerd.runtime.v1", "type==io.containerd.runtime.v2")
 	if err != nil {
 		return base.WorkerOpt{}, errors.Wrap(err, "failed to list runtime plugin")
 	}
@@ -151,19 +134,6 @@ func newContainerd(client *containerd.Client, workerOpts WorkerOptions) (base.Wo
 		}
 	}
 
-	snap := containerdsnapshot.NewSnapshotter(workerOpts.SnapshotterName, client.SnapshotService(workerOpts.SnapshotterName), workerOpts.Namespace, nil)
-
-	if err := cache.MigrateV2(
-		context.TODO(),
-		filepath.Join(root, "metadata.db"),
-		filepath.Join(root, "metadata_v2.db"),
-		cs,
-		snap,
-		lm,
-	); err != nil {
-		return base.WorkerOpt{}, err
-	}
-
 	md, err := metadata.NewStore(filepath.Join(root, "metadata_v2.db"))
 	if err != nil {
 		return base.WorkerOpt{}, err
@@ -179,16 +149,20 @@ func newContainerd(client *containerd.Client, workerOpts WorkerOptions) (base.Wo
 		TraceSocket:      workerOpts.TraceSocket,
 		Rootless:         workerOpts.Rootless,
 		Runtime:          workerOpts.Runtime,
+		CDIManager:       workerOpts.CDIManager,
 		NetworkProviders: np,
+		ProxyProvider:    proxyProvider,
 	}
 
 	opt := base.WorkerOpt{
 		ID:               id,
+		Root:             root,
 		Labels:           xlabels,
 		MetadataStore:    md,
 		NetworkProviders: np,
+		ProxyProvider:    proxyProvider,
 		Executor:         containerdexecutor.New(executorOpts),
-		Snapshotter:      snap,
+		Snapshotter:      containerdsnapshot.NewSnapshotter(workerOpts.SnapshotterName, client.SnapshotService(workerOpts.SnapshotterName), workerOpts.Namespace, nil),
 		ContentStore:     cs,
 		Applier:          winlayers.NewFileSystemApplierWithWindows(cs, df),
 		Differ:           winlayers.NewWalkingDiffWithWindows(cs, df),
@@ -198,6 +172,7 @@ func newContainerd(client *containerd.Client, workerOpts WorkerOptions) (base.Wo
 		GarbageCollect:   gc,
 		ParallelismSem:   workerOpts.ParallelismSem,
 		MountPoolRoot:    filepath.Join(root, "cachemounts"),
+		CDIManager:       workerOpts.CDIManager,
 	}
 	return opt, nil
 }

@@ -1,6 +1,6 @@
 // Package splunk provides the log driver for forwarding server logs to
 // Splunk HTTP Event Collector endpoint.
-package splunk // import "github.com/docker/docker/daemon/logger/splunk"
+package splunk
 
 import (
 	"bytes"
@@ -20,14 +20,15 @@ import (
 	"time"
 
 	"github.com/containerd/log"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/loggerutils"
-	"github.com/docker/docker/pkg/pools"
 	"github.com/google/uuid"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/loggerutils"
+	"github.com/moby/moby/v2/pkg/pools"
 )
 
 const (
-	driverName                    = "splunk"
+	driverName = "splunk"
+
 	splunkURLKey                  = "splunk-url"
 	splunkTokenKey                = "splunk-token"
 	splunkSourceKey               = "splunk-source"
@@ -41,11 +42,6 @@ const (
 	splunkGzipCompressionKey      = "splunk-gzip"
 	splunkGzipCompressionLevelKey = "splunk-gzip-level"
 	splunkIndexAcknowledgment     = "splunk-index-acknowledgment"
-	envKey                        = "env"
-	envRegexKey                   = "env-regex"
-	labelsKey                     = "labels"
-	labelsRegexKey                = "labels-regex"
-	tagKey                        = "tag"
 )
 
 const (
@@ -119,16 +115,16 @@ type splunkLoggerRaw struct {
 }
 
 type splunkMessage struct {
-	Event      interface{} `json:"event"`
-	Time       string      `json:"time"`
-	Host       string      `json:"host"`
-	Source     string      `json:"source,omitempty"`
-	SourceType string      `json:"sourcetype,omitempty"`
-	Index      string      `json:"index,omitempty"`
+	Event      any    `json:"event"`
+	Time       string `json:"time"`
+	Host       string `json:"host"`
+	Source     string `json:"source,omitempty"`
+	SourceType string `json:"sourcetype,omitempty"`
+	Index      string `json:"index,omitempty"`
 }
 
 type splunkMessageEvent struct {
-	Line   interface{}       `json:"line"`
+	Line   any               `json:"line"`
 	Source string            `json:"source"`
 	Tag    string            `json:"tag,omitempty"`
 	Attrs  map[string]string `json:"attrs,omitempty"`
@@ -139,15 +135,6 @@ const (
 	splunkFormatJSON   = "json"
 	splunkFormatInline = "inline"
 )
-
-func init() {
-	if err := logger.RegisterLogDriver(driverName, New); err != nil {
-		panic(err)
-	}
-	if err := logger.RegisterLogOptValidator(driverName, ValidateLogOpt); err != nil {
-		panic(err)
-	}
-}
 
 // New creates splunk logger driver using configuration passed in context
 func New(info logger.Info) (logger.Logger, error) {
@@ -227,35 +214,16 @@ func New(info logger.Info) (logger.Logger, error) {
 		}
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig: tlsConfig,
-		Proxy:           http.ProxyFromEnvironment,
-	}
-	client := &http.Client{
-		Transport: transport,
-	}
-
-	source := info.Config[splunkSourceKey]
-	sourceType := info.Config[splunkSourceTypeKey]
-	index := info.Config[splunkIndexKey]
-
-	nullMessage := &splunkMessage{
-		Host:       hostname,
-		Source:     source,
-		SourceType: sourceType,
-		Index:      index,
-	}
-
 	// Allow user to remove tag from the messages by setting tag to empty string
-	tag := ""
-	if tagTemplate, ok := info.Config[tagKey]; !ok || tagTemplate != "" {
+	var tag string
+	if tagTemplate, ok := info.Config[logger.AttrLogTag]; !ok || tagTemplate != "" {
 		tag, err = loggerutils.ParseLogTag(info, loggerutils.DefaultTemplate)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	attrs, err := info.ExtraAttributes(nil)
+	extraAttrs, err := info.ExtraAttributes(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -267,12 +235,22 @@ func New(info logger.Info) (logger.Logger, error) {
 		streamChannelSize     = getAdvancedOptionInt(envVarStreamChannelSize, defaultStreamChannelSize)
 	)
 
-	logger := &splunkLogger{
-		client:                client,
-		transport:             transport,
-		url:                   splunkURL.String(),
-		auth:                  "Splunk " + splunkToken,
-		nullMessage:           nullMessage,
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+		Proxy:           http.ProxyFromEnvironment,
+	}
+
+	splLogger := &splunkLogger{
+		client:    &http.Client{Transport: transport},
+		transport: transport,
+		url:       splunkURL.String(),
+		auth:      "Splunk " + splunkToken,
+		nullMessage: &splunkMessage{
+			Host:       hostname,
+			Source:     info.Config[splunkSourceKey],
+			SourceType: info.Config[splunkSourceTypeKey],
+			Index:      info.Config[splunkIndexKey],
+		},
 		gzipCompression:       gzipCompression,
 		gzipCompressionLevel:  gzipCompressionLevel,
 		stream:                make(chan *splunkMessage, streamChannelSize),
@@ -292,24 +270,15 @@ func New(info logger.Info) (logger.Logger, error) {
 		}
 	}
 	if verifyConnection {
-		err = verifySplunkConnection(logger)
+		err = verifySplunkConnection(splLogger)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	var splunkFormat string
-	if splunkFormatParsed, ok := info.Config[splunkFormatKey]; ok {
-		switch splunkFormatParsed {
-		case splunkFormatInline:
-		case splunkFormatJSON:
-		case splunkFormatRaw:
-		default:
-			return nil, fmt.Errorf("Unknown format specified %s, supported formats are inline, json and raw", splunkFormat)
-		}
-		splunkFormat = splunkFormatParsed
-	} else {
-		splunkFormat = splunkFormatInline
+	splunkFormat := splunkFormatInline
+	if f, ok := info.Config[splunkFormatKey]; ok {
+		splunkFormat = f
 	}
 
 	var loggerWrapper splunkLoggerInterface
@@ -318,33 +287,33 @@ func New(info logger.Info) (logger.Logger, error) {
 	case splunkFormatInline:
 		nullEvent := &splunkMessageEvent{
 			Tag:   tag,
-			Attrs: attrs,
+			Attrs: extraAttrs,
 		}
 
-		loggerWrapper = &splunkLoggerInline{logger, nullEvent}
+		loggerWrapper = &splunkLoggerInline{splLogger, nullEvent}
 	case splunkFormatJSON:
 		nullEvent := &splunkMessageEvent{
 			Tag:   tag,
-			Attrs: attrs,
+			Attrs: extraAttrs,
 		}
 
-		loggerWrapper = &splunkLoggerJSON{&splunkLoggerInline{logger, nullEvent}}
+		loggerWrapper = &splunkLoggerJSON{&splunkLoggerInline{splLogger, nullEvent}}
 	case splunkFormatRaw:
 		var prefix bytes.Buffer
 		if tag != "" {
 			prefix.WriteString(tag)
 			prefix.WriteString(" ")
 		}
-		for key, value := range attrs {
+		for key, value := range extraAttrs {
 			prefix.WriteString(key)
 			prefix.WriteString("=")
 			prefix.WriteString(value)
 			prefix.WriteString(" ")
 		}
 
-		loggerWrapper = &splunkLoggerRaw{logger, prefix.Bytes()}
+		loggerWrapper = &splunkLoggerRaw{splLogger, prefix.Bytes()}
 	default:
-		return nil, fmt.Errorf("Unexpected format %s", splunkFormat)
+		return nil, fmt.Errorf("unknown format specified %s, supported formats are inline, json and raw", splunkFormat)
 	}
 
 	go loggerWrapper.worker()
@@ -352,7 +321,13 @@ func New(info logger.Info) (logger.Logger, error) {
 	return loggerWrapper, nil
 }
 
-func (l *splunkLoggerInline) Log(msg *logger.Message) error {
+func (l *splunkLoggerInline) Log(msg *logger.Message) (err error) {
+	defer func() {
+		if err == nil {
+			logger.PutMessage(msg)
+		}
+	}()
+
 	message := l.createSplunkMessage(msg)
 
 	event := *l.nullEvent
@@ -360,11 +335,16 @@ func (l *splunkLoggerInline) Log(msg *logger.Message) error {
 	event.Source = msg.Source
 
 	message.Event = &event
-	logger.PutMessage(msg)
 	return l.queueMessageAsync(message)
 }
 
-func (l *splunkLoggerJSON) Log(msg *logger.Message) error {
+func (l *splunkLoggerJSON) Log(msg *logger.Message) (err error) {
+	defer func() {
+		if err == nil {
+			logger.PutMessage(msg)
+		}
+	}()
+
 	message := l.createSplunkMessage(msg)
 	event := *l.nullEvent
 
@@ -378,11 +358,16 @@ func (l *splunkLoggerJSON) Log(msg *logger.Message) error {
 	event.Source = msg.Source
 
 	message.Event = &event
-	logger.PutMessage(msg)
 	return l.queueMessageAsync(message)
 }
 
-func (l *splunkLoggerRaw) Log(msg *logger.Message) error {
+func (l *splunkLoggerRaw) Log(msg *logger.Message) (err error) {
+	defer func() {
+		if err == nil {
+			logger.PutMessage(msg)
+		}
+	}()
+
 	// empty or whitespace-only messages are not accepted by HEC
 	if strings.TrimSpace(string(msg.Line)) == "" {
 		return nil
@@ -391,7 +376,6 @@ func (l *splunkLoggerRaw) Log(msg *logger.Message) error {
 	message := l.createSplunkMessage(msg)
 
 	message.Event = string(append(l.prefix, msg.Line...))
-	logger.PutMessage(msg)
 	return l.queueMessageAsync(message)
 }
 
@@ -414,10 +398,10 @@ func (l *splunkLogger) worker() {
 			if !open {
 				l.postMessages(messages, true)
 				l.lock.Lock()
-				defer l.lock.Unlock()
 				l.transport.CloseIdleConnections()
 				l.closed = true
 				l.closedCond.Signal()
+				l.lock.Unlock()
 				return
 			}
 			messages = append(messages, message)
@@ -434,16 +418,12 @@ func (l *splunkLogger) worker() {
 }
 
 func (l *splunkLogger) postMessages(messages []*splunkMessage, lastChance bool) []*splunkMessage {
-	messagesLen := len(messages)
-
 	ctx, cancel := context.WithTimeout(context.Background(), batchSendTimeout)
 	defer cancel()
 
+	messagesLen := len(messages)
 	for i := 0; i < messagesLen; i += l.postMessagesBatchSize {
-		upperBound := i + l.postMessagesBatchSize
-		if upperBound > messagesLen {
-			upperBound = messagesLen
-		}
+		upperBound := min(i+l.postMessagesBatchSize, messagesLen)
 
 		if err := l.tryPostMessages(ctx, messages[i:upperBound]); err != nil {
 			log.G(ctx).WithError(err).WithField("module", "logger/splunk").Warn("Error while sending logs")
@@ -456,9 +436,9 @@ func (l *splunkLogger) postMessages(messages []*splunkMessage, lastChance bool) 
 				// we could not send and return buffer minus one batch size
 				for j := i; j < upperBound; j++ {
 					if jsonEvent, err := json.Marshal(messages[j]); err != nil {
-						log.G(ctx).Error(err)
+						log.G(ctx).WithError(err).Error("Failed to send a message and failed to encode to JSON")
 					} else {
-						log.G(ctx).Error(fmt.Errorf("Failed to send a message '%s'", string(jsonEvent)))
+						log.G(ctx).WithField("message", string(jsonEvent)).Error("Failed to send a message")
 					}
 				}
 				return messages[upperBound:messagesLen]
@@ -506,11 +486,10 @@ func (l *splunkLogger) tryPostMessages(ctx context.Context, messages []*splunkMe
 			return err
 		}
 	}
-	req, err := http.NewRequest(http.MethodPost, l.url, bytes.NewBuffer(buffer.Bytes()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.url, bytes.NewBuffer(buffer.Bytes()))
 	if err != nil {
 		return err
 	}
-	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", l.auth)
 	// Tell if we are sending gzip compressed body
 	if l.gzipCompression {
@@ -529,8 +508,10 @@ func (l *splunkLogger) tryPostMessages(ctx context.Context, messages []*splunkMe
 		return err
 	}
 	defer func() {
-		pools.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		// Drain  and close the body to let the transport reuse the connection.
+		// see https://github.com/google/go-github/pull/317/files#r57536827
+		_, _ = pools.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode != http.StatusOK {
 		rdr := io.LimitReader(resp.Body, maxResponseSize)
@@ -570,6 +551,10 @@ func (l *splunkLogger) createSplunkMessage(msg *logger.Message) *splunkMessage {
 func ValidateLogOpt(cfg map[string]string) error {
 	for key := range cfg {
 		switch key {
+		case logger.AttrEnv, logger.AttrEnvRegex, logger.AttrLabels, logger.AttrLabelsRegex, logger.AttrLogTag:
+			// Common attributes handled through [logger.Info.ExtraAttributes] and [loggerutils.ParseLogTag].
+			continue
+
 		case splunkURLKey:
 		case splunkTokenKey:
 		case splunkSourceKey:
@@ -583,11 +568,6 @@ func ValidateLogOpt(cfg map[string]string) error {
 		case splunkGzipCompressionKey:
 		case splunkGzipCompressionLevelKey:
 		case splunkIndexAcknowledgment:
-		case envKey:
-		case envRegexKey:
-		case labelsKey:
-		case labelsRegexKey:
-		case tagKey:
 		default:
 			return fmt.Errorf("unknown log opt '%s' for %s log driver", key, driverName)
 		}
@@ -620,7 +600,7 @@ func parseURL(info logger.Info) (*url.URL, error) {
 }
 
 func verifySplunkConnection(l *splunkLogger) error {
-	req, err := http.NewRequest(http.MethodOptions, l.url, nil)
+	req, err := http.NewRequest(http.MethodOptions, l.url, http.NoBody)
 	if err != nil {
 		return err
 	}
@@ -629,8 +609,10 @@ func verifySplunkConnection(l *splunkLogger) error {
 		return err
 	}
 	defer func() {
-		pools.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		// Drain  and close the body to let the transport reuse the connection.
+		// see https://github.com/google/go-github/pull/317/files#r57536827
+		_, _ = pools.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 	}()
 
 	if resp.StatusCode != http.StatusOK {

@@ -1,9 +1,9 @@
-package jsonfilelog // import "github.com/docker/docker/daemon/logger/jsonfilelog"
+package jsonfilelog
 
 import (
 	"bufio"
 	"bytes"
-	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,8 +13,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/loggertest"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/loggertest"
 	"gotest.tools/v3/assert"
 )
 
@@ -25,7 +25,7 @@ func BenchmarkJSONFileLoggerReadLogs(b *testing.B) {
 		ContainerID: "a7317399f3f857173c6179d44823594f8294678dea9999662e5c625b5a1c7657",
 		LogPath:     filepath.Join(tmp, "container.log"),
 		Config: map[string]string{
-			"labels": "first,second",
+			logger.AttrLabels: "first,second",
 		},
 		ContainerLabels: map[string]string{
 			"first":  "label_value",
@@ -63,7 +63,7 @@ func BenchmarkJSONFileLoggerReadLogs(b *testing.B) {
 		}
 	}()
 
-	lw := jsonlogger.(*JSONFileLogger).ReadLogs(context.TODO(), logger.ReadConfig{Follow: true})
+	lw := jsonlogger.(*JSONFileLogger).ReadLogs(b.Context(), logger.ReadConfig{Follow: true})
 	for {
 		select {
 		case _, ok := <-lw.Msg:
@@ -104,7 +104,7 @@ func TestEncodeDecode(t *testing.T) {
 	assert.Assert(t, string(msg.Line) == "hello 3\n")
 
 	_, err = dec.Decode()
-	assert.Assert(t, err == io.EOF)
+	assert.Assert(t, errors.Is(err, io.EOF))
 }
 
 func TestReadLogs(t *testing.T) {
@@ -209,7 +209,7 @@ func (d dirStringer) String() string {
 			return ""
 		}
 
-		btw.WriteString(fmt.Sprintf("%s\t%s\t%dB\t%s\n", fi.Name(), fi.Mode(), fi.Size(), fi.ModTime()))
+		fmt.Fprintf(btw, "%s\t%s\t%dB\t%s\n", fi.Name(), fi.Mode(), fi.Size(), fi.ModTime())
 	}
 	btw.Flush()
 	tw.Flush()

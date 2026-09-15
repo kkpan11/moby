@@ -7,7 +7,7 @@
 // The systemd-journal-remote command reads serialized journal entries in the
 // Journal Export Format and writes them to journal files. This format is
 // well-documented and straightforward to generate.
-package fake // import "github.com/docker/docker/daemon/logger/journald/internal/fake"
+package fake
 
 import (
 	"bytes"
@@ -15,17 +15,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"testing"
 	"time"
 
-	"code.cloudfoundry.org/clock"
 	"github.com/coreos/go-systemd/v22/journal"
 	"github.com/google/uuid"
+	"github.com/moby/moby/v2/daemon/internal/lazyregexp"
 	"gotest.tools/v3/assert"
 
-	"github.com/docker/docker/daemon/logger/journald/internal/export"
+	"github.com/moby/moby/v2/daemon/logger/journald/internal/export"
 )
 
 // The systemd-journal-remote command is not conventionally installed on $PATH.
@@ -60,8 +59,9 @@ type Sender struct {
 	CmdName    string
 	OutputPath string
 
-	// Clock for timestamping sent messages.
-	Clock clock.Clock
+	// Now returns the current time for timestamping sent messages.
+	// Defaults to time.Now if nil.
+	Now func() time.Time
 	// Whether to assign the event's realtime timestamp to the time
 	// specified by the SYSLOG_TIMESTAMP variable value. This is roughly
 	// analogous to journald receiving the event and assigning it a
@@ -90,7 +90,6 @@ func New(outpath string) (*Sender, error) {
 	sender := &Sender{
 		CmdName:    p,
 		OutputPath: outpath,
-		Clock:      clock.NewClock(),
 		BootID:     uuid.New(), // UUIDv4, like systemd itself generates for sd_id128 values.
 	}
 	return sender, nil
@@ -109,7 +108,7 @@ func NewT(t *testing.T, outpath string) *Sender {
 	return s
 }
 
-var validVarName = regexp.MustCompile("^[A-Z0-9][A-Z0-9_]*$")
+var validVarName = lazyregexp.New("^[A-Z0-9][A-Z0-9_]*$")
 
 // Send is a drop-in replacement for
 // github.com/coreos/go-systemd/v22/journal.Send.
@@ -130,7 +129,11 @@ func (s *Sender) Send(message string, priority journal.Priority, vars map[string
 			return fmt.Errorf("fake: error parsing SYSLOG_TIMESTAMP value %q: %w", ts, err)
 		}
 	} else {
-		ts = s.Clock.Now()
+		now := s.Now
+		if now == nil {
+			now = time.Now
+		}
+		ts = now()
 	}
 	if err := export.WriteField(&buf, "__REALTIME_TIMESTAMP", strconv.FormatInt(ts.UnixMicro(), 10)); err != nil {
 		return fmt.Errorf("fake: error writing entry to systemd-journal-remote: %w", err)
